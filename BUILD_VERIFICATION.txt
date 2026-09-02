@@ -59,6 +59,15 @@ Requester attribution collection channel (docs/30, offline reference form):
 - decisions carry NO attribution refs unless a transaction log is supplied;
   the report is display-only output
 
+Attribution lab (lab/, runnable demonstration):
+- ./lab/run.sh: 6/6 scenarios PASS (loopback-only, offline, no enforcement):
+  rotation (4 rotating IPs -> ONE fingerprint group), campaigns (3 toolchains
+  -> 3 groups, no false links), formats (envoy+nginx logs -> containment
+  link), live (real HTTP through the challenge origin: P1/P4/P5 captured,
+  spoofed User-Agent stored nowhere, raw IPs pseudonymized), boundary
+  (decisions byte-identical with/without attribution), degradation
+  (stop-and-mark envelopes)
+
 v2.1 attack-surface closure (documented; scaffold coverage as noted):
 - plaintext-53 redirect-to-managed + resolver baseline: spec (FR-029, docs/24)
 - tuple-form allowlist entries + traffic profiles + drift-as-finding: spec (FR-030, docs/26)

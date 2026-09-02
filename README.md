@@ -14,6 +14,14 @@ APIP is not a hack-back system. It does not compromise, disrupt, scan, or manipu
 
 The reference implementation in `reference/` is deliberately **offline and dry-run only**. It evaluates sample indicators and emits candidate RPZ and Suricata artifacts to files. It does not modify host firewall state, DNS servers, BGP sessions, cloud accounts, or third-party systems.
 
+## Try the lab
+
+```bash
+cd lab && ./run.sh
+```
+
+The **Attribution Lab** (`lab/`, see its README) demonstrates the `docs/30` requester attribution engine end-to-end on loopback-only traffic: rotating attacker infrastructure collapsing into one behavioral fingerprint, distinct toolchains staying separate, one campaign correlating across different vendor log formats — and proof that attribution can never change a single enforcement decision. It opens `lab/output/attribution_report.html`, the analyst correlation view.
+
 ## Package map
 
 - `FULL_SPEC.md` — consolidated product/system specification.
@@ -39,6 +47,7 @@ The reference implementation in `reference/` is deliberately **offline and dry-r
 - `docs/20_SAFETY_CASE_AND_FAILURE_ANALYSIS.md` — hazards, mitigations, fault injection, abuse resistance.
 - `docs/21_REFERENCE_DEPLOYMENT_BLUEPRINT.md` — concrete production component and adapter blueprint.
 - `docs/22_OPERATOR_UI_AND_WORKFLOWS.md` — operator console, roles, explain/revoke/replay workflows.
+- `lab/` — runnable demonstration lab (loopback-only) for the docs/30 attribution engine and its hard boundary.
 - `docs/23_BEHAVIORAL_DETECTION_SUITE.md` — deterministic detection families (beaconing, DGA, DNS tunneling, fast-flux, volume, novelty, TLS mismatch), corroboration lattice, anti-gaming.
 - `docs/24_ENCRYPTION_AND_BYPASS_RESISTANCE.md` — DoH/DoT known-hosts containment, coverage accounting, compensating posture.
 - `docs/25_LAYERED_INTERDICTION_AND_SHARED_INFRASTRUCTURE.md` — L0–L7 response ladder; context-acting rungs safe on shared infrastructure.

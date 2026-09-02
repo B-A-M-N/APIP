@@ -6,7 +6,7 @@
   "files": [
     {
       "path": ".gitignore",
-      "sha256": "56a67e5f37365d3b81276202a7a26bda9bea23cdddc1384e89c10a30ff7cd488"
+      "sha256": "358a1e4c8de634947349f5f5d3b1a13ff5b150348d7df58c2103a17e84b65180"
     },
     {
       "path": "BUILD_VERIFICATION.txt",
@@ -18,7 +18,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "6cfba26e861ce980d79aad1e0a79166a420198d52a1efa2321cb31cb9519eaf1"
+      "sha256": "7ad544f5e9d26e993f8bc804bd3c54f01298797b8c435fe6835ede49556f451c"
     },
     {
       "path": "api/openapi.yaml",
@@ -163,6 +163,18 @@
     {
       "path": "examples/transactions.jsonl",
       "sha256": "d96c34536fc9e140a535040c1427bbf41deadaad8cea490f23735a6b7950c64b"
+    },
+    {
+      "path": "lab/README.md",
+      "sha256": "c2b2c8f23d85fd4aea77e27574aa59f2703032344b79bb47471aadf67eca62c6"
+    },
+    {
+      "path": "lab/run.sh",
+      "sha256": "d6907e0a76f4628c88e88f1304081b5e9ead191818e3dcf4125bd82f3494cbc0"
+    },
+    {
+      "path": "lab/run_lab.py",
+      "sha256": "4808932c9596b7310adfeaddc88ab697c246fba5e466c8d1853537ed4024d11f"
     },
     {
       "path": "reference/README.md",

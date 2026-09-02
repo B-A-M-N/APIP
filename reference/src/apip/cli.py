@@ -82,6 +82,53 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_capture(args: argparse.Namespace) -> int:
+    """Live-capture subcommand (docs/30): run the loopback challenge origin,
+    or convert a terminator access log into contract records."""
+    from .live.adapters import apply_stream
+    from .live.server import ChallengeOrigin
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    store = CorrelationStore()
+
+    if args.log:
+        # log-conversion mode: terminator access log -> contract JSONL + report
+        tx_path = out / "transactions.jsonl"
+        class _W:
+            def __init__(self, fh): self.fh = fh
+            def write(self, rec): self.fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        with open(args.log, "r", encoding="utf-8", errors="replace") as f, \
+                open(tx_path, "w", encoding="utf-8") as o:
+            parsed, rejected, unparsed = apply_stream(f, _W(o))
+        # fold the captured records into the store
+        with open(tx_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    store.observe(json.loads(line))
+        print(f"parsed={parsed} rejected={rejected} unparsed={unparsed} output={tx_path}")
+    else:
+        # serve mode: loopback challenge origin (refuses non-loopback by default)
+        tx_path = out / "transactions.jsonl"
+        origin = ChallengeOrigin(tx_path, epoch=args.epoch, store=store)
+        print(f"challenge origin on http://{args.bind}:{args.port} "
+              f"(observe-only; Ctrl+C to stop; records -> {tx_path})")
+        try:
+            origin.serve(args.bind, args.port)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            origin.shutdown()
+
+    report = store.report()
+    (out / "attribution_report.json").write_text(json.dumps(report, indent=2) + "\n")
+    from .uireport import render_correlation_report
+    (out / "attribution_report.html").write_text(
+        render_correlation_report(report), encoding="utf-8")
+    print(f"tracked={report['tracked_requesters']} degraded={report['degraded']} "
+          f"report={out / 'attribution_report.html'}")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="APIP dry-run reference scaffold")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -92,7 +139,20 @@ def main() -> int:
     ev.add_argument("--transactions", default=None,
                     help="optional JSONL of observed transactions (docs/30 harvest)")
     ev.set_defaults(func=cmd_evaluate)
+    cap = sub.add_parser("capture", help="docs/30 harvest: loopback challenge origin or log conversion")
+    cap.add_argument("--log", default=None,
+                     help="terminator access log to convert (envoy/haproxy/nginx formats)")
+    cap.add_argument("--bind", default="127.0.0.1",
+                     help="bind address for serve mode (loopback enforced)")
+    cap.add_argument("--port", type=int, default=8765)
+    cap.add_argument("--epoch", default="0", help="probe-order epoch (docs/29)")
+    cap.add_argument("--out", required=True)
+    cap.set_defaults(func=cmd_capture)
     args = p.parse_args()
+    if getattr(args, "func", None) is cmd_capture and not args.log:
+        if not (args.bind.startswith("127.") or args.bind in ("localhost", "::1")):
+            p.error("--bind must be loopback (production non-loopback deployment is an "
+                    "explicit, reviewed opt-in; see docs/30)")
     return args.func(args)
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@
     },
     {
       "path": "BUILD_VERIFICATION.txt",
-      "sha256": "4feed058091d4fa5bcd88820638d99c8701e2e0d9de4aa1cb4ac115cd4f2e491"
+      "sha256": "01678e81e4679d194ae488b9a9dd622a5a50c24a2824a76d3e7693837beaafd8"
     },
     {
       "path": "FULL_SPEC.md",
@@ -145,6 +145,10 @@
       "sha256": "b3b1daffec0d729da374be93dd77f561a872ff6244f85b9ce84ce7847c1279b1"
     },
     {
+      "path": "examples/access_log_sample.log",
+      "sha256": "de3121f00f74849267b416cea1251eb28c0c5b900e5efc5ec1e16c39e2bec1aa"
+    },
+    {
       "path": "examples/indicators.json",
       "sha256": "2aedba45271dffa0b4a7c5983b9784d3c50adcc93c01894fca65dd3143eac150"
     },
@@ -174,11 +178,11 @@
     },
     {
       "path": "reference/src/apip/attribution.py",
-      "sha256": "da576971b25bec64dc4b329f466ee2ff2886e09a31626d8219168935149d2935"
+      "sha256": "0a7044d030c62587dbb6e044fe588a35725a958bcbe90993bd5023494fc4d240"
     },
     {
       "path": "reference/src/apip/cli.py",
-      "sha256": "3c2c52990dd920b29b46a2db5841cd23306745ea0ebd0b94cdce24df651b2b6b"
+      "sha256": "d35c7f8b3a575e5caacc66e3a14b96ec1a66b66488eba98b237c25036c0b1ceb"
     },
     {
       "path": "reference/src/apip/config.py",
@@ -199,6 +203,18 @@
     {
       "path": "reference/src/apip/io.py",
       "sha256": "9a7ff014f30340bd2b8c04e93a8fb9488f08e7d27517b3fa9049dccd81f141ad"
+    },
+    {
+      "path": "reference/src/apip/live/__init__.py",
+      "sha256": "1d3dfbb01e33b476c63abf48f381387d68a4f1cedadd45f58e09b41260997a5f"
+    },
+    {
+      "path": "reference/src/apip/live/adapters.py",
+      "sha256": "5bdd2de1e3652afde3d0ef8b3aa392132bc1b3d5b58c9e8479756f3a9e5baef0"
+    },
+    {
+      "path": "reference/src/apip/live/server.py",
+      "sha256": "1e0a2af0b99038d5b491e6f71c5da1c138bd60ac9ec323de77d79a1bcdb42dcc"
     },
     {
       "path": "reference/src/apip/models.py",
@@ -231,6 +247,10 @@
     {
       "path": "reference/tests/test_config_validation.py",
       "sha256": "77a8d062806392280a03e1503a9147e7cef3bce999ad9e25a5fe7a84f6b5a031"
+    },
+    {
+      "path": "reference/tests/test_live_capture.py",
+      "sha256": "5f685fa31b285f109104f95edf4c4ee983cf597254dab4cccf6766d5e9fd0b89"
     },
     {
       "path": "reference/tests/test_no_ai_conformance.py",

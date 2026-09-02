@@ -1,0 +1,7 @@
+[2026-09-01T19:41:10Z] "GET /asset HTTP/1.1" 203.0.113.9 accept-language=en-US,en;q=0.9 accept-encoding=gzip,deflate,br ja4=t13d1516h2_8daaf6152771_b186095e22b6
+[2026-09-01T19:44:51Z] "GET /asset HTTP/1.1" 198.51.100.23 accept-language=en-US,en;q=0.9 accept-encoding=gzip,deflate,br ja4=t13d1516h2_8daaf6152771_b186095e22b6
+{"time":"2026-09-01T19:47:03Z","remote_addr":"192.0.2.77","http_accept_language":"en-US,en;q=0.9","http_accept_encoding":"gzip,deflate,br","ja4":"t13d1516h2_8daaf6152771_b186095e22b6","header_order":"host|user-agent|accept|accept-encoding|connection"}
+Jan  1 19:49:27 edge haproxy[312]: 198.51.100.4:33890 [03/Jan/2026:19:49:27.001] h=accept-language:* h=accept-encoding:identity
+{"time":"2026-09-01T19:52:44Z","remote_addr":"192.0.2.15","http_accept_language":"*","http_accept_encoding":"identity","ja4":"t13d1513h2_5c54147bee53_e5647b281b39","header_order":"user-agent|accept|host"}
+[2026-09-01T19:55:18Z] "GET /asset HTTP/1.1" 203.0.113.200 accept-language=zh-CN accept-encoding=gzip ja4=t13d1516h2_8daaf6152771_b186095e22b6
+this line is not a recognized access log format at all

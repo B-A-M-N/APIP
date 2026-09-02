@@ -81,6 +81,10 @@ _TX_STRING_FIELDS = {"client_ref", "observed_at", "session_epoch",
                      "accept_language", "accept_encoding", "tls_ja4"}
 _TX_LIST_FIELDS = {"header_order", "challenge_body_key_order"}
 
+# ISO-8601 UTC shape enforced structurally: YYYY-MM-DDTHH:MM:SS(.ffffff)?Z
+import re as _re
+_ISO_UTC = _re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
+
 
 class TransactionRejected(ValueError):
     """A transaction record violated the observed-transaction contract."""
@@ -101,6 +105,10 @@ def validate_transaction(tx: dict) -> None:
         v = tx.get(f)
         if not isinstance(v, str) or not (1 <= len(v) <= 128):
             raise TransactionRejected(f"{f} must be a 1..128 char string")
+    if not _ISO_UTC.match(tx["observed_at"]):
+        raise TransactionRejected(
+            "observed_at must be ISO-8601 UTC (YYYY-MM-DDTHH:MM:SS[.ffffff]Z); "
+            "adapters must normalize before emitting")
     for f, allowed in _TX_ENUMS.items():
         if f in tx and tx[f] not in allowed:
             raise TransactionRejected(f"{f} must be one of {sorted(allowed)}")
@@ -248,16 +256,25 @@ class CorrelationStore:
         for s in self._by_handle.values():
             groups.setdefault(fingerprint(s.features), []).append(s.handle)
         fps = list(groups)
+        feats_by_fp = {fingerprint(s.features): s.features
+                       for s in self._by_handle.values()}
         links = []
         for i in range(len(fps)):
             for j in range(i + 1, len(fps)):
-                a = next(s.features for s in self._by_handle.values()
-                         if fingerprint(s.features) == fps[i])
-                b = next(s.features for s in self._by_handle.values()
-                         if fingerprint(s.features) == fps[j])
+                a, b = feats_by_fp[fps[i]], feats_by_fp[fps[j]]
                 sim = similarity(a, b)
-                if sim >= min_similarity:
-                    links.append({"a": fps[i], "b": fps[j], "shared_probes": sim})
+                matching = sum(1 for k in set(a) & set(b) if a[k] == b[k])
+                # Link when matching-value probes clear the policy floor, OR
+                # one vector is fully contained in the other with all shared
+                # values identical (>= 2 probes). The containment clause
+                # handles heterogeneous terminators: different loggers
+                # capture different probe subsets of the same client. Shared
+                # keys with CONFLICTING values never link — behavioral
+                # disagreement is evidence of difference.
+                contained = (matching == min(len(a), len(b)) and matching >= 2
+                             and matching == sim)
+                if matching >= min_similarity or contained:
+                    links.append({"a": fps[i], "b": fps[j], "shared_probes": matching})
         return {
             "schema_version": self.SCHEMA_VERSION,
             "degraded": self.degraded,

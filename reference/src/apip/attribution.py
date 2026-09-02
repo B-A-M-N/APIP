@@ -65,6 +65,55 @@ def handle_for(client_ref: str) -> str:
     return "rh--" + hashlib.sha256(client_ref.encode()).hexdigest()[:16]
 
 
+# --- adapter contract validation (schemas/observed_transaction.schema.json) --
+# Structural validation mirroring the schema, stdlib-only (docs/28 allowlist).
+# Production adapters must emit records this validator accepts; malformed
+# records are REJECTED (never coerced), so a broken log shipper cannot
+# silently distort the feature vectors.
+
+_TX_ENUMS = {
+    "cache_behavior": {"validators_absent", "validators_present_correct",
+                       "validators_present_incorrect", "revalidation_ignored"},
+    "range_fallback": {"range_honored", "range_ignored",
+                       "identity_fallback", "malformed_retry"},
+}
+_TX_STRING_FIELDS = {"client_ref", "observed_at", "session_epoch",
+                     "accept_language", "accept_encoding", "tls_ja4"}
+_TX_LIST_FIELDS = {"header_order", "challenge_body_key_order"}
+
+
+class TransactionRejected(ValueError):
+    """A transaction record violated the observed-transaction contract."""
+
+
+def validate_transaction(tx: dict) -> None:
+    """Validate one observed-transaction record against the docs/30 contract.
+
+    Raises TransactionRejected with a named reason on any violation. The
+    reference pipeline refuses (not coerces) malformed records.
+    """
+    if not isinstance(tx, dict):
+        raise TransactionRejected("record must be an object")
+    unknown = set(tx) - set(_TX_STRING_FIELDS) - set(_TX_ENUMS) - set(_TX_LIST_FIELDS)
+    if unknown:
+        raise TransactionRejected(f"unknown fields: {sorted(unknown)}")
+    for f in ("client_ref", "observed_at"):
+        v = tx.get(f)
+        if not isinstance(v, str) or not (1 <= len(v) <= 128):
+            raise TransactionRejected(f"{f} must be a 1..128 char string")
+    for f, allowed in _TX_ENUMS.items():
+        if f in tx and tx[f] not in allowed:
+            raise TransactionRejected(f"{f} must be one of {sorted(allowed)}")
+    for f in _TX_LIST_FIELDS:
+        if f in tx:
+            v = tx[f]
+            if (not isinstance(v, list) or len(v) > 64
+                    or not all(isinstance(x, str) and 0 < len(x) <= 64 for x in v)
+                    or len(set(v)) != len(v)):
+                raise TransactionRejected(
+                    f"{f} must be a list of unique short strings (max 64)")
+
+
 def extract_features(tx: dict) -> dict[str, str]:
     """Fixed per-probe extractors over one observed transaction record.
 
@@ -140,7 +189,9 @@ class CorrelationStore:
 
     def observe(self, tx: dict) -> dict[str, str] | None:
         """Fold one observed transaction into the requester's feature vector.
-        Returns the derived fingerprint when the vector is non-empty."""
+        Returns the derived fingerprint when the vector is non-empty.
+        Contract-violating records are rejected (never coerced)."""
+        validate_transaction(tx)
         feats = extract_features(tx)
         if not feats:
             return None

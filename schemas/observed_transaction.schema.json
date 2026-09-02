@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apip/schemas/observed_transaction.schema.json",
+  "title": "Observed Transaction Record (docs/30)",
+  "description": "One observed HTTP/TLS transaction as emitted by a proxy/TLS terminator log adapter. Carries observable behavior only. Self-declared fields (User-Agent text) are captured as raw material but never trusted; the engine uses construction behavior (ordering, structure, correctness). Absent optional fields mean the terminator did not observe that material — absence is recorded, never guessed.",
+  "type": "object",
+  "required": ["client_ref", "observed_at"],
+  "additionalProperties": false,
+  "properties": {
+    "client_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Opaque client identity at the terminator (e.g. 'ip:port' or connection id). Pseudonymized to a requester handle (rh--) before storage; the raw ref is not persisted by the attribution engine."
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp of the transaction."
+    },
+    "session_epoch": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "Operator-controlled epoch bucket for probe-order draws (docs/29). Optional; defaults to the store's policy epoch."
+    },
+    "header_order": {
+      "type": "array",
+      "items": {"type": "string", "maxLength": 64},
+      "maxItems": 64,
+      "uniqueItems": true,
+      "description": "P1: request header names in exact emission order (P1:header_order, P1:header_set)."
+    },
+    "accept_language": {
+      "type": "string",
+      "maxLength": 256,
+      "description": "P2: raw Accept-Language value (used only for structural coherence, not content)."
+    },
+    "accept_encoding": {
+      "type": "string",
+      "maxLength": 256,
+      "description": "P2: raw Accept-Encoding value."
+    },
+    "tls_ja4": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "P3: JA4-family digest of the client hello, captured passively at the TLS terminator."
+    },
+    "cache_behavior": {
+      "type": "string",
+      "enum": ["validators_absent", "validators_present_correct",
+               "validators_present_incorrect", "revalidation_ignored"],
+      "description": "P4: observed conditional-request correctness class on a versioned asset."
+    },
+    "challenge_body_key_order": {
+      "type": "array",
+      "items": {"type": "string", "maxLength": 64},
+      "maxItems": 32,
+      "uniqueItems": true,
+      "description": "P5: key order the client used when serializing the canonical-JSON challenge response."
+    },
+    "range_fallback": {
+      "type": "string",
+      "enum": ["range_honored", "range_ignored", "identity_fallback", "malformed_retry"],
+      "description": "P6: observed Range/Accept-Encoding fallback behavior class."
+    }
+  }
+}

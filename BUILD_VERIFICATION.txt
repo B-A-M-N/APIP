@@ -2,7 +2,7 @@ APIP specification package verification — v2.1
 Date: 2026-09-01
 
 Reference scaffold:
-- python -m unittest discover -s tests -v: PASS (82 tests)
+- python -m unittest discover -s tests -v: PASS (92 tests)
 - ./verify.sh: PASS
 - dry-run evaluation: PASS (6 synthetic indicators, SHADOW mode)
   - exact-FQDN C2 -> L4 domain block (dns_nxdomain, shadow)
@@ -42,8 +42,14 @@ Requester attribution collection channel (docs/30, offline reference form):
 - observable-behavior extraction over a JSONL transaction log (6 records):
   PASS — 3 rotating IPs collapse to one fingerprint; a second toolchain forms
   its own group; cross-group link reported by shared-probe count
+- adapter contract (schemas/observed_transaction.schema.json) enforced by
+  validate_transaction: unknown fields, bad enums, malformed lists REJECTED
+  not coerced: PASS (test)
+- operator correlation view: deterministic read-only HTML render
+  (attribution_report.html) — groups, shared-probe links, degraded banner,
+  pseudonymous handles only: PASS (test)
 - decisions carry NO attribution refs unless a transaction log is supplied;
-  the report is display-only output (attribution_report.json)
+  the report is display-only output
 
 v2.1 attack-surface closure (documented; scaffold coverage as noted):
 - plaintext-53 redirect-to-managed + resolver baseline: spec (FR-029, docs/24)

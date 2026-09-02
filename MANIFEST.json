@@ -5,8 +5,12 @@
   "generated": "2026-09-01",
   "files": [
     {
+      "path": ".gitignore",
+      "sha256": "56a67e5f37365d3b81276202a7a26bda9bea23cdddc1384e89c10a30ff7cd488"
+    },
+    {
       "path": "BUILD_VERIFICATION.txt",
-      "sha256": "b10fcbb75cd526b73e751f9c94e88d6bb9a8482601fd974c0792ba5725eace14"
+      "sha256": "4feed058091d4fa5bcd88820638d99c8701e2e0d9de4aa1cb4ac115cd4f2e491"
     },
     {
       "path": "FULL_SPEC.md",
@@ -66,7 +70,7 @@
     },
     {
       "path": "docs/12_IMPLEMENTATION_BACKLOG.md",
-      "sha256": "8e5a74434446ddf3fc8516db6583892aa918e2a75085cb4b239fca6e31352005"
+      "sha256": "81d6da85ded21434e1bb9f670e55c4f560e6cc3e0e92ef31f571a9f2b64642f6"
     },
     {
       "path": "docs/13_RESEARCH_SOURCES.md",
@@ -138,7 +142,7 @@
     },
     {
       "path": "docs/30_REQUESTER_ATTRIBUTION_AND_FINGERPRINTING.md",
-      "sha256": "4659f0d39b8859d1fdbd6ec0762006c57fe0bef2b0f4c9291f869e4b7c2ca4de"
+      "sha256": "b3b1daffec0d729da374be93dd77f561a872ff6244f85b9ce84ce7847c1279b1"
     },
     {
       "path": "examples/indicators.json",
@@ -170,11 +174,11 @@
     },
     {
       "path": "reference/src/apip/attribution.py",
-      "sha256": "32388a026d0f0a4bc82ab73bdfa4a5b525b8edca1bd8201f2ec5c675151b642a"
+      "sha256": "da576971b25bec64dc4b329f466ee2ff2886e09a31626d8219168935149d2935"
     },
     {
       "path": "reference/src/apip/cli.py",
-      "sha256": "7f42c0eb6f8edd8d77f9d5e3a9a8256969e26d5a3724abeed055ad14054a702f"
+      "sha256": "3c2c52990dd920b29b46a2db5841cd23306745ea0ebd0b94cdce24df651b2b6b"
     },
     {
       "path": "reference/src/apip/config.py",
@@ -217,8 +221,12 @@
       "sha256": "8c89941edea7b1e7c809d19e2ba3d08006d1e71b4473512d40187665fe2e8727"
     },
     {
+      "path": "reference/src/apip/uireport.py",
+      "sha256": "49bd7c94a68cb55c0172ce1dee0b9fb185261a282fdab93e279a2cb3e4e82a37"
+    },
+    {
       "path": "reference/tests/test_attribution.py",
-      "sha256": "28b335562f421d78b47ab9e781ddb3afb2d9d63f8c50e98e91ec5ef8052ec846"
+      "sha256": "c2c0103801f4d8fb5e829e46322d268d1d84f3f16d82ddae4d47527a8b1704e3"
     },
     {
       "path": "reference/tests/test_config_validation.py",
@@ -263,6 +271,10 @@
     {
       "path": "schemas/indicator.schema.json",
       "sha256": "38696b3ebbac0f7e7616c9f46bf6776a57a7e21ad34bc2aa9d3f41ad9ca6ce9d"
+    },
+    {
+      "path": "schemas/observed_transaction.schema.json",
+      "sha256": "f46641a02f247b21d91845cd782e5706a356ff19e6de45815c74ccac8207cabd"
     },
     {
       "path": "schemas/policy.schema.json",

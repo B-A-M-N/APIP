@@ -11,7 +11,8 @@ from apip.models import Indicator, Evidence
 from apip.policy import Policy, RungFloor, evaluate
 from apip.registry import SourceRegistry, SourceProfile
 from apip.attribution import (ATTRIBUTION_SOURCE_CLASS, probe_order, fingerprint,
-                              similarity, extract_features, handle_for, CorrelationStore)
+                              similarity, extract_features, handle_for, CorrelationStore,
+                              validate_transaction, TransactionRejected)
 
 REG = SourceRegistry((
     SourceProfile("curated-a", "curated", True),
@@ -211,6 +212,77 @@ class CorrelationStoreTests(unittest.TestCase):
         d_with = evaluate(_ind(), POL, CTX)
         self.assertEqual(d_clean.to_dict(), d_with.to_dict())
         self.assertEqual(d_with.attribution_refs, ())   # engine never auto-attaches
+
+
+class AdapterContractTests(unittest.TestCase):
+    """WP-30: log-shipper adapters must emit contract-valid records;
+    violations are rejected, never coerced."""
+
+    def test_valid_record_passes(self):
+        validate_transaction(_tx("1.2.3.4:5555"))          # must not raise
+        validate_transaction({"client_ref": "c", "observed_at": "2026-09-01T19:00:00Z"})
+
+    def test_missing_required_rejected(self):
+        with self.assertRaises(TransactionRejected):
+            validate_transaction({"observed_at": "2026-09-01T19:00:00Z"})
+        with self.assertRaises(TransactionRejected):
+            validate_transaction({"client_ref": "c"})
+
+    def test_unknown_field_rejected(self):
+        with self.assertRaises(TransactionRejected):
+            validate_transaction(_tx("c", points_m=100))   # smuggling shape
+
+    def test_bad_enum_rejected(self):
+        with self.assertRaises(TransactionRejected):
+            validate_transaction(_tx("c", cache_behavior="looks_fine_to_me"))
+
+    def test_bad_list_rejected(self):
+        with self.assertRaises(TransactionRejected):
+            validate_transaction(_tx("c", header_order=["host", "host"]))     # dup
+        with self.assertRaises(TransactionRejected):
+            validate_transaction(_tx("c", header_order="host,user-agent"))    # not a list
+
+    def test_non_object_rejected(self):
+        with self.assertRaises(TransactionRejected):
+            validate_transaction("GET / HTTP/1.1")
+
+    def test_store_rejects_malformed_record(self):
+        s = CorrelationStore()
+        with self.assertRaises(TransactionRejected):
+            s.observe({"client_ref": "c", "observed_at": "x", "nonsense": 1})
+        self.assertEqual(s.report()["tracked_requesters"], 0)
+
+
+class UiReportTests(unittest.TestCase):
+    """WP-30 operator correlation view (file-form, read-only)."""
+
+    def _rendered(self):
+        from apip.uireport import render_from_store
+        s = CorrelationStore()
+        s.observe(_tx("a"))
+        s.observe(_tx("b", observed_at="2026-09-01T19:01:00Z"))
+        s.observe(_tx("c", header_order=["user-agent", "accept", "host"],
+                       tls_ja4="t13d1513h2_5c54147bee53_e5647b281b39"))
+        return render_from_store(s)
+
+    def test_render_is_deterministic(self):
+        self.assertEqual(self._rendered(), self._rendered())
+
+    def test_render_shows_groups_and_no_raw_identity(self):
+        html = self._rendered()
+        self.assertIn("fp--fp1--", html)
+        self.assertIn("rh--", html)
+        self.assertIn("Read-only view", html)
+        self.assertNotIn("client_ref", html)      # raw identifiers never shown
+        self.assertNotIn("203.0.113", html)
+
+    def test_render_shows_degraded_banner(self):
+        from apip.uireport import render_from_store
+        s = CorrelationStore(max_requesters=1)
+        s.observe(_tx("a"))
+        s.observe(_tx("b"))                       # overflow -> degraded
+        html = render_from_store(s)
+        self.assertIn("DEGRADED", html)
 
 
 if __name__ == "__main__":

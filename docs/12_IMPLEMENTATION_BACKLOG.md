@@ -278,3 +278,13 @@ Implements the six residual-surface reductions:
 - BD-8 synchronized first-contact family with population-scaled N (FR-032, `docs/23`);
 - standing exposure inventory diff + operator-owned-space scan reconciliation, incident-by-default on undocumented listeners (FR-033, `docs/27`);
 - defend-the-defender deployment profile: controller allow-first segment, pull-only agents, pinned adapter egress (FR-034, `docs/09`).
+
+## WP-30 Requester attribution production integration (v2.1)
+
+Builds on the reference implementation (`reference/src/apip/attribution.py`, offline complete):
+
+- **Log-stream adapters:** per-terminator adapters (Envoy access log, HAProxy, NGINX, cloud LB) emitting the versioned observed-transaction record schema (`schemas/observed_transaction.schema.json`); adapter conformance suite validates field extraction (header order capture, JA4, conditional-request sequencing) against golden captures;
+- **Pipeline deployment:** `CorrelationStore` behind the control-plane service boundary with policy-versioned resource envelopes, TTL/retention wired to `docs/09` data-class windows;
+- **Operator UI:** correlation view rendering `attribution_report.json` — fingerprint groups with probe coverage, cross-group links by shared-probe count, per-handle drill-down (pseudonymous handles only), degraded-state banner; strictly read-only (no action affordances on attribution data);
+- **Privacy gates:** legal/privacy review sign-off as a deployment release gate; cross-tenant matching disabled by default; retention timers enforced in the store, not by external cleanup;
+- **Challenge-origin integration:** serve P4/P5/P6 probe material on the L1 challenge path only (`docs/25` budgets unchanged); passive P1/P2/P3 harvest from all transacting sessions.

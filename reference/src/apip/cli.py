@@ -32,11 +32,17 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     # attribution refs. Absent log -> no refs, decisions unchanged.
     store = CorrelationStore()
     if getattr(args, "transactions", None):
+        from .attribution import TransactionRejected
         with open(args.transactions, "r", encoding="utf-8") as f:
-            for line in f:
+            for lineno, line in enumerate(f, 1):
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     store.observe(json.loads(line))
+                except TransactionRejected as e:
+                    raise SystemExit(
+                        f"transaction record rejected at {args.transactions}:{lineno}: {e}")
     pairs = []
     for i in indicators:
         # Typed context for context-acting rungs (docs/25 v2.1). The demo
@@ -67,8 +73,11 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     # docs/30: campaign-correlation report (the analyst view, file form).
     # Display-only: feeding it back into anything enforcement-side is
     # prohibited and blocked by the attribution source-class gate.
-    (out / "attribution_report.json").write_text(
-        json.dumps(store.report(), indent=2) + "\n")
+    report = store.report()
+    (out / "attribution_report.json").write_text(json.dumps(report, indent=2) + "\n")
+    from .uireport import render_correlation_report
+    (out / "attribution_report.html").write_text(
+        render_correlation_report(report), encoding="utf-8")
     print(f"evaluated={len(pairs)} mode={policy.mode} output={out}")
     return 0
 

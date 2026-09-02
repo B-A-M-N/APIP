@@ -1,0 +1,276 @@
+{
+  "manifest_version": "3",
+  "package": "attack-path-interdiction-platform",
+  "spec_revision": "v2.1",
+  "generated": "2026-09-01",
+  "files": [
+    {
+      "path": "BUILD_VERIFICATION.txt",
+      "sha256": "b10fcbb75cd526b73e751f9c94e88d6bb9a8482601fd974c0792ba5725eace14"
+    },
+    {
+      "path": "FULL_SPEC.md",
+      "sha256": "045d091bd721690d21fdf46d7d184365bbc0e94f2fd1497c990a7093a4bf4565"
+    },
+    {
+      "path": "README.md",
+      "sha256": "6cfba26e861ce980d79aad1e0a79166a420198d52a1efa2321cb31cb9519eaf1"
+    },
+    {
+      "path": "api/openapi.yaml",
+      "sha256": "e8530a67e37c3adc321c6e3e42bc1f79738122463c46a4bb516aac0b66e2a812"
+    },
+    {
+      "path": "docs/01_PRODUCT_REQUIREMENTS.md",
+      "sha256": "825f9d8bbbf6d1e301f02b1201c2004a4fb85f16828c276fd33aa5f5d1b92e8c"
+    },
+    {
+      "path": "docs/02_SYSTEM_ARCHITECTURE.md",
+      "sha256": "181f9902dcfa044e40095122e94dae35e88ba5d4bc4fc1080bd366589252c2c3"
+    },
+    {
+      "path": "docs/03_THREAT_MODEL.md",
+      "sha256": "4e0568edf03f718c01958b14328e2e3e0b761541aee1abe8639d96d9ab85d714"
+    },
+    {
+      "path": "docs/04_EVIDENCE_CONFIDENCE_POLICY.md",
+      "sha256": "ae44fdc5c6d822256a8363a6af87ed7496a6af59140cb94b4052dfbc358fb4ae"
+    },
+    {
+      "path": "docs/05_DATA_AND_INTERFACES.md",
+      "sha256": "ecad8762a3a1a62bc66be696c266c4c36d3beda0dbd7157dd4d19f146194331f"
+    },
+    {
+      "path": "docs/06_ENFORCEMENT_ADAPTERS.md",
+      "sha256": "1a4da507a5770b686a3332ba8cdd805a1a512aa4f901a52bf503746d4903ff1a"
+    },
+    {
+      "path": "docs/07_DEPLOYMENT_PROFILES.md",
+      "sha256": "58b4973d8d20f9964fb5e0c21a03b6e4ff949e12bb0cfc126063b3c246ad11e9"
+    },
+    {
+      "path": "docs/08_ENERGY_OT_ALIGNMENT.md",
+      "sha256": "13992c0914a4773f4b2d2cb6e9bd851a00262f8ee3ad10cd5eb9e82b457db800"
+    },
+    {
+      "path": "docs/09_SECURITY_PRIVACY_GOVERNANCE.md",
+      "sha256": "c48ba8b71816649b6b253f12952e96b91a08f79b4eafb2e94d63863e2c48171d"
+    },
+    {
+      "path": "docs/10_TESTING_VALIDATION.md",
+      "sha256": "4940848c385c0cd3f118a2fe38baa5469bb3a08ac26e68d4a17a588e210e5f3b"
+    },
+    {
+      "path": "docs/11_OPERATIONS_RUNBOOK.md",
+      "sha256": "6ea61b3e0ca11dbaa6eddd940398a5577095ec64f250b95bada2ee6b4e2e0c00"
+    },
+    {
+      "path": "docs/12_IMPLEMENTATION_BACKLOG.md",
+      "sha256": "8e5a74434446ddf3fc8516db6583892aa918e2a75085cb4b239fca6e31352005"
+    },
+    {
+      "path": "docs/13_RESEARCH_SOURCES.md",
+      "sha256": "ca8c4955052d262ff9eb9d16cfcac208f779dc4bad70b027d477b685f0952867"
+    },
+    {
+      "path": "docs/14_ACCEPTANCE_CRITERIA.md",
+      "sha256": "360d608242444b4839699553c83536127d9d6bf37664bf3151ad6fda2581758a"
+    },
+    {
+      "path": "docs/15_DESIGN_DECISIONS.md",
+      "sha256": "7ce71d995a4f6bd34a85fe9f063aa86297b38e2e061fa74be764848d9b2f95de"
+    },
+    {
+      "path": "docs/16_ADVANCED_ANALYTICS.md",
+      "sha256": "352ae96a89a894c463fcfeec0a29e361715c8c7a2f113422102c9fd38b7b2fb7"
+    },
+    {
+      "path": "docs/17_PROVIDER_SCALE_AND_SLOS.md",
+      "sha256": "f7fc9723071a2472c2238c7187803585099a3902c5b3e8ce21328039292843ab"
+    },
+    {
+      "path": "docs/18_PILOT_AND_DEMONSTRATION_PLAN.md",
+      "sha256": "0d51d80053f6fb8f6139fa636757c0415b26ce51d16eaecc0a60fa2d5b55f7ef"
+    },
+    {
+      "path": "docs/19_CONTROLS_AND_STANDARDS_MAPPING.md",
+      "sha256": "eb03a25271534ed0432e18a52ed7431647d63d41fbd17977327f9f9aae6ae7d0"
+    },
+    {
+      "path": "docs/20_SAFETY_CASE_AND_FAILURE_ANALYSIS.md",
+      "sha256": "e521d23469f21b2a7ff8b710e0f7a42bd8da7847e1642b3da2e609deb9be67ea"
+    },
+    {
+      "path": "docs/21_REFERENCE_DEPLOYMENT_BLUEPRINT.md",
+      "sha256": "cf1a70a71ddfac18399fe467b7a13f9dede564ddd500a60b40738859c9d6e20e"
+    },
+    {
+      "path": "docs/22_OPERATOR_UI_AND_WORKFLOWS.md",
+      "sha256": "573a66924be03d008540323ab40d6d8e468b8b1dc7bf7b98b3884f68ec863b46"
+    },
+    {
+      "path": "docs/23_BEHAVIORAL_DETECTION_SUITE.md",
+      "sha256": "422724eea8ce6ef679e67d50745427cdb4bdc412994b62ffcf33877695e2d6f3"
+    },
+    {
+      "path": "docs/24_ENCRYPTION_AND_BYPASS_RESISTANCE.md",
+      "sha256": "322ee5e859da0e472dc80f0648b496c4ee1f6db374fc9f661c346d58a585c542"
+    },
+    {
+      "path": "docs/25_LAYERED_INTERDICTION_AND_SHARED_INFRASTRUCTURE.md",
+      "sha256": "51813cf55505de0ad4d581d545043a97689a25305ecbe083f1aa6c9abafc3498"
+    },
+    {
+      "path": "docs/26_ALLOW_FIRST_MODE_FOR_CRITICAL_SEGMENTS.md",
+      "sha256": "b44e20a34f973ede5d090227792bd4c81ddcb683e15c39754d675a7752b4b4bc"
+    },
+    {
+      "path": "docs/27_VIRTUAL_PATCHING_AND_EXPLOIT_PREVENTION.md",
+      "sha256": "945b83f093c26971a4e26580584710c04c97ab26cc50007bbaf9ab3d4bc97934"
+    },
+    {
+      "path": "docs/28_AI_ERA_ATTACK_POSTURE.md",
+      "sha256": "63688d285788ff6a81e98634cb4d1f356b66149534739da830910b8537b24fc3"
+    },
+    {
+      "path": "docs/29_DETERMINISTIC_RANDOMIZATION.md",
+      "sha256": "5740c913028316f933ac2d3d9d846d119f0fc5595e4d8f4fcd8347c1f6c4a318"
+    },
+    {
+      "path": "docs/30_REQUESTER_ATTRIBUTION_AND_FINGERPRINTING.md",
+      "sha256": "4659f0d39b8859d1fdbd6ec0762006c57fe0bef2b0f4c9291f869e4b7c2ca4de"
+    },
+    {
+      "path": "examples/indicators.json",
+      "sha256": "2aedba45271dffa0b4a7c5983b9784d3c50adcc93c01894fca65dd3143eac150"
+    },
+    {
+      "path": "examples/openc2_intent_example.json",
+      "sha256": "04379328133bbb66410873125f82d9111b5ada692f1783803ecac46c9539aeaa"
+    },
+    {
+      "path": "examples/policy.toml",
+      "sha256": "13bdef9afa54446ab80b4ebf74e4e301c264bc0d9bb395b8c56e8c540fe0b6bf"
+    },
+    {
+      "path": "examples/transactions.jsonl",
+      "sha256": "d96c34536fc9e140a535040c1427bbf41deadaad8cea490f23735a6b7950c64b"
+    },
+    {
+      "path": "reference/README.md",
+      "sha256": "b6e7aae35d0f7bdc182af0215f1f258b8417c2f0824418498c4a2f9e20125010"
+    },
+    {
+      "path": "reference/pyproject.toml",
+      "sha256": "14423bc6adef64dcbdcaa8c5e493e46d3cffcc7d5f550ccec41325dadd0b93a5"
+    },
+    {
+      "path": "reference/src/apip/__init__.py",
+      "sha256": "91447944015cec709e8aa7655f7e9d64e1e4508e7023a57fe3746911c0fc6fed"
+    },
+    {
+      "path": "reference/src/apip/attribution.py",
+      "sha256": "32388a026d0f0a4bc82ab73bdfa4a5b525b8edca1bd8201f2ec5c675151b642a"
+    },
+    {
+      "path": "reference/src/apip/cli.py",
+      "sha256": "7f42c0eb6f8edd8d77f9d5e3a9a8256969e26d5a3724abeed055ad14054a702f"
+    },
+    {
+      "path": "reference/src/apip/config.py",
+      "sha256": "a2d7a57448cafc0375ccf5ee57514ae10030b5c87c2d4e3e5a650947cc35b2ea"
+    },
+    {
+      "path": "reference/src/apip/exporters/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "reference/src/apip/exporters/rpz.py",
+      "sha256": "73caf5bb0b15a940802f61640486e670d841aa8481e32bd595b4bd2c1fe73aa7"
+    },
+    {
+      "path": "reference/src/apip/exporters/suricata.py",
+      "sha256": "1eca983f903f55fd91aa9437694e7a47ceaf747399096f1225c1be49a7b102b0"
+    },
+    {
+      "path": "reference/src/apip/io.py",
+      "sha256": "9a7ff014f30340bd2b8c04e93a8fb9488f08e7d27517b3fa9049dccd81f141ad"
+    },
+    {
+      "path": "reference/src/apip/models.py",
+      "sha256": "c339bf424d2ca7cce6516bdbfdbc447ba32dec363ace008c3fc2d4bb91502aa0"
+    },
+    {
+      "path": "reference/src/apip/policy.py",
+      "sha256": "2045157baceda7c6ef21d306a05236ad57ee99c0d132f368be6868d1365798e3"
+    },
+    {
+      "path": "reference/src/apip/randomize.py",
+      "sha256": "8350a4ccd993a5db4a258724ade4ed0c9208a040e296269155054e70484ae71e"
+    },
+    {
+      "path": "reference/src/apip/registry.py",
+      "sha256": "18144f129c13e4cb7987d907ff7742cb3aae941860d7ddd145133acafa8bba57"
+    },
+    {
+      "path": "reference/src/apip/scoring.py",
+      "sha256": "8c89941edea7b1e7c809d19e2ba3d08006d1e71b4473512d40187665fe2e8727"
+    },
+    {
+      "path": "reference/tests/test_attribution.py",
+      "sha256": "28b335562f421d78b47ab9e781ddb3afb2d9d63f8c50e98e91ec5ef8052ec846"
+    },
+    {
+      "path": "reference/tests/test_config_validation.py",
+      "sha256": "77a8d062806392280a03e1503a9147e7cef3bce999ad9e25a5fe7a84f6b5a031"
+    },
+    {
+      "path": "reference/tests/test_no_ai_conformance.py",
+      "sha256": "549696f6a72e0b6f66e421e7660ca586c7945f1cd5a129683440345a618361e1"
+    },
+    {
+      "path": "reference/tests/test_policy.py",
+      "sha256": "cd2e16696c77b31930492cec5a713f9c0531f9058224280392633e2c2ead1793"
+    },
+    {
+      "path": "reference/tests/test_randomize.py",
+      "sha256": "c639eaecaead6b7f9ef90fd70b37f75599a84740c318acbf044099fb56b8ba88"
+    },
+    {
+      "path": "reference/tests/test_schema_consistency.py",
+      "sha256": "21eb4169653967fb43e59c9fb099a6d39e04581565242485021fe2c44c9323a7"
+    },
+    {
+      "path": "reference/tests/test_scoring.py",
+      "sha256": "45856387647604084e232a7e4fc96904fe16bd2746882d9d180760cfc7783f58"
+    },
+    {
+      "path": "reference/verify.sh",
+      "sha256": "db24c02e19ac9de897728c548b85010967eac4a42313fecc22fbf386f40caa85"
+    },
+    {
+      "path": "schemas/action_receipt.schema.json",
+      "sha256": "f6d8a89c34ecec50c2157844831e5373824f5a6ac5305f76ee44f2efc2a453d3"
+    },
+    {
+      "path": "schemas/behavior_event.schema.json",
+      "sha256": "191de083c4af7244bb2da4dd963d8180b755a579b782ff80182b85f83357e43f"
+    },
+    {
+      "path": "schemas/decision.schema.json",
+      "sha256": "7cbb534154075c8ee0abaf6e038ba61c8fc2fd18f64a4523cf2bacacd3ab3c6a"
+    },
+    {
+      "path": "schemas/indicator.schema.json",
+      "sha256": "38696b3ebbac0f7e7616c9f46bf6776a57a7e21ad34bc2aa9d3f41ad9ca6ce9d"
+    },
+    {
+      "path": "schemas/policy.schema.json",
+      "sha256": "96368adea6b9a95d04b384646ea99211dce85b154802daa69765934d4845ca55"
+    },
+    {
+      "path": "sources.json",
+      "sha256": "6f074cdc06f8e204fc9cf1d70addc8d5278cbdeedc641a14c1a7e9eddecbdef2"
+    }
+  ]
+}

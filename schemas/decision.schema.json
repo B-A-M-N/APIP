@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/apip/decision.schema.json",
+  "title": "APIP Decision",
+  "type": "object",
+  "required": [
+    "id",
+    "indicator_id",
+    "maliciousness",
+    "action_safety",
+    "disposition",
+    "action",
+    "rung",
+    "scope",
+    "ttl_seconds",
+    "policy_version",
+    "reason_codes"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "indicator_id": {
+      "type": "string"
+    },
+    "maliciousness": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "action_safety": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "disposition": {
+      "enum": [
+        "NO_ACTION",
+        "OBSERVE",
+        "SHADOW_ACTION",
+        "PROPOSE_OPERATOR_APPROVAL",
+        "AUTO_ENFORCE",
+        "REVOKE"
+      ]
+    },
+    "action": {
+      "enum": [
+        "none",
+        "observe",
+        "challenge",
+        "rate_limit",
+        "egress_allowlist_deny",
+        "dns_nxdomain",
+        "dns_nodata",
+        "firewall_deny",
+        "proxy_deny",
+        "proxy_challenge",
+        "host_quarantine",
+        "routing_filter",
+        "virtual_patch"
+      ]
+    },
+    "rung": {
+      "description": "Interdiction ladder rung (docs/25). L0 observe, L1 challenge, L2 rate-limit, L3 egress-allowlist, L4 domain block, L5 IP deny, L6 host quarantine, L7 routing, NONE for no action.",
+      "enum": [
+        "NONE",
+        "L0",
+        "L1",
+        "L2",
+        "L3",
+        "L4",
+        "L5",
+        "L6",
+        "L7"
+      ]
+    },
+    "scope": {
+      "type": "string"
+    },
+    "segment_id": {
+      "type": "string",
+      "description": "Present when the decision applies to an allow-first segment (docs/26)."
+    },
+    "ttl_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Actual TTL after any randomized jitter (docs/29)."
+    },
+    "nominal_ttl_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Policy-nominal TTL before jitter; present when randomization applied."
+    },
+    "policy_version": {
+      "type": "string"
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "explanation": {
+      "type": "string"
+    },
+    "randomization": {
+      "type": ["object", "null"],
+      "description": "Recorded draw enabling exact replay (docs/29); null when no randomized mechanism applied.",
+      "required": ["mechanism", "bounds_version", "seed_id", "draw"],
+      "properties": {
+        "mechanism": {
+          "enum": [
+            "challenge_sampling",
+            "rate_ceiling",
+            "ttl_jitter",
+            "shadow_review_sampling",
+            "threshold_dither",
+            "window_placement",
+            "quarantine_variant",
+            "other"
+          ]
+        },
+        "bounds_version": {"type": "string"},
+        "seed_id": {"type": "string"},
+        "draw": {
+          "type": "object",
+          "description": "Mechanism-specific resulting values.",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

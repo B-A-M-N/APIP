@@ -1,0 +1,99 @@
+policy_version = "2026-09-01.2"
+mode = "SHADOW"
+scope = "example-tenant"
+
+[thresholds]
+observe_m = 40
+fqdn_auto_m = 95
+fqdn_auto_s = 90
+ip_rate_m = 90
+ip_rate_s = 85
+ip_deny_m = 98
+ip_deny_s = 95
+
+# v2: per-rung automation floors (docs/25). Higher rungs are at least as strict.
+[thresholds.rungs.L1]
+m = 85
+s = 75
+
+[thresholds.rungs.L2]
+m = 90
+s = 80
+
+[thresholds.rungs.L4]
+m = 95
+s = 90
+
+[thresholds.rungs.L5]
+m = 98
+s = 95
+
+[limits]
+max_auto_ttl_seconds = 3600
+max_new_auto_actions_per_batch = 100
+# L1 client-impact budget (docs/25): at most 5% of interactive transactions challenged/hour
+max_challenged_transaction_fraction_per_hour = 0.05
+
+[safety]
+auto_prefix_deny = false
+auto_routing = false
+auto_wildcard_domain = false
+allowlist_precedence = true
+no_ai_components = true
+
+# v2: behavioral suite policy (docs/23)
+[behavioral]
+enabled_families = [
+  "beacon_periodicity",
+  "dga_likelihood",
+  "dns_tunneling",
+  "fastflux",
+  "volume_anomaly",
+  "first_seen_novelty",
+  "tls_metadata_mismatch",
+]
+max_behavioral_m_contribution = 60
+
+[behavioral.corroboration]
+distinct_families_for_rate_limit = 2
+distinct_families_for_deny = 3
+deny_also_requires_external = true
+
+# v2: allow-first segment (docs/26). Example OT DMZ segment in SHADOW stage.
+[segments.ot-dmz-a]
+mode = "ALLOW_FIRST"
+onboarding_stage = "SHADOW"
+owner = "ot-ops"
+review_cadence_days = 90
+allowlist_ttl_days = 180
+max_denied_volume_alarm_per_hour = 50
+break_glass_profile = "QUARANTINE_ALLOWLIST"
+
+# v2: seeded randomization bounds (docs/29). Draws are recorded per decision.
+[randomization]
+enabled = true
+bounds_version = "rv-2026-09-01.1"
+
+[randomization.mechanisms.ttl_jitter]
+enabled = true
+min = 0.8
+max = 1.0
+units = "fraction_of_nominal_ttl"
+
+[randomization.mechanisms.rate_ceiling]
+enabled = true
+min = 0.5
+max = 1.0
+units = "fraction_of_nominal_ceiling"
+
+[randomization.mechanisms.challenge_sampling]
+enabled = true
+min = 0.1
+max = 1.0
+units = "fraction_of_eligible_clients"
+
+[randomization.mechanisms.threshold_dither]
+enabled = true
+min = 0.9
+max = 1.1
+units = "fraction_of_policy_threshold"

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/apip/behavior_event.schema.json",
+  "title": "APIP Behavioral Event",
+  "description": "Deterministic behavioral detection output (docs/23) submitted as evidence. Behavioral evidence is subject to the same scoring, corroboration, and policy gates as any other source and can never alone authorize a deny.",
+  "type": "object",
+  "required": ["id", "family", "family_version", "detected_at", "subject", "features"],
+  "properties": {
+    "id": {"type": "string"},
+    "family": {
+      "enum": [
+        "beacon_periodicity",
+        "dga_likelihood",
+        "dns_tunneling",
+        "fastflux",
+        "volume_anomaly",
+        "first_seen_novelty",
+        "tls_metadata_mismatch",
+        "sync_first_contact"
+      ]
+    },
+    "family_version": {"type": "string"},
+    "detected_at": {"type": "string", "format": "date-time"},
+    "window": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "start": {"type": "string", "format": "date-time"},
+        "end": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    },
+    "subject": {
+      "type": "object",
+      "description": "What the detection observed: internal host (pseudonymized) and/or external observable.",
+      "properties": {
+        "host_pseudonym": {"type": "string"},
+        "observable_type": {"type": "string", "enum": ["fqdn", "ipv4", "ipv6", "flow", "tls_fingerprint"]},
+        "observable_value": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "features": {
+      "type": "object",
+      "description": "Exact feature vector computed by the family; deterministic given telemetry and baseline version.",
+      "additionalProperties": true
+    },
+    "baseline_version": {"type": "string"},
+    "band": {"type": "string", "enum": ["low", "medium", "high"]},
+    "origin": {"const": "local_behavioral"},
+    "corroboration_group": {
+      "type": "string",
+      "description": "Family-group identifier used by the k-of-n corroboration lattice."
+    }
+  },
+  "additionalProperties": false
+}

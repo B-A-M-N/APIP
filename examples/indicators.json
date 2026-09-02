@@ -1,0 +1,108 @@
+[
+  {
+    "id": "indicator--demo-domain",
+    "type": "fqdn",
+    "value": "c2-demo.invalid",
+    "sources": ["curated-a", "curated-b", "local-sensor"],
+    "first_seen": "2026-09-01T19:00:00Z",
+    "last_seen": "2026-09-01T20:00:00Z",
+    "marking": "TLP:CLEAR",
+    "tags": ["c2"],
+    "evidence": [
+      {"kind": "curated_source", "source_id": "curated-a", "observed_at": "2026-09-01T19:00:00Z"},
+      {"kind": "curated_source", "source_id": "curated-b", "observed_at": "2026-09-01T19:05:00Z"},
+      {"kind": "direct_local_detection", "source_id": "local-sensor", "observed_at": "2026-09-01T19:50:00Z"},
+      {"kind": "exact_fqdn", "source_id": "local-sensor", "observed_at": "2026-09-01T19:50:00Z"},
+      {"kind": "recent", "source_id": "local-sensor", "observed_at": "2026-09-01T20:00:00Z"},
+      {"kind": "bounded_scope", "source_id": "local-sensor", "observed_at": "2026-09-01T20:00:00Z"},
+      {"kind": "verified_rollback", "source_id": "local-sensor", "observed_at": "2026-09-01T20:00:00Z"}
+    ]
+  },
+  {
+    "id": "indicator--demo-ip-shared",
+    "type": "ipv4",
+    "value": "203.0.113.66",
+    "sources": ["curated-a"],
+    "first_seen": "2026-09-01T18:00:00Z",
+    "last_seen": "2026-09-01T20:00:00Z",
+    "marking": "TLP:CLEAR",
+    "tags": ["suspected-c2", "shared-cloud"],
+    "evidence": [
+      {"kind": "single_curated_source", "source_id": "curated-a", "observed_at": "2026-09-01T18:00:00Z"},
+      {"kind": "recent", "source_id": "curated-a", "observed_at": "2026-09-01T20:00:00Z"},
+      {"kind": "shared_cloud", "source_id": "curated-a", "observed_at": "2026-09-01T20:00:00Z"},
+      {"kind": "exact_ip", "source_id": "curated-a", "observed_at": "2026-09-01T20:00:00Z"}
+    ]
+  },
+  {
+    "id": "indicator--demo-ip-dedicated",
+    "type": "ipv4",
+    "value": "198.51.100.44",
+    "sources": ["curated-a", "curated-b", "local-sensor"],
+    "first_seen": "2026-09-01T18:00:00Z",
+    "last_seen": "2026-09-01T20:00:00Z",
+    "marking": "TLP:CLEAR",
+    "tags": ["c2", "dedicated"],
+    "evidence": [
+      {"kind": "curated_source", "source_id": "curated-a", "observed_at": "2026-09-01T18:00:00Z"},
+      {"kind": "curated_source", "source_id": "curated-b", "observed_at": "2026-09-01T18:10:00Z"},
+      {"kind": "direct_local_detection", "source_id": "local-sensor", "observed_at": "2026-09-01T19:30:00Z"},
+      {"kind": "recent", "source_id": "local-sensor", "observed_at": "2026-09-01T20:00:00Z"},
+      {"kind": "exact_ip", "source_id": "local-sensor", "observed_at": "2026-09-01T20:00:00Z"},
+      {"kind": "dedicated_use", "source_id": "local-sensor", "observed_at": "2026-09-01T20:00:00Z"},
+      {"kind": "verified_rollback", "source_id": "local-sensor", "observed_at": "2026-09-01T20:00:00Z"}
+    ]
+  },
+  {
+    "id": "indicator--demo-dga-fresh",
+    "type": "fqdn",
+    "value": "x7fjq2m9zk4p8w.invalid",
+    "sources": ["local-behavioral"],
+    "first_seen": "2026-09-01T19:45:00Z",
+    "last_seen": "2026-09-01T20:00:00Z",
+    "marking": "TLP:CLEAR",
+    "tags": ["first-seen", "dga-like"],
+    "evidence": [
+      {"kind": "behavioral_dga_likelihood", "source_id": "local-behavioral", "observed_at": "2026-09-01T19:45:00Z"},
+      {"kind": "behavioral_first_seen_novelty", "source_id": "local-behavioral", "observed_at": "2026-09-01T19:45:00Z"},
+      {"kind": "recent", "source_id": "local-behavioral", "observed_at": "2026-09-01T20:00:00Z"}
+    ]
+  },
+  {
+    "id": "indicator--demo-shared-c2",
+    "type": "fqdn",
+    "value": "c2-on-cdn-demo.invalid",
+    "sources": ["curated-a", "curated-b", "local-behavioral", "local-sensor"],
+    "first_seen": "2026-09-01T19:10:00Z",
+    "last_seen": "2026-09-01T20:00:00Z",
+    "marking": "TLP:CLEAR",
+    "tags": ["c2", "shared-cloud"],
+    "evidence": [
+      {"kind": "curated_source", "source_id": "curated-a", "observed_at": "2026-09-01T19:10:00Z"},
+      {"kind": "curated_source", "source_id": "curated-b", "observed_at": "2026-09-01T19:20:00Z"},
+      {"kind": "behavioral_beacon_periodicity", "source_id": "local-behavioral", "observed_at": "2026-09-01T19:40:00Z"},
+      {"kind": "behavioral_first_seen_novelty", "source_id": "local-behavioral", "observed_at": "2026-09-01T19:45:00Z"},
+      {"kind": "exact_fqdn", "source_id": "local-sensor", "observed_at": "2026-09-01T20:00:00Z"},
+      {"kind": "recent", "source_id": "local-sensor", "observed_at": "2026-09-01T20:00:00Z"},
+      {"kind": "bounded_scope", "source_id": "local-sensor", "observed_at": "2026-09-01T20:00:00Z"},
+      {"kind": "verified_rollback", "source_id": "local-sensor", "observed_at": "2026-09-01T20:00:00Z"},
+      {"kind": "shared_cloud", "source_id": "curated-a", "observed_at": "2026-09-01T20:00:00Z"}
+    ]
+  },
+  {
+    "id": "indicator--demo-poisoned-score-attempt",
+    "type": "fqdn",
+    "value": "score-injection-attempt.invalid",
+    "sources": ["curated-a"],
+    "first_seen": "2026-09-01T19:55:00Z",
+    "last_seen": "2026-09-01T20:00:00Z",
+    "marking": "TLP:CLEAR",
+    "tags": ["demonstration"],
+    "evidence": [
+      {"kind": "curated_source", "source_id": "curated-a", "observed_at": "2026-09-01T19:55:00Z",
+       "points_m": 100, "points_s": 100, "origin": "local_behavioral",
+       "family": "beacon_periodicity", "independent": true,
+       "note": "A malicious source attempting to smuggle points, origin, family and independence flags. All ignored server-side."}
+    ]
+  }
+]

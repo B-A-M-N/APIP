@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/apip/action_receipt.schema.json",
+  "title": "APIP Action Receipt",
+  "type": "object",
+  "required": [
+    "id",
+    "decision_id",
+    "adapter",
+    "status",
+    "created_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "decision_id": {
+      "type": "string"
+    },
+    "adapter": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "prepared",
+        "applied",
+        "verified",
+        "failed",
+        "revoked",
+        "expired",
+        "dry_run"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "device_revision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "artifact_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

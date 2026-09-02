@@ -1,0 +1,15 @@
+{
+  "command_id": "cmd--demo-domain",
+  "action": "deny",
+  "target": {
+    "domain_name": "c2-demo.invalid"
+  },
+  "actuator": {
+    "type": "dns-rpz"
+  },
+  "modifiers": {
+    "duration": 3600,
+    "scope": "example-tenant"
+  },
+  "decision_id": "decision--demo-domain"
+}

@@ -1,0 +1,64 @@
+APIP specification package verification — v2.1
+Date: 2026-09-01
+
+Reference scaffold:
+- python -m unittest discover -s tests -v: PASS (82 tests)
+- ./verify.sh: PASS
+- dry-run evaluation: PASS (6 synthetic indicators, SHADOW mode)
+  - exact-FQDN C2 -> L4 domain block (dns_nxdomain, shadow)
+  - shared-cloud IP -> L0 observe (identity-unsafe, context evidence below floors)
+  - dedicated-IP C2 -> L5 IP deny (shadow)
+  - first-seen DGA-like domain (single behavioral family) -> L0 OBSERVE
+    (uncorroborated behavioral cap below all action floors)
+  - C2 on shared CDN (2 behavioral families + external) -> L2 pair rate-limit
+  - evidence payload smuggling points/origin/family -> NO_ACTION (inert)
+  - shared-CDN C2 domain -> L4 domain block (shadow) — the v1 shared-infra
+    safe harbor no longer suppresses action; L5 demoted, L4 retained
+- seeded TTL randomization: draws recorded per decision, within policy
+  bounds, replay-deterministic (CI-enforced)
+
+Data/interface validation:
+- JSON parse: PASS for all JSON schemas, sources.json, and JSON examples
+- generated decisions validate against schemas/decision.schema.json: PASS (6/6)
+- behavioral evidence records conform to family enum (incl. sync_first_contact): PASS
+- OpenAPI YAML parse: PASS (PyYAML)
+- examples/policy.toml TOML parse: PASS
+
+No-AI conformance (docs/28) — CI-ENFORCED via tests/test_no_ai_conformance.py, run in verify.sh:
+- dependency allowlist: security-bearing modules import only the deterministic stdlib allowlist: PASS (test)
+- AI package ban list (torch/transformers/openai/anthropic/...): zero imports anywhere: PASS (test)
+- static inference-call-shape scan (complete/predict/embed/infer/...): zero occurrences: PASS (test)
+- no `random` module usage; all draws via recorded ApipRng (SHA-256 DRBG, no os.urandom): PASS (test)
+- pyproject declares zero runtime dependencies: PASS (test)
+- full evaluation path executes with sockets blocked (offline operation): PASS (test)
+- AI-evidence invariance regression: decisions byte-identical with and without
+  annotation-class records, across weak/deny-strength/L5/negative-weight evidence:
+  PASS (tests/test_policy.py::AnnotationInvarianceTests)
+- attribution-output isolation (docs/30): decisions byte-identical with and without
+  attribution records; bounded correlation store degrades deterministically;
+  PASS (tests/test_attribution.py)
+
+Requester attribution collection channel (docs/30, offline reference form):
+- observable-behavior extraction over a JSONL transaction log (6 records):
+  PASS — 3 rotating IPs collapse to one fingerprint; a second toolchain forms
+  its own group; cross-group link reported by shared-probe count
+- decisions carry NO attribution refs unless a transaction log is supplied;
+  the report is display-only output (attribution_report.json)
+
+v2.1 attack-surface closure (documented; scaffold coverage as noted):
+- plaintext-53 redirect-to-managed + resolver baseline: spec (FR-029, docs/24)
+- tuple-form allowlist entries + traffic profiles + drift-as-finding: spec (FR-030, docs/26)
+- capacity ceilings on constrained segments: spec (FR-031, docs/25)
+- BD-8 synchronized first-contact family: spec + schema enum (FR-032, docs/23)
+- standing exposure drift detection, operator-owned-space-only scanning: spec (FR-033, docs/27)
+- defend-the-defender deployment posture: spec (FR-034, docs/09)
+
+Safety state of reference scaffold:
+- no network calls
+- no firewall modification
+- no resolver modification
+- no BGP/routing modification
+- emits files only
+- bundled sample network indicators use .invalid or RFC TEST-NET address space
+
+This verification proves the included scaffold behaves as described. It is not a production security certification and does not validate any future live adapter.

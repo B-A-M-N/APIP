@@ -1,0 +1,347 @@
+openapi: 3.1.0
+info:
+  title: APIP Control Plane API
+  version: 0.1.0-draft
+  description: >-
+    Draft operator-authorized defensive control-plane API. This contract is for
+    evidence, decisions, approvals, bundles, and receipts; it is not an endpoint
+    for arbitrary network commands.
+servers:
+  - url: https://apip.operator.invalid/api/v1
+security:
+  - mTLS: []
+paths:
+  /indicators:
+    post:
+      summary: Submit normalized or source-derived threat evidence
+      operationId: createIndicator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Indicator'}
+      responses:
+        '202': {description: Accepted for evidence processing}
+        '400': {description: Invalid or unsupported evidence}
+        '403': {description: Source not authorized}
+  /decisions:
+    get:
+      summary: Query decisions within caller scope
+      operationId: listDecisions
+      parameters:
+        - in: query
+          name: disposition
+          schema: {type: string}
+        - in: query
+          name: tenant_id
+          schema: {type: string}
+      responses:
+        '200':
+          description: Decision list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Decision'}
+  /decisions/{decision_id}:
+    get:
+      summary: Read one decision and its explanation
+      operationId: getDecision
+      parameters:
+        - in: path
+          name: decision_id
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Decision
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Decision'}
+        '404': {description: Not found in caller scope}
+  /decisions/{decision_id}/approvals:
+    post:
+      summary: Approve or reject a policy-generated proposal
+      operationId: decideApproval
+      parameters:
+        - in: path
+          name: decision_id
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision, reason]
+              properties:
+                decision: {type: string, enum: [approve, reject]}
+                reason: {type: string, minLength: 1}
+                requested_ttl_seconds: {type: integer, minimum: 1}
+      responses:
+        '200': {description: Approval decision recorded}
+        '409': {description: Decision no longer eligible or policy changed}
+  /bundles:
+    get:
+      summary: Fetch signed desired-state bundle metadata for an authorized edge
+      operationId: listBundles
+      responses:
+        '200':
+          description: Bundle metadata
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Bundle'}
+  /behavior-events:
+    post:
+      summary: Submit deterministic behavioral detection output as evidence
+      description: >-
+        Behavioral events are evidence only (docs/23). They feed the same
+        scoring/corroboration/policy pipeline as any other source and can
+        never alone authorize a deny action.
+      operationId: createBehaviorEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BehaviorEvent'}
+      responses:
+        '202': {description: Accepted as evidence}
+        '400': {description: Invalid event}
+  /coverage:
+    get:
+      summary: Chokepoint coverage ledger per population segment
+      description: >-
+        Measured fraction of DNS-bearing sessions observed at the managed
+        resolver versus total egress sessions (docs/24). Populations below
+        the coverage floor are excluded from protected-population claims.
+      operationId: getCoverage
+      responses:
+        '200':
+          description: Coverage report
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/CoverageEntry'}
+  /segments:
+    get:
+      summary: List allow-first segments and lifecycle stages
+      operationId: listSegments
+      responses:
+        '200':
+          description: Segment list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Segment'}
+  /segments/{segment_id}/stage-transitions:
+    post:
+      summary: Advance or regress a segment's onboarding stage (approval-gated)
+      description: >-
+        Stage transitions follow the docs/26 lifecycle. Forward transitions
+        to ENFORCE require the segment approver role; emergency regression
+        (ENFORCE to SHADOW) is the segment stop and requires operator action.
+      operationId: transitionSegment
+      parameters:
+        - in: path
+          name: segment_id
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_stage, reason]
+              properties:
+                to_stage: {type: string, enum: [ENUMERATE, SIMULATE, SHADOW, CANARY, ENFORCE, REVIEW]}
+                reason: {type: string, minLength: 1}
+      responses:
+        '200': {description: Transition recorded}
+        '409': {description: Invalid transition or gate unmet}
+  /virtual-patches:
+    get:
+      summary: List virtual patches with stage and patch-tracking state
+      operationId: listVirtualPatches
+      responses:
+        '200':
+          description: Virtual patch list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/VirtualPatch'}
+    post:
+      summary: Propose a virtual patch (compiled through the normal decision pipeline)
+      operationId: proposeVirtualPatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/VirtualPatch'}
+      responses:
+        '202': {description: Proposal accepted for staging}
+  /receipts:
+    post:
+      summary: Submit edge application/verification receipt
+      operationId: createReceipt
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Receipt'}
+      responses:
+        '202': {description: Receipt accepted}
+  /revocations:
+    post:
+      summary: Revoke an existing authorized action
+      operationId: createRevocation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision_id, reason]
+              properties:
+                decision_id: {type: string}
+                reason: {type: string, minLength: 1}
+      responses:
+        '202': {description: Revocation compiled for applicable edges}
+  /health:
+    get:
+      security: []
+      summary: Readiness/liveness summary without sensitive evidence
+      operationId: health
+      responses:
+        '200': {description: Healthy}
+components:
+  securitySchemes:
+    mTLS:
+      type: mutualTLS
+  schemas:
+    Indicator:
+      type: object
+      required: [id, type, value, sources, evidence]
+      properties:
+        id: {type: string}
+        tenant_id: {type: string}
+        type: {type: string, enum: [fqdn, ipv4, ipv6, cidr, url, file_hash, cert_fingerprint, network_fingerprint]}
+        value: {type: string}
+        sources:
+          type: array
+          items: {type: string}
+        evidence:
+          type: array
+          items: {type: object, additionalProperties: true}
+    Decision:
+      type: object
+      required: [id, indicator_id, maliciousness, action_safety, disposition, action, rung, scope, ttl_seconds, policy_version, reason_codes]
+      properties:
+        id: {type: string}
+        indicator_id: {type: string}
+        tenant_id: {type: string}
+        maliciousness: {type: integer, minimum: 0, maximum: 100}
+        action_safety: {type: integer, minimum: 0, maximum: 100}
+        disposition: {type: string, enum: [NO_ACTION, OBSERVE, SHADOW_ACTION, PROPOSE_OPERATOR_APPROVAL, AUTO_ENFORCE, REVOKE]}
+        action: {type: string}
+        rung: {type: string, enum: [NONE, L0, L1, L2, L3, L4, L5, L6, L7]}
+        scope: {type: string}
+        segment_id: {type: string}
+        ttl_seconds: {type: integer, minimum: 0}
+        nominal_ttl_seconds: {type: integer, minimum: 0}
+        policy_version: {type: string}
+        reason_codes:
+          type: array
+          items: {type: string}
+        explanation: {type: string}
+        randomization:
+          type: object
+          description: Recorded draw enabling exact replay (docs/29)
+          properties:
+            mechanism: {type: string}
+            bounds_version: {type: string}
+            seed_id: {type: string}
+            draw: {type: object, additionalProperties: true}
+    BehaviorEvent:
+      type: object
+      description: Deterministic behavioral detection output as evidence (docs/23)
+      required: [id, family, family_version, detected_at, subject, features]
+      properties:
+        id: {type: string}
+        family: {type: string, enum: [beacon_periodicity, dga_likelihood, dns_tunneling, fastflux, volume_anomaly, first_seen_novelty, tls_metadata_mismatch, sync_first_contact]}
+        family_version: {type: string}
+        detected_at: {type: string, format: date-time}
+        subject:
+          type: object
+          properties:
+            host_pseudonym: {type: string}
+            observable_type: {type: string}
+            observable_value: {type: string}
+        features: {type: object, additionalProperties: true}
+        baseline_version: {type: string}
+        band: {type: string, enum: [low, medium, high]}
+        origin: {type: string, const: local_behavioral}
+    CoverageEntry:
+      type: object
+      description: Per-segment chokepoint coverage (docs/24)
+      required: [segment_id, coverage_fraction, floor, meets_floor]
+      properties:
+        segment_id: {type: string}
+        coverage_fraction: {type: number, minimum: 0, maximum: 1}
+        floor: {type: number, minimum: 0, maximum: 1}
+        meets_floor: {type: boolean}
+        address_family: {type: string, enum: [ipv4, ipv6]}
+        compensating_posture: {type: boolean}
+    Segment:
+      type: object
+      description: Allow-first segment state (docs/26)
+      required: [id, mode, onboarding_stage]
+      properties:
+        id: {type: string}
+        mode: {type: string, enum: [ALLOW_FIRST, STANDARD]}
+        onboarding_stage: {type: string, enum: [ENUMERATE, SIMULATE, SHADOW, CANARY, ENFORCE, REVIEW]}
+        owner: {type: string}
+        review_cadence_days: {type: integer}
+        break_glass: {type: object, properties: {active: {type: boolean}, expires_at: {type: string, format: date-time}}}
+    VirtualPatch:
+      type: object
+      description: Virtual patch record (docs/27)
+      required: [id, vp_class, asset_id, remediation_ticket]
+      properties:
+        id: {type: string}
+        vp_class: {type: string, enum: [VP-1, VP-2, VP-3, VP-4]}
+        asset_id: {type: string}
+        cve: {type: string}
+        stage: {type: string, enum: [proposed, shadow, canary, enforced, retiring, retired]}
+        remediation_ticket: {type: string}
+        created_at: {type: string, format: date-time}
+        review_date: {type: string, format: date-time}
+    Bundle:
+      type: object
+      required: [id, sequence, scope, created_at, expires_at, manifest_hash, signature]
+      properties:
+        id: {type: string}
+        sequence: {type: integer, minimum: 0}
+        scope: {type: string}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        manifest_hash: {type: string}
+        signature: {type: string}
+    Receipt:
+      type: object
+      required: [id, decision_id, adapter, status, created_at]
+      properties:
+        id: {type: string}
+        decision_id: {type: string}
+        adapter: {type: string}
+        status: {type: string, enum: [prepared, applied, verified, failed, reverted, expired, dry_run]}
+        created_at: {type: string, format: date-time}
+        device_revision: {type: [string, 'null']}
+        artifact_hash: {type: [string, 'null']}
+        message: {type: string}

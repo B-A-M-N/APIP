@@ -269,6 +269,13 @@ class CorrelationStore:
         self._max = max_requesters
         self._by_handle: dict[str, _RequesterState] = {}
         self.degraded: bool = False
+        # v2.2: the store is folded from handler threads (ChallengeOrigin.emit)
+        # as well as offline; observe() mutates shared state and must be
+        # atomic. Read paths (report/prune) are invoked from the pipeline
+        # thread and take the same lock, keeping the bounded-store contract
+        # exact under contention.
+        import threading as _threading
+        self._lock = _threading.RLock()
 
     def observe(self, tx: dict) -> dict[str, str] | None:
         """Fold one observed transaction into the requester's feature vector.
@@ -279,18 +286,19 @@ class CorrelationStore:
         if not feats:
             return None
         handle = handle_for(str(tx.get("client_ref", "")))
-        state = self._by_handle.get(handle)
-        if state is None:
-            if len(self._by_handle) >= self._max:
-                # deterministic degradation: stop tracking new handles
-                self.degraded = True
-                return None
-            state = _RequesterState(handle=handle)
-            self._by_handle[handle] = state
-        state.features.update(feats)
-        state.transactions += 1
-        state.last_seen = str(tx.get("observed_at", state.last_seen))
-        return fingerprint(state.features)
+        with self._lock:
+            state = self._by_handle.get(handle)
+            if state is None:
+                if len(self._by_handle) >= self._max:
+                    # deterministic degradation: stop tracking new handles
+                    self.degraded = True
+                    return None
+                state = _RequesterState(handle=handle)
+                self._by_handle[handle] = state
+            state.features.update(feats)
+            state.transactions += 1
+            state.last_seen = str(tx.get("observed_at", state.last_seen))
+            return fingerprint(state.features)
 
     def _evict_oldest(self) -> None:
         if not self._by_handle:
@@ -315,18 +323,19 @@ class CorrelationStore:
             return 0
         horizon = timedelta(seconds=ttl_seconds)
         expired = []
-        for s in self._by_handle.values():
-            try:
-                seen = datetime.fromisoformat(s.last_seen.replace("Z", "+00:00"))
-            except ValueError:
-                expired.append(s.handle)
-                continue
-            if seen > now + horizon:
-                expired.append(s.handle)          # future-stamped: treat as stale
-            elif seen + horizon < now:
-                expired.append(s.handle)          # genuinely aged out
-        for h in expired:
-            del self._by_handle[h]
+        with self._lock:
+            for s in self._by_handle.values():
+                try:
+                    seen = datetime.fromisoformat(s.last_seen.replace("Z", "+00:00"))
+                except ValueError:
+                    expired.append(s.handle)
+                    continue
+                if seen > now + horizon:
+                    expired.append(s.handle)          # future-stamped: treat as stale
+                elif seen + horizon < now:
+                    expired.append(s.handle)          # genuinely aged out
+            for h in expired:
+                del self._by_handle[h]
         return len(expired)
 
     def report(self, min_similarity: int = 3) -> dict:

@@ -1,121 +1,107 @@
-APIP specification package verification — v2.1.1
-Date: 2026-09-01
+APIP specification package verification — v2.2
+Date: 2026-09-02
 
 Reference scaffold:
-- python -m unittest discover -s tests -v: PASS (143 tests)
-- ./verify.sh: PASS
+- ./verify.sh: PASS (runs everything below, in order)
+- python -m unittest discover -s tests -v: PASS (187 tests)
+- no-AI conformance gate (docs/28): PASS (CI-enforced, see tests/
+  test_no_ai_conformance.py — dependency allowlist, AI package ban list,
+  inference-call-shape scan, ApipRng-only entropy, sockets-blocked run)
+- schema conformance (v2.2): PASS — every emitted artifact validated
+  against the shipped JSON schemas by the dependency-free validator
+  (tests/test_schema_conformance.py), cross-checked with the reference
+  `jsonschema` implementation when installed
 - dry-run evaluation: PASS (6 synthetic indicators, SHADOW mode,
   reference clock pinned by [replay].reference_now — byte-replay exact)
   - exact-FQDN C2 -> L4 domain block (dns_nxdomain, shadow)
-  - shared-cloud IP -> L0 observe (identity-unsafe, context evidence below floors)
+  - shared-cloud IP -> L0 observe (identity-unsafe, context evidence
+    below floors)
   - dedicated-IP C2 -> L5 IP deny (shadow)
   - first-seen DGA-like domain (single behavioral family) -> L0 OBSERVE
-    (uncorroborated behavioral cap below all action floors)
-  - C2 on shared CDN (2 behavioral families + external) -> L2 pair rate-limit
-    WITH drawn ceiling 232/min (bounds [120,240], recorded draw, rule
-    compiled as http.host + detection_filter with ceiling in metadata)
+  - C2 on shared CDN (2 behavioral families + external) -> L2 pair
+    rate-limit WITH drawn ceiling, rule compiled as http.host +
+    detection_filter with ceiling in metadata
   - evidence payload smuggling points/origin/family -> NO_ACTION (inert)
-- seeded randomization: TTL jitter + rate-ceiling draws recorded per
-  decision, within policy bounds, replay-deterministic (CI-enforced)
-- compiled artifacts carry decision id, ceiling, and TTL metadata; the
-  exporter REFUSES a ceilingless rate_limit (raises, never emits an intent)
+- BD-1 behavioral detector wired into the CLI (`--events`): detections
+  fold into matching indicators as local behavioral evidence through the
+  same weight table, caps, and corroboration lattice as any evidence
+- docs/25 L1 client-impact budget ENFORCED (v2.2 follow-up):
+  max_challenged_transaction_fraction_per_hour counts every
+  proxy_challenge against floor(fraction x measured volume); overflow
+  ALARMS and AUTO-REVERTS to L0 (client_impact_budget_exceeded /
+  challenge_auto_reverted_to_L0). Denominator is explicit operator
+  input ([measurement].interactive_transactions_per_hour or CLI
+  --transactions-per-hour); fraction set + unmeasured -> allowance 0
+  (fail closed). Survivors deterministic by (policy_version, id);
+  integer fixed-point arithmetic; non-challenge rungs never counted;
+  reversion emits no enforcement artifact. Pinned by
+  tests/test_independent_audit.py::ClientImpactBudgetTests (8 tests,
+  incl. CLI end-to-end). The offline scaffold enforces the budget
+  per batch against the full measured-hour allowance; cross-batch
+  hourly tracking requires the live deployment the scaffold
+  deliberately is not.
 
-v2.1.1 adversarial-audit residual closure (all pinned in
-tests/test_audit_residuals.py, 23 tests):
-- L2 rate ceiling: selector + recorded draw + exporter enforcement: PASS
-- fqdn pair rate-limits compile to real http.host rules: PASS
-- docs/23 envelopes exercised by a reference streaming detector
-  (apip/behavioral.py BD-1): bounded windows/events/emission,
-  stop-and-mark degradation, deterministic eviction: PASS
-- P5 key-order extractor hardened (bounded scan, charset, escape-aware,
-  hostile bodies fail closed): PASS
-- attribution handles keyed (HMAC-SHA-256, per-deployment key via
-  APIP_DEPLOYMENT_KEY / APIP_DEPLOYMENT_KEY_FILE; dev fallback bannered
-  in reports as UNKEYED HANDLES): PASS
-- replay clock pinning ([replay].reference_now): byte-exact replay: PASS
-- upstream provenance independence (resellers of one upstream
-  corroborate once): PASS
-- per-indicator evidence envelope (max_evidence_per_indicator,
-  deterministic truncation reason): PASS
-- lab adversary fidelity: churn scenario (full behavioral rotation
-  untraceable — engine claims nothing; partial churn linkable): PASS
+v2.2 independent-audit closure (all pinned in
+tests/test_independent_audit.py + tests/test_schema_conformance.py):
+- artifact-injection class closed at three boundaries: ingest charset
+  validation (ids/sources/kinds/timestamps), selector-gate refusal,
+  compile-time validation/escaping in both exporters. Demonstrated
+  injection PoC (indicator id -> suricata metadata rule injection)
+  now fails closed at load: PASS
+- corroboration kinds are claims, verified against derived upstream
+  provenance (one feed self-asserting two_curated_sources no longer
+  reaches L5; reseller chains count once): PASS
+- duplicate-record scoring collapse before the evidence envelope
+  (dedup-then-cap ordering preserves exculpatory evidence): PASS
+- canonical allowlist matching (case/trailing-dot/whitespace//32
+  spellings all match; wider prefixes deliberately never match a host):
+  PASS
+- allowlist expires_at enforced against the replay clock; governed
+  entries (owner+ticket) required at load: PASS
+- blast-radius budget enforced (max_new_auto_actions_per_batch; overflow
+  demotes to OBSERVE with a named reason): PASS
+- authorized_prefixes loadable from [authorization] policy section: PASS
+- thread-safe capture writer/counter/store (exact cap under 6-thread
+  contention, no closed-file exceptions): PASS
+- hostile Content-Length refused (400) or clamped; 30s handler timeout:
+  PASS
+- IPv6 cross-format handle stability ([v6]:port accepted, all spellings
+  canonicalize, zone ids rejected): PASS
+- emitted decisions conform to schemas/decision.schema.json (list-form
+  randomization + attribution_refs + epoch draw field now in schema):
+  PASS (6/6, both validators)
+- unicode/invisible-character/NUL id injection rejected at load: PASS
 
 Data/interface validation:
-- JSON parse: PASS for all JSON schemas, sources.json, and JSON examples
-- generated decisions validate against schemas/decision.schema.json: PASS (6/6)
-- behavioral evidence records conform to family enum (incl. sync_first_contact): PASS
+- JSON parse: PASS for all JSON schemas, sources.json, MANIFEST.json,
+  and JSON examples
 - OpenAPI YAML parse: PASS (PyYAML)
 - examples/policy.toml TOML parse: PASS
+- MANIFEST.json: 88 files hashed; verify with the snippet in that file's
+  directory (all hashes match this tree)
 
-No-AI conformance (docs/28) — CI-ENFORCED via tests/test_no_ai_conformance.py, run in verify.sh:
-- dependency allowlist: security-bearing modules import only the deterministic stdlib allowlist: PASS (test)
-- AI package ban list (torch/transformers/openai/anthropic/...): zero imports anywhere: PASS (test)
-- static inference-call-shape scan (complete/predict/embed/infer/...): zero occurrences: PASS (test)
-- no `random` module usage; all draws via recorded ApipRng (SHA-256 DRBG, no os.urandom): PASS (test)
-- pyproject declares zero runtime dependencies: PASS (test)
-- full evaluation path executes with sockets blocked (offline operation): PASS (test)
-- AI-evidence invariance regression: decisions byte-identical with and without
-  annotation-class records, across weak/deny-strength/L5/negative-weight evidence:
-  PASS (tests/test_policy.py::AnnotationInvarianceTests)
-- attribution-output isolation (docs/30): decisions byte-identical with and without
-  attribution records; bounded correlation store degrades deterministically;
-  PASS (tests/test_attribution.py)
+No-AI conformance (docs/28) — CI-ENFORCED via tests/test_no_ai_conformance.py,
+run inside verify.sh:
+- dependency allowlist: security-bearing modules import only the
+  deterministic stdlib allowlist (`threading` added in v2.2 for locks
+  only — no timers, no entropy): PASS
+- AI package ban list: zero imports anywhere: PASS
+- static inference-call-shape scan: zero occurrences: PASS
+- no `random` module usage; all draws via recorded ApipRng: PASS
+- pyproject declares zero runtime dependencies: PASS
+- full evaluation path executes with sockets blocked: PASS
+- AI-evidence invariance regression (byte-identical decisions with and
+  without annotation records): PASS
+- attribution-output isolation (decisions byte-identical with and
+  without attribution records; engine never auto-attaches refs): PASS
 
-Requester attribution collection channel (docs/30, offline reference form):
-- observable-behavior extraction over a JSONL transaction log (6 records):
-  PASS — 3 rotating IPs collapse to one fingerprint; a second toolchain forms
-  its own group; cross-group link reported by shared-probe count
-- adapter contract (schemas/observed_transaction.schema.json) enforced by
-  validate_transaction: unknown fields, bad enums, malformed lists REJECTED
-  not coerced: PASS (test)
-- operator correlation view: deterministic read-only HTML render
-  (attribution_report.html) — groups, shared-probe links, degraded banner,
-  pseudonymous handles only: PASS (test)
-- live capture path (apip.live, loopback-only): challenge origin observed real
-  HTTP — P1 header-order vectors, P4 conditional-request classes, P5
-  challenge key-order all captured and folded into one 5-probe fingerprint;
-  non-loopback bind refused by default; writer bounded with stop-and-mark
-- terminator log adapters (envoy/haproxy/nginx): mixed-format sample log
-  parsed to contract-valid records (6 parsed / 0 rejected / 1 unparsed,
-  garbage counted not guessed); same behavior across formats correlates via
-  value-matched containment links
-- decisions carry NO attribution refs unless a transaction log is supplied;
-  the report is display-only output
+Lab:
+- lab/run.sh: PASS (7/7 scenarios; loopback-only; no enforcement)
 
-Adversarial audit (AUDIT_ADVERSARIAL_2026_09_01.md):
-- 13 red-team probes against the running code; 5 defects demonstrated and
-  FIXED with regression tests (RPZ comment injection, always-fresh recency
-  default, cross-format handle fragmentation, rejection-marker loader crash,
-  future-timestamp state pinning); 3 accepted-with-documentation (seed
-  publication rationale, P1 hop sensitivity, reason growth residual);
-  smuggling/annotation-isolation/corroboration/bounds attacks all held.
-  PASS (tests/test_adversarial_audit.py, 11 tests)
+CI:
+- .github/workflows/verify.yml runs verify.sh + the lab on push across
+  Python 3.11/3.12/3.13
 
-Attribution lab (lab/, runnable demonstration):
-- ./lab/run.sh: 7/7 scenarios PASS (loopback-only, offline, no enforcement):
-  rotation (4 rotating IPs -> ONE fingerprint group), campaigns (3 toolchains
-  -> 3 groups, no false links), formats (envoy+nginx logs -> containment
-  link), churn (full behavioral rotation UNTRACEABLE — stated plainly;
-  partial churn leaves value-matched containment links), live (real HTTP
-  through the challenge origin: P1/P4/P5 captured, spoofed User-Agent
-  stored nowhere, raw IPs pseudonymized), boundary (decisions
-  byte-identical with/without attribution), degradation (stop-and-mark
-  envelopes)
-
-v2.1 attack-surface closure (documented; scaffold coverage as noted):
-- plaintext-53 redirect-to-managed + resolver baseline: spec (FR-029, docs/24)
-- tuple-form allowlist entries + traffic profiles + drift-as-finding: spec (FR-030, docs/26)
-- capacity ceilings on constrained segments: spec (FR-031, docs/25)
-- BD-8 synchronized first-contact family: spec + schema enum (FR-032, docs/23)
-- standing exposure drift detection, operator-owned-space-only scanning: spec (FR-033, docs/27)
-- defend-the-defender deployment posture: spec (FR-034, docs/09)
-
-Safety state of reference scaffold:
-- no network calls
-- no firewall modification
-- no resolver modification
-- no BGP/routing modification
-- emits files only
-- bundled sample network indicators use .invalid or RFC TEST-NET address space
-
-This verification proves the included scaffold behaves as described. It is not a production security certification and does not validate any future live adapter.
+This verification proves the included scaffold behaves as described. It
+is not a production security certification and does not validate any
+future live adapter.

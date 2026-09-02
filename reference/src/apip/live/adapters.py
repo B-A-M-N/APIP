@@ -35,21 +35,46 @@ def adapter(name: str):
 
 
 def _safe_client(ref: str) -> str | None:
-    """Accept only well-formed address refs; log injection attempts are
-    rejected rather than sanitized into something plausible.
+    """Accept well-formed address refs in ALL common terminator spellings;
+    log injection attempts are rejected rather than sanitized into
+    something plausible.
 
-    Adversarial-audit fix: the ref is normalized to the ADDRESS ONLY (port
-    stripped) so the same client seen through two terminators — one logging
-    ip:port, one logging bare IP — derives the same pseudonymous handle.
-    Ephemeral ports previously fragmented one client into unbounded handles.
+    Normalization rules (the handle is derived from the RETURNED string, so
+    every spelling of one address must return the same string):
+      - ip:port (IPv4)      -> bare address      (v2.1.1 audit fix)
+      - [v6]:port           -> bare v6 address   (v2.2: previously REJECTED,
+                                                    fragmenting IPv6 clients)
+      - bare v6             -> canonical RFC 5952 form, so '2001:db8::1' and
+                               '2001:0db8:0000::1' derive ONE handle
+      - zone ids ('%eth0')  -> rejected (link-local scope is not a stable
+                               requester identity)
+    Returns the CANONICAL ipaddress rendering, which is what the attribution
+    HMAC hashes — canonicalization here is what makes cross-format
+    correlation exact for IPv6, not just IPv4.
     """
-    ref = ref.strip("[]").strip()
-    addr = ref.rsplit(":", 1)[0] if ref.count(":") == 1 else ref
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    # [v6]:port — the only standard form where host and port are unambiguous
+    if ref.startswith("[") and "]" in ref:
+        host, _, port = ref[1:].partition("]")
+        if port.startswith(":"):
+            addr = host
+        else:
+            return None
+    else:
+        # strip a single trailing :port for IPv4 only; IPv6 colons are
+        # structural, never a port separator
+        if ref.count(":") == 1:
+            addr = ref.rsplit(":", 1)[0]
+        else:
+            addr = ref
+    if "%" in addr:            # zone id: not a stable identity
+        return None
     try:
-        ipaddress.ip_address(addr)
+        return str(ipaddress.ip_address(addr))
     except ValueError:
         return None
-    return addr
 
 
 @adapter("envoy")

@@ -64,11 +64,26 @@ class ScoringAuthorityTests(unittest.TestCase):
         self.assertEqual(m, 0)
 
     def test_behavioral_share_reported_unclamped(self):
-        e = [ev(f"behavioral_{f}", source="local-behavioral")
-             for f in ("dga_likelihood", "first_seen_novelty", "beacon_periodicity")] * 3
+        # v2.2: duplicate records from one source dedup, so the unclamped
+        # share is built from REPEATED SIGHTINGS — same kinds, distinct
+        # observation times (docs/04 'repeated recent sightings'), all
+        # inside the freshness window.
+        e = []
+        for rep in range(3):
+            for f in ("dga_likelihood", "first_seen_novelty", "beacon_periodicity"):
+                e.append(ev(f"behavioral_{f}", source="local-behavioral",
+                            at=f"2026-09-01T19:{rep * 10:02d}:00Z"))
         m, bm, _, _, _, _, _ = score_parts(ind(e), EvidenceTable(DEFAULT_WEIGHTS), recency, REG)
         self.assertGreater(bm, 100)    # unclamped share visible to cap logic
         self.assertEqual(m, bm)        # all M is behavioral here
+
+    def test_duplicate_records_dedup(self):
+        # v2.2 regression: N copies of one record scored N times and
+        # inflated M from 25 to 100 (independent-audit finding 3).
+        from copy import copy
+        e = [ev("curated_source")] * 4
+        m, _, _, _, _, _ = score(ind(e), EvidenceTable(DEFAULT_WEIGHTS), recency, REG)
+        self.assertEqual(m, 25)        # one observation, scored once
 
 if __name__ == "__main__":
     unittest.main()

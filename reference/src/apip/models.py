@@ -77,3 +77,29 @@ class Decision:
         if self.selector is not None:
             d["selector"] = self.selector.to_dict()
         return d
+
+    def with_budget_demotion(self) -> "Decision":
+        """Demote this decision to OBSERVE under a blast-radius budget
+        (docs/04 §8): the action class is dropped, the rung downgraded to
+        L0/NONE, TTL zeroed, and the demotion is recorded with a named
+        reason. Deterministic: same decision in, same demoted decision out
+        (the id is intentionally recomputed from the demoted fields)."""
+        return Decision(
+            id=self.id + "-demoted",      # traceable to the enforcing decision
+            indicator_id=self.indicator_id,
+            maliciousness=self.maliciousness,
+            action_safety=self.action_safety,
+            disposition="OBSERVE",
+            action="observe",
+            rung="L0",
+            scope=self.scope,
+            ttl_seconds=0,
+            policy_version=self.policy_version,
+            reason_codes=tuple(sorted(set(self.reason_codes)
+                                      | {"blast_radius_budget_exceeded"})),
+            explanation=self.explanation,
+            selector=None,
+            nominal_ttl_seconds=self.nominal_ttl_seconds,
+            randomization=self.randomization,
+            attribution_refs=self.attribution_refs,
+        )

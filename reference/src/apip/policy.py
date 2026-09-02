@@ -5,9 +5,10 @@ from typing import Any, Callable
 from .models import Indicator, Decision, ActionSelector
 from .scoring import (score_parts, EvidenceTable, DEFAULT_WEIGHTS,
                       SHARED_INFRA_KINDS as SHARED_INFRA_EVIDENCE,
-                      NON_AUTHORITATIVE_CLASSES)
+                      NON_AUTHORITATIVE_CLASSES, _dedup_evidence)
 from .registry import SourceRegistry, DEFAULT_REGISTRY
 from .randomize import ApipRng, draw_ttl_jitter, draw_scaled_integer
+from .sanitize import validate_client, UnsafeIdentifier
 
 # Interdiction ladder rungs (docs/25)
 RUNGS = ("NONE", "L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7")
@@ -39,6 +40,59 @@ class AllowlistEntry:
     owner: str = ""
     ticket: str = ""
     expires_at: str | None = None   # None = no expiry (requires governance)
+    # v2.2: canonical form — derived automatically in __post_init__ for any
+    # construction path (config loader, direct construction, tests).
+    # Matching is ALWAYS done on the canonical form so an entry spelled
+    # 'Example.COM.' suppresses the indicator 'example.com' (verbatim string
+    # matching previously let trivially-different spellings silently fail to
+    # protect). For unparseable values the canonical form falls back to the
+    # stripped lowercase literal, which then only matches itself.
+    canonical: str = ""
+
+    def __post_init__(self):
+        if not self.canonical:
+            object.__setattr__(self, "canonical", _allowlist_key(self.value))
+
+    def matches(self, value: str, scope: str) -> bool:
+        return (self.scope in {scope, "*"}
+                and bool(self.canonical)
+                and self.canonical == _allowlist_key(value))
+
+
+def _allowlist_key(value: str) -> str:
+    """Canonical matching key for allowlist entries and indicator values.
+
+    Best-effort canonicalization via the same rules the ingest boundary
+    uses (lowercase DNS form for domains, canonical ip literals, strict-
+    false CIDR). A value that fails canonicalization matches only its own
+    stripped-lowercase form — fail closed, never fail open.
+
+    v2.2: a single-host prefix (a /32 or /128) canonicalizes to the same
+    key as the bare address — the operator who allowlists `x/32` means the
+    host x, and spelling the target either way must match.
+    """
+    import ipaddress
+    v = value.strip().rstrip(".")
+    if not v:
+        return ""
+    try:
+        return str(ipaddress.ip_address(v))
+    except ValueError:
+        pass
+    try:
+        net = ipaddress.ip_network(v, strict=False)
+        # single-host prefixes match the bare address (and vice versa)
+        if net.num_addresses == 1:
+            return str(net.network_address)
+        return str(net)
+    except ValueError:
+        pass
+    # domain-shaped: lowercase; attempt IDNA like the ingest canonicalizer
+    low = v.lower()
+    try:
+        return low.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return low
 
 
 @dataclass(frozen=True)
@@ -94,6 +148,21 @@ class Policy:
     # Caps the number of evidence records considered per indicator,
     # bounding reason-code cardinality upstream of any streaming stage.
     max_evidence_per_indicator: int = 64
+    # v2.2 (docs/04 §8 blast-radius budget): cap on actions a single batch
+    # may propose (AUTO_ENFORCE or SHADOW). Overflow DEMOTES to OBSERVE
+    # with a reason — a poisoned feed cannot mass-emit controls in one
+    # batch. None = unlimited (reference default; production MUST set it).
+    max_new_auto_actions_per_batch: int | None = None
+    # v2.2 (docs/25 L1 client-impact budget): max fraction of a tenant's
+    # interactive transactions that may be CHALLENGED (L1 proxy_challenge)
+    # per hour; exceeding it alarms and auto-reverts the overflow to L0.
+    # A FRACTION needs a denominator the offline batch scaffold cannot
+    # observe — so the measured trailing-hour interactive transaction count
+    # is an explicit input (None = unset). Fail-closed rule: when the knob
+    # is set but no measurement is supplied, the allowance is ZERO — the
+    # scaffold never guesses transaction volume.
+    max_challenged_transaction_fraction_per_hour: float | None = None
+    measured_interactive_transactions_per_hour: int | None = None
 
 
 def _decision_id(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip: int,
@@ -130,10 +199,50 @@ def _in_scope(value: str, itype: str, policy: Policy) -> bool:
 
 
 def _allowlisted(value: str, policy: Policy) -> tuple[bool, str]:
+    """Allowlist gate (docs/04): precedence is absolute.
+
+    v2.2 semantics:
+      - matching is CANONICAL, not verbatim: entries are canonicalized at
+        load (io/config) and matched against the canonicalized indicator
+        value, so spelling variants can never silently fail to protect;
+      - expired entries no longer suppress: `expires_at` is enforced
+        against the replay clock (reference_now when pinned, else the wall
+        clock), closing the stale-allowlist hole (docs/26: a stale entry
+        is a finding, not a feature). An expired hit records
+        `allowlist_expired:<value>` so the operator sees the governance
+        failure instead of silent enforcement.
+    """
+    now_key = policy.reference_now
     for entry in policy.allowlist:
-        if entry.value == value and entry.scope in {policy.scope, "*"}:
-            return True, f"allowlist_hit:{entry.value}"
+        if not entry.matches(value, policy.scope):
+            continue
+        if entry.expires_at is None:
+            return True, f"allowlist_hit:{value}"
+        expiry = _parse_instant(entry.expires_at)
+        now = _parse_instant(now_key) if now_key else _wall_now()
+        if now is not None and expiry is not None and now > expiry:
+            # expired: enforcement proceeds; governance failure recorded
+            continue
+        return True, f"allowlist_hit:{value}"
     return False, ""
+
+
+def _parse_instant(ts: str):
+    from datetime import datetime, timezone
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _wall_now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
 
 
 def _behavioral_families(indicator: Indicator, registry: SourceRegistry) -> set[str]:
@@ -209,6 +318,18 @@ def select_rung(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip: 
     reasons: list[str] = []
     deny_ok = True
     rand_records: list[dict] = []
+
+    # v2.2 artifact-boundary defense: a client selector reaches compiled
+    # enforcement artifacts (suricata apip_client metadata). Validate it
+    # HERE, at selector construction, so an unsanitizable reference refuses
+    # the context-acting rungs entirely rather than flowing toward an
+    # artifact (the exporters validate again — belt and suspenders).
+    if client is not None:
+        try:
+            client = validate_client(client)
+        except UnsafeIdentifier:
+            reasons.append("client_selector_unsafe_for_artifacts")
+            client = None
 
     # --- behavioral corroboration gate (v2.1): if behavioral evidence
     # contributes AT ALL, deny requires k families AND external corroboration.
@@ -348,6 +469,102 @@ def _bounded_evidence(indicator: Indicator, policy: Policy) -> tuple[Indicator, 
     return bounded, len(indicator.evidence) - cap
 
 
+def challenge_allowance(policy: Policy) -> int:
+    """docs/25 L1 client-impact budget: the number of interactive
+    transactions that may be CHALLENGED in the trailing hour.
+
+    The budget is a FRACTION (max_challenged_transaction_fraction_per_hour)
+    of the tenant's measured interactive transaction volume. The offline
+    batch scaffold cannot observe that volume, so it is an explicit input
+    (measured_interactive_transactions_per_hour) — never guessed. Fail
+    closed:
+
+      - knob unset                    -> unlimited (budget not configured)
+      - knob set, no measurement      -> 0 (auto-revert every challenge)
+      - knob set, measurement present -> floor(fraction * measured)
+
+    Integer fixed-point arithmetic: fraction is scaled by 10^6 and the
+    allowance is computed on integers, so the same (fraction, measurement)
+    yields the same allowance on every platform — no float drift in a
+    decision-bearing quantity.
+    """
+    frac = policy.max_challenged_transaction_fraction_per_hour
+    if frac is None:
+        return -1          # sentinel: budget not configured
+    measured = policy.measured_interactive_transactions_per_hour
+    if measured is None:
+        return 0           # fail closed: configured but unmeasured
+    micros = round(frac * 1_000_000)
+    return (measured * micros) // 1_000_000
+
+
+def apply_client_impact_budget(pairs: list[tuple[Indicator, Decision]],
+                               policy: Policy) -> tuple[list[tuple[Indicator, Decision]], bool]:
+    """Enforce the docs/25 L1 client-impact budget across a batch.
+
+    Counts every proxy_challenge (L1) decision against
+    challenge_allowance(policy); overflow decisions AUTO-REVERT to L0 with
+    `client_impact_budget_exceeded` + `challenge_auto_reverted_to_L0` and
+    the caller raises the docs/25 alarm. Survivors are chosen in
+    (policy_version, decision id) order, so replaying the same batch
+    reverts the SAME decisions — the reversion set is a function of the
+    batch content, never of input order. Returns (possibly rewritten pairs,
+    alarmed).
+
+    Unconfigured budget (allowance sentinel -1): pairs pass through
+    untouched, no alarm. challenges present with a zero allowance (fail-
+    closed unmeasured) reverts ALL of them.
+
+    Batch-scope note: docs/25 states the budget per hour; a live
+    deployment would carry the allowance across batches within the hour.
+    The offline scaffold's batch contract is one invocation = one batch,
+    so enforcement here is per-batch against the full measured-hour
+    allowance — the honest subset a stateless pipeline can guarantee.
+    """
+    allowance = challenge_allowance(policy)
+    if allowance < 0:
+        return pairs, False
+    challenged = [d for _, d in pairs if d.action == "proxy_challenge"]
+    overflow = len(challenged) - allowance
+    if overflow <= 0:
+        return pairs, False
+    revert = {d.id for d in sorted(challenged,
+                                   key=lambda d: (d.policy_version, d.id))[allowance:]}
+    rewritten = [
+        (i, with_client_impact_demotion(d) if d.id in revert else d)
+        for i, d in pairs
+    ]
+    return rewritten, True
+
+
+def with_client_impact_demotion(decision: Decision) -> Decision:
+    """docs/25 L1 client-impact budget overflow: the challenge AUTO-REVERTS
+    to L0 (OBSERVE) with a named reason, and the L1 rung floor is recorded
+    as met so the audit trail shows the reversion was a budget event, not a
+    scoring failure. Mirrors `Decision.with_budget_demotion()`; kept as a
+    separate named transition because the two budgets alarm differently."""
+    return Decision(
+        id=decision.id + "-challenge-budget-reverted",
+        indicator_id=decision.indicator_id,
+        maliciousness=decision.maliciousness,
+        action_safety=decision.action_safety,
+        disposition="OBSERVE",
+        action="observe",
+        rung="L0",
+        scope=decision.scope,
+        ttl_seconds=0,
+        policy_version=decision.policy_version,
+        reason_codes=tuple(sorted(set(decision.reason_codes)
+                                  | {"client_impact_budget_exceeded",
+                                     "challenge_auto_reverted_to_L0"})),
+        explanation=decision.explanation,
+        selector=None,
+        nominal_ttl_seconds=decision.nominal_ttl_seconds,
+        randomization=decision.randomization,
+        attribution_refs=decision.attribution_refs,
+    )
+
+
 def _make_recency_classifier(policy: Policy):
     """Bind the policy's recency window to the replay clock (v2.1.1).
 
@@ -384,6 +601,17 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
     client = context.get("client")
     protocol_class = context.get("protocol_class")
 
+    # v2.2 integrity: collapse duplicate observations BEFORE the envelope
+    # cap. Order matters — dedup-then-cap means a flood of duplicated
+    # records cannot crowd out a dissenting record (e.g. prior_false_positive)
+    # within the envelope; cap-then-dedup would let one feed's spam suppress
+    # exculpatory evidence.
+    indicator, dup_dropped = _dedup_evidence(indicator, policy.source_registry)
+    if dup_dropped:
+        reasons_base = {f"evidence_deduplicated:{dup_dropped}"}
+    else:
+        reasons_base = set()
+
     # docs/23 evidence envelope: bound the records scored per indicator,
     # bounding reason-cardinality and scorer work upstream of any stage.
     indicator, ev_dropped = _bounded_evidence(indicator, policy)
@@ -395,7 +623,9 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
         indicator, policy.evidence_table, _make_recency_classifier(policy),
         policy.source_registry)
     if ev_dropped:
-        reasons = tuple(sorted(set(reasons) | {f"evidence_envelope_truncated:{ev_dropped}"}))
+        reasons_base.add(f"evidence_envelope_truncated:{ev_dropped}")
+    if reasons_base:
+        reasons = tuple(sorted(set(reasons) | reasons_base))
 
     behavioral_fams = _behavioral_families(indicator, policy.source_registry)
     cap = _behavioral_cap(behavioral_fams, policy)

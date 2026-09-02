@@ -120,8 +120,16 @@ Promotion must proceed through OBSERVE → SHADOW → ENFORCE. No feed may direc
 
 ```bash
 cd reference
-python -m unittest discover -s tests -v
-python -m apip.cli evaluate ../examples/indicators.json \
+./verify.sh          # full suite: 180+ tests, no-AI conformance, schema conformance
+```
+
+Or run pieces individually (`PYTHONPATH=src` is required because the
+scaffold is a src-layout package with zero installed dependencies):
+
+```bash
+cd reference
+PYTHONPATH=src python -m unittest discover -s tests -v
+PYTHONPATH=src python -m apip.cli evaluate ../examples/indicators.json \
   --policy ../examples/policy.toml \
   --out ../examples/generated
 ```
@@ -132,8 +140,22 @@ The command writes:
 - `rpz.zone`
 - `suricata.rules`
 - `receipts.json`
+- `attribution_report.json` / `.html`
 
 All example indicators use `.invalid` domains or TEST-NET IP space.
+
+Two budget knobs are enforced by the engine (overflow demotes/reverts with
+named reason codes — never silently exceeds):
+
+- **Blast radius** (`max_new_auto_actions_per_batch`, docs/04 §8): one batch
+  may propose at most that many AUTO_ENFORCE/SHADOW actions.
+- **L1 client impact** (`max_challenged_transaction_fraction_per_hour`,
+  docs/25): at most that fraction of the tenant's interactive transactions
+  may be *challenged* per hour; the overflow alarms and auto-reverts to L0.
+  The fraction's denominator is measured volume, supplied via
+  `[measurement].interactive_transactions_per_hour` or the CLI
+  `--transactions-per-hour` flag (flag wins). Fail closed: a set fraction
+  with no measurement reverts every challenge.
 
 ## Standards and guidance anchors
 

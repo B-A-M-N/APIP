@@ -17,10 +17,22 @@ HARD SAFETY PROPERTIES (enforced in code and tests):
     address never reaches the transaction records;
   - bounded output: the JSONL writer enforces a max-records cap with
     deterministic stop-and-mark, mirroring docs/23 resource envelopes.
+
+v2.2 robustness (independent-audit findings 7–9):
+  - the writer is thread-safe: ThreadingHTTPServer runs one handler thread
+    per request, and the writer previously raced on its cap counter and
+    file handle (demonstrated cap overshoot + closed-file exceptions);
+  - hostile Content-Length values are rejected or clamped: a non-numeric
+    header crashed the handler and a negative one turned the bounded body
+    read into an unbounded read-until-EOF (thread pinned per connection);
+  - every connection has a hard socket timeout, so a stalled client can
+    pin a thread for seconds, not forever;
+  - handler exceptions answer 400 and never escape into the server loop.
 """
 from __future__ import annotations
 
 import json
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -40,9 +52,20 @@ from ..attribution import (
 # by probe_order so replayed/frozen responses are detectable.
 CHALLENGE_KEYS = ("ts", "nonce", "response", "probe_set")
 
+# Per-connection socket timeout (seconds): bounds how long one slow client
+# can pin one handler thread.
+HANDLER_TIMEOUT_S = 30
+# Hard body cap (bytes) regardless of the claimed Content-Length.
+MAX_BODY_BYTES = 65_536
+
 
 class _TxWriter:
-    """Bounded JSONL writer for observed-transaction records."""
+    """Bounded, thread-safe JSONL writer for observed-transaction records.
+
+    v2.2: every mutation of (_count, _fh, degraded) happens under a lock.
+    The cap is now exact under contention (previously overshot) and a
+    thread can never flush a handle another thread just closed.
+    """
 
     def __init__(self, path: Path, max_records: int = 100_000):
         self._path = path
@@ -50,27 +73,38 @@ class _TxWriter:
         self._count = 0
         self.degraded = False
         self._fh = None
+        self._lock = threading.Lock()
 
     def write(self, record: dict[str, Any]) -> None:
-        if self.degraded:
+        acquired = self._lock.acquire(timeout=5.0)
+        if not acquired:
+            # lock starvation is itself degradation: stop-and-mark rather
+            # than block the handler thread indefinitely
+            self.degraded = True
             return
-        if self._count >= self._max:
-            self.degraded = True   # stop-and-mark (docs/23 discipline)
+        try:
+            if self.degraded:
+                return
+            if self._count >= self._max:
+                self.degraded = True   # stop-and-mark (docs/23 discipline)
+                if self._fh:
+                    self._fh.close()
+                    self._fh = None
+                return
+            if self._fh is None:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                self._fh = open(self._path, "a", encoding="utf-8")
+            self._fh.write(json.dumps(record, sort_keys=True) + "\n")
+            self._fh.flush()
+            self._count += 1
+        finally:
+            self._lock.release()
+
+    def close(self) -> None:
+        with self._lock:
             if self._fh:
                 self._fh.close()
                 self._fh = None
-            return
-        if self._fh is None:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._fh = open(self._path, "a", encoding="utf-8")
-        self._fh.write(json.dumps(record, sort_keys=True) + "\n")
-        self._fh.flush()
-        self._count += 1
-
-    def close(self) -> None:
-        if self._fh:
-            self._fh.close()
-            self._fh = None
 
 
 class ChallengeOrigin:
@@ -88,6 +122,8 @@ class ChallengeOrigin:
         self.store = store
         self.requests_observed = 0
         self._sessions: dict[str, int] = {}     # handle -> assigned session number
+        self._sessions_lock = threading.Lock()  # handler threads race here too
+        self._counter_lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
 
     # -- handler factory ---------------------------------------------------
@@ -101,6 +137,8 @@ class ChallengeOrigin:
             #   P2: locale/encoding coherence inputs
             #   P4: conditional-request correctness on the versioned asset
             #   P6: Range/Accept-Encoding fallback behavior
+            timeout = HANDLER_TIMEOUT_S   # bounds stalled-client thread pinning
+
             def _record_common(self) -> dict[str, Any]:
                 headers = []
                 for k in self.headers.keys():
@@ -124,8 +162,9 @@ class ChallengeOrigin:
             def _session_for(self) -> tuple[str, int]:
                 raw = self.client_address[0]
                 handle = handle_for(raw)   # pseudonymize first, retain raw nowhere
-                n = origin._sessions.get(handle, 0)
-                origin._sessions[handle] = n + 1
+                with origin._sessions_lock:
+                    n = origin._sessions.get(handle, 0)
+                    origin._sessions[handle] = n + 1
                 return handle, n
 
             def log_message(self, fmt, *args):  # quiet by default
@@ -134,7 +173,8 @@ class ChallengeOrigin:
             # P4/P6 material: a versioned asset with known validators.
             def do_GET(self):
                 rec = self._record_common()
-                origin.requests_observed += 1
+                with origin._counter_lock:
+                    origin.requests_observed += 1
                 etag = '"v1-2026-09-01"'
                 path = self.path.split("?")[0]
                 if path == "/healthz":
@@ -184,10 +224,18 @@ class ChallengeOrigin:
             # P5 material: the canonical-JSON challenge object.
             def do_POST(self):
                 rec = self._record_common()
-                origin.requests_observed += 1
-                length = int(self.headers.get("Content-Length") or 0)
-                # bounded read: refuse absurd bodies regardless of claimed length
-                body = self.rfile.read(min(length, 65536)) if length else b""
+                with origin._counter_lock:
+                    origin.requests_observed += 1
+                length = _safe_content_length(self.headers.get("Content-Length"))
+                if length is None:
+                    # hostile or malformed framing: answer 400, never crash
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"bad content-length\n")
+                    return
+                # bounded read: hard cap regardless of the claimed length
+                body = self.rfile.read(min(length, MAX_BODY_BYTES)) if length else b""
                 _, n = self._session_for()
                 probes = probe_order(f"post-{n}", origin.epoch)
                 if self.path == "/challenge":
@@ -221,7 +269,8 @@ class ChallengeOrigin:
             return
         self.writer.write(rec)
         if self.store is not None:
-            self.store.observe(rec)
+            with self._counter_lock:
+                self.store.observe(rec)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -233,12 +282,14 @@ class ChallengeOrigin:
                 "refusing non-loopback bind by default; pass allow_nonloopback=True "
                 "only for production deployment after privacy review (docs/30)")
         self._server = ThreadingHTTPServer((bind, port), self._make_handler())
+        self._server.daemon_threads = True
         self._server.serve_forever()
 
     def serve_forever(self, bind: str, port: int, allow_nonloopback: bool = False) -> None:
         if not allow_nonloopback and not _is_loopback(bind):
             raise ValueError("non-loopback bind requires allow_nonloopback=True")
         self._server = ThreadingHTTPServer((bind, port), self._make_handler())
+        self._server.daemon_threads = True
         self._server.serve_forever()
 
     def shutdown(self) -> None:
@@ -246,6 +297,25 @@ class ChallengeOrigin:
             self._server.shutdown()
             self._server = None
         self.writer.close()
+
+
+def _safe_content_length(raw: str | None) -> int | None:
+    """Parse a Content-Length header defensively.
+
+    Returns None for anything that is not a plain non-negative integer
+    (the handler answers 400), otherwise the clamped integer value. The
+    previous inline `int(header or 0)` crashed on non-numeric input and
+    turned negative values into read-until-EOF body reads.
+    """
+    if raw is None:
+        return 0
+    raw = raw.strip()
+    if not raw or not raw.isdigit():
+        return None
+    try:
+        return min(int(raw), MAX_BODY_BYTES)
+    except ValueError:
+        return None
 
 
 def _is_loopback(bind: str) -> bool:

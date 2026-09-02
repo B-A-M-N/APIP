@@ -1,0 +1,29 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # The scaffold itself is dependency-free; jsonschema is installed ONLY
+      # as an optional cross-check of the stdlib schema-conformance tests.
+      - name: Install optional schema cross-check dependency
+        run: python -m pip install jsonschema
+      - name: Run verification (unit + no-AI conformance + schema conformance)
+        run: |
+          cd reference
+          ./verify.sh
+      - name: Run attribution lab
+        run: |
+          cd lab
+          ./run.sh

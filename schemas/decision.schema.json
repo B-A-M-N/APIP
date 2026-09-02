@@ -18,10 +18,12 @@
   ],
   "properties": {
     "id": {
-      "type": "string"
+      "type": "string",
+      "pattern": "^decision--[A-Za-z0-9_.:-]{1,160}$"
     },
     "indicator_id": {
-      "type": "string"
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
     },
     "maliciousness": {
       "type": "integer",
@@ -104,11 +106,42 @@
       "type": "string"
     },
     "randomization": {
-      "type": [
-        "object",
-        "null"
-      ],
-      "description": "Recorded draw enabling exact replay (docs/29); null when no randomized mechanism applied.",
+      "description": "Recorded draw(s) enabling exact replay (docs/29); null when no randomized mechanism applied. A single draw is an object (legacy shape); a decision carrying multiple mechanisms (e.g. rate_ceiling + ttl_jitter) carries an array of draw objects — v2.2 aligns the schema with that shape.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/randomizationDraw"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/randomizationDraw"
+          },
+          "minItems": 2,
+          "maxItems": 8
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "attribution_refs": {
+      "type": "array",
+      "description": "Display-only attribution references (docs/30). NEVER a decision input: the engine never populates this field, and decisions are byte-identical with and without any attribution records. Present (empty) in engine output for explicit display-only typing.",
+      "items": {
+        "type": "string",
+        "pattern": "^fp--fp1--[0-9a-f]{16}$"
+      },
+      "maxItems": 16
+    },
+    "selector": {
+      "$ref": "#/$defs/actionSelector"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "randomizationDraw": {
+      "type": "object",
+      "description": "One recorded randomization draw (docs/29).",
       "required": [
         "mechanism",
         "bounds_version",
@@ -131,6 +164,10 @@
         "bounds_version": {
           "type": "string"
         },
+        "epoch": {
+          "type": "string",
+          "description": "Randomization epoch the draw was taken in (docs/29); part of the reproducible seed material."
+        },
         "seed_id": {
           "type": "string"
         },
@@ -142,12 +179,6 @@
       },
       "additionalProperties": false
     },
-    "selector": {
-      "$ref": "#/$defs/actionSelector"
-    }
-  },
-  "additionalProperties": false,
-  "$defs": {
     "actionSelector": {
       "type": [
         "object",

@@ -139,6 +139,46 @@
           "minimum": 1,
           "maximum": 1024,
           "description": "docs/23 evidence envelope: maximum evidence records considered per indicator; overflow is dropped deterministically with a reason code."
+        },
+        "max_new_auto_actions_per_batch": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "docs/04 §8 blast-radius budget: maximum AUTO_ENFORCE/SHADOW actions one batch may propose; overflow demotes to OBSERVE with blast_radius_budget_exceeded."
+        },
+        "max_challenged_transaction_fraction_per_hour": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "description": "docs/25 L1 client-impact budget: at most this fraction of the tenant's interactive transactions may be challenged per hour; the overflow alarms and auto-reverts to L0 (client_impact_budget_exceeded / challenge_auto_reverted_to_L0). Backed by measurement.interactive_transactions_per_hour."
+        }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "interactive_transactions_per_hour": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Operator-supplied trailing-hour interactive transaction volume — the denominator of the docs/25 L1 client-impact fraction. The offline scaffold never invents it; a set fraction with no measurement is a zero allowance (fail closed) and every challenge auto-reverts to L0. A CLI --transactions-per-hour flag overrides this when both are present."
+        }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "authorized_prefixes": {
+          "type": "array",
+          "description": "docs/04: authorized target space; targets outside are hard-rejected (out_of_authorized_scope). Production deployments MUST enumerate; empty/absent means unrestricted reference behavior.",
+          "items": {
+            "type": "string",
+            "description": "CIDR prefix; load-time validation is authoritative",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "maxItems": 1024,
+          "uniqueItems": true
         }
       }
     },

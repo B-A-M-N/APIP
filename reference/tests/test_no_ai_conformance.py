@@ -27,10 +27,14 @@ SECURITY_BEARING = {
 # supply-chain escape and fails the build. `os` is restricted to env/file
 # access for the deployment key (v2.1.1); `hmac` provides keyed
 # pseudonymization; both are deterministic, side-effect-free uses.
+# v2.2: `threading` added — synchronization primitives (locks) only, for the
+# thread-safe bounded writer / correlation store / capture counters; no
+# timers, no I/O, no scheduling. Determinism is unaffected: locks order
+# concurrent access but introduce no entropy into any decision path.
 STDLIB_ALLOWLIST = {
     "__future__", "argparse", "dataclasses", "datetime", "hashlib", "hmac",
     "ipaddress", "itertools", "json", "math", "os", "pathlib", "re",
-    "typing", "tomllib", "unittest",
+    "threading", "typing", "tomllib", "unittest",
 }
 
 # AI/ML package ban list (docs/28 conformance: no model SDK may be present).

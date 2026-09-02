@@ -30,8 +30,14 @@ s = 95
 
 [limits]
 max_auto_ttl_seconds = 3600
+# v2.2: blast-radius budget (docs/04 §8) — one batch may propose at most
+# this many actions; overflow DEMOTES to OBSERVE with a named reason.
 max_new_auto_actions_per_batch = 100
-# L1 client-impact budget (docs/25): at most 5% of interactive transactions challenged/hour
+# L1 client-impact budget (docs/25): at most 5% of the tenant's interactive
+# transactions challenged/hour; the overflow alarms and auto-reverts to L0.
+# The fraction's denominator is MEASURED volume — supplied via the CLI
+# --transactions-per-hour flag or the [measurement] block below. Fail
+# closed: a set fraction with no measurement = zero challenges survive.
 max_challenged_transaction_fraction_per_hour = 0.05
 # v2.1.1: L2 rate ceiling (docs/25 client-impact budget). A rate_limit rule
 # without a ceiling is not a rule; the drawn ceiling never exceeds this
@@ -39,6 +45,24 @@ max_challenged_transaction_fraction_per_hour = 0.05
 nominal_rate_ceiling_per_min = 240
 # v2.1.1: docs/23 evidence envelope — records scored per indicator cap.
 max_evidence_per_indicator = 64
+
+# v2.2: authorized target space (docs/04). Targets outside these prefixes
+# are hard-rejected (out_of_authorized_scope) no matter how strong the
+# evidence. The example enumerates the documentation ranges its own data
+# uses; production MUST enumerate its real scope.
+[authorization]
+authorized_prefixes = [
+  "198.51.100.0/24",
+  "203.0.113.0/24",
+]
+
+# v2.2 (docs/25 L1 client-impact budget): the measured interactive
+# transaction volume of the trailing hour — the denominator the challenge
+# fraction is taken against. Operator-supplied telemetry, never invented by
+# the scaffold; the CLI --transactions-per-hour flag overrides this when
+# both are set. Unset = fail closed for the budget (zero challenges).
+[measurement]
+interactive_transactions_per_hour = 1000
 
 # v2.1.1: replay clock (docs/10 deterministic-replay harness). When set,
 # evidence freshness is evaluated against this instant and decision

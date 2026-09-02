@@ -1,14 +1,21 @@
 from __future__ import annotations
 from ..models import Indicator, Decision
+from ..sanitize import suricata_safe, validate_fqdn, validate_ip_literal
+
 
 def compile_rules(items: list[tuple[Indicator, Decision]]) -> str:
     """Compile decisions into a dry-run Suricata ruleset.
 
-    v2.1.1 (audit residual fix): rate_limit rules previously had NO ceiling
-    semantics — the rung was selected but the compiled artifact carried no
-    rate at all. rate_limit now compiles to alert + rate_filter with the
-    decision's drawn ceiling (docs/25), and every rule carries the decision
-    id and TTL so an operator can trace the rule back to its recorded draws.
+    v2.2 hardening: EVERY interpolation into rule text passes a compile-time
+    validator/escaper (`suricata_safe`) and address targets are re-validated
+    as canonical IP literals. The v2.1.1 audit found `apip_client` carried
+    raw, indicator-derived text into metadata — a rule-injection path — and
+    the general fix is structural: no value reaches a rule without passing
+    the artifact boundary, regardless of what upstream trusted.
+
+    v2.1.1 residual (retained): rate_limit rules carry the decision's drawn
+    ceiling and the exporter REFUSES a ceilingless rate_limit — an intent
+    is never compiled as a rule.
     """
     lines = ["# Dry-run APIP Suricata output. Review before any use."]
     sid = 9100000
@@ -20,11 +27,15 @@ def compile_rules(items: list[tuple[Indicator, Decision]]) -> str:
             raise ValueError(
                 f"rate_limit decision {dec.id} has no rate ceiling; "
                 "refusing to compile an intent as a rule")
+        # artifact-boundary validation of every variable field (fail closed)
+        disposition = suricata_safe(dec.disposition, "disposition")
+        rung = suricata_safe(dec.rung, "rung")
+        dec_id = suricata_safe(dec.id, "decision id")
         if ind.type in {"ipv4", "ipv6"} and dec.action in {"firewall_deny", "rate_limit"}:
+            target = validate_ip_literal(ind.value)
             sid += 1
             action = "drop" if dec.action == "firewall_deny" else "alert"
-            ttl = dec.ttl_seconds or 0
-            # This is intentionally a simple demonstrator and emits only reserved TEST-NET sample data in the package examples.
+            ttl = max(1, dec.ttl_seconds or 0)
             if action == "alert":
                 # Ceiling semantics via real detection_filter (docs/25): the
                 # rule fires only once the source exceeds the drawn ceiling
@@ -34,37 +45,40 @@ def compile_rules(items: list[tuple[Indicator, Decision]]) -> str:
                 # actual rate_filter/iptables-hashlimit mapping) can consume
                 # them without re-deriving anything.
                 rule = (
-                    f'{action} ip $HOME_NET any -> {ind.value} any '
-                    f'(msg:"APIP {dec.disposition} {ind.value} rung={dec.rung}"; '
-                    f'metadata:apip_decision {dec.id}, apip_ceiling_per_min {ceiling}, '
-                    f'apip_ttl_seconds {max(1, ttl)}; '
-                    f'detection_filter:track by_src, count {ceiling}, seconds 60; '
+                    f'{action} ip $HOME_NET any -> {target} any '
+                    f'(msg:"APIP {disposition} {target} rung={rung}"; '
+                    f'metadata:apip_decision {dec_id}, apip_ceiling_per_min {int(ceiling)}, '
+                    f'apip_ttl_seconds {ttl}; '
+                    f'detection_filter:track by_src, count {int(ceiling)}, seconds 60; '
                     f'sid:{sid}; rev:1;)'
                 )
             else:
                 rule = (
-                    f'{action} ip $HOME_NET any -> {ind.value} any '
-                    f'(msg:"APIP {dec.disposition} {ind.value} rung={dec.rung}"; '
-                    f'metadata:apip_decision {dec.id}, apip_ttl_seconds {max(1, ttl)}; '
+                    f'{action} ip $HOME_NET any -> {target} any '
+                    f'(msg:"APIP {disposition} {target} rung={rung}"; '
+                    f'metadata:apip_decision {dec_id}, apip_ttl_seconds {ttl}; '
                     f'sid:{sid}; rev:1;)'
                 )
             lines.append(rule)
         elif (ind.type == "fqdn" and dec.action == "rate_limit"
               and dec.selector is not None
               and dec.selector.scope_type == "client_destination_pair"):
-            # v2.1.1: fqdn pair rate-limits previously compiled to NOTHING
-            # while receipts still claimed a suricata artifact existed.
-            # Compile as an http.host alert gated by the pair's drawn
-            # ceiling; metadata carries decision id + ceiling + client so
-            # the production enforcement compiler consumes them directly.
+            # v2.1.1: fqdn pair rate-limits compile as http.host alerts gated
+            # by the pair's drawn ceiling; metadata carries decision id +
+            # ceiling + client so the production enforcement compiler
+            # consumes them directly. v2.2: the client reference — historically
+            # derived from external indicator ids — passes the artifact
+            # boundary like every other field.
+            host = validate_fqdn(ind.value)
+            client = suricata_safe(dec.selector.client or "unknown", "apip_client")
             sid += 1
             lines.append(
                 f'alert http any any -> any any '
-                f'(msg:"APIP {dec.disposition} {ind.value} rung={dec.rung}"; '
-                f'http.host; content:"{ind.value}"; nocase; '
-                f'metadata:apip_decision {dec.id}, apip_ceiling_per_min {ceiling}, '
-                f'apip_client {dec.selector.client or "unknown"}, '
+                f'(msg:"APIP {disposition} {host} rung={rung}"; '
+                f'http.host; content:"{host}"; nocase; '
+                f'metadata:apip_decision {dec_id}, apip_ceiling_per_min {int(ceiling)}, '
+                f'apip_client {client}, '
                 f'apip_ttl_seconds {max(1, dec.ttl_seconds or 1)}; '
-                f'detection_filter:track by_src, count {ceiling}, seconds 60; '
+                f'detection_filter:track by_src, count {int(ceiling)}, seconds 60; '
                 f'sid:{sid}; rev:1;)')
     return "\n".join(lines) + "\n"

@@ -31,6 +31,28 @@ class PolicyValidationError(ValueError):
     pass
 
 
+def canonical_allowlist_entry(value: str, scope: str, owner: str = "",
+                              ticket: str = "",
+                              expires_at: str | None = None):
+    """Public constructor for canonical allowlist entries (v2.2)."""
+    return _canonical_allowlist_entry(value=value, scope=scope, owner=owner,
+                                      ticket=ticket, expires_at=expires_at)
+
+
+def _canonical_allowlist_entry(value: str, scope: str, owner: str = "",
+                               ticket: str = "", expires_at: str | None = None):
+    """Build an AllowlistEntry with its canonical matching key (v2.2).
+
+    Matching is canonical so 'Example.COM.' protects 'example.com'. An
+    entry whose value cannot be parsed at all keeps a stripped-lowercase
+    key that matches only itself — fail closed.
+    """
+    from .policy import AllowlistEntry, _allowlist_key
+    key = _allowlist_key(value)
+    return AllowlistEntry(value=value, scope=scope, owner=owner,
+                          ticket=ticket, expires_at=expires_at, canonical=key)
+
+
 # Strict monotonic ladder (docs/25): each stronger rung must have floors at
 # least as strict as the rung below it.
 _LADDER_ORDER = ["L1", "L2", "L4", "L5"]
@@ -94,6 +116,39 @@ def validate_policy(raw: dict) -> list[str]:
         if not (isinstance(rn, str) and _re.match(
                 r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$", rn)):
             problems.append("replay.reference_now must be ISO-8601 UTC (...Z)")
+    # v2.2 (docs/04 §8): a batch-action budget must be a positive integer
+    # when present; production policies are expected to set it.
+    mb = limits.get("max_new_auto_actions_per_batch")
+    if mb is not None and (not isinstance(mb, int) or isinstance(mb, bool) or mb < 1):
+        problems.append("limits.max_new_auto_actions_per_batch must be a positive integer when set")
+    # v2.2 (docs/25 L1 client-impact budget): the challenged-transaction
+    # fraction must be a real fraction in (0, 1] when present; zero would
+    # silently disable every challenge while looking configured, and >1 is
+    # not a fraction. The measured transaction count (CLI-side) must be a
+    # non-negative integer when supplied.
+    cf = limits.get("max_challenged_transaction_fraction_per_hour")
+    if cf is not None and (isinstance(cf, bool) or not isinstance(cf, (int, float))
+                           or not (0 < float(cf) <= 1)):
+        problems.append(
+            "limits.max_challenged_transaction_fraction_per_hour must be a number in (0, 1] when set")
+    mi = (raw.get("measurement") or {}).get("interactive_transactions_per_hour")
+    if mi is not None and (not isinstance(mi, int) or isinstance(mi, bool) or mi < 0):
+        problems.append(
+            "measurement.interactive_transactions_per_hour must be a non-negative integer when set")
+    # v2.2 (docs/26): governed allowlist entries carry owner and ticket;
+    # unowned or unticketed entries are rejected at load — allow-first
+    # posture treats a stale/ungoverned entry as a finding, not a feature.
+    for pos, e in enumerate(raw.get("allowlist") or []):
+        if not str(e.get("owner", "")).strip() or not str(e.get("ticket", "")).strip():
+            problems.append(f"allowlist entry #{pos} must carry owner and ticket "
+                            "(docs/26 governed entries)")
+        exp = e.get("expires_at")
+        if exp is not None:
+            import re as _re2
+            if not (isinstance(exp, str) and _re2.match(
+                    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$", exp)):
+                problems.append(
+                    f"allowlist entry #{pos} expires_at must be ISO-8601 UTC (...Z)")
     return problems
 
 
@@ -129,7 +184,7 @@ def load_policy(path: str | Path) -> Policy:
     )
 
     allowlist = tuple(
-        AllowlistEntry(
+        _canonical_allowlist_entry(
             value=str(e["value"]),
             scope=str(e.get("scope", raw.get("scope", "*"))),
             owner=str(e.get("owner", "")),
@@ -171,6 +226,27 @@ def load_policy(path: str | Path) -> Policy:
         max_behavioral_m_contribution=int(b.get("max_behavioral_m_contribution", 60)),
         max_evidence_per_indicator=int(l.get("max_evidence_per_indicator", 64)),
         nominal_rate_ceiling_per_min=int(l.get("nominal_rate_ceiling_per_min", 0)),
+        # v2.2: blast-radius budget (docs/04 §8). None when unset.
+        max_new_auto_actions_per_batch=(
+            int(l["max_new_auto_actions_per_batch"])
+            if l.get("max_new_auto_actions_per_batch") is not None else None),
+        # v2.2: L1 client-impact budget (docs/25) + the measured interactive
+        # transaction volume that gives the fraction its denominator. The
+        # measurement is operator-supplied telemetry — the scaffold never
+        # invents it; unset measurement + set fraction = zero allowance
+        # (fail closed, see policy.challenge_allowance).
+        max_challenged_transaction_fraction_per_hour=(
+            float(l["max_challenged_transaction_fraction_per_hour"])
+            if l.get("max_challenged_transaction_fraction_per_hour") is not None else None),
+        measured_interactive_transactions_per_hour=(
+            int((raw.get("measurement") or {})["interactive_transactions_per_hour"])
+            if (raw.get("measurement") or {}).get("interactive_transactions_per_hour") is not None
+            else None),
+        # v2.2: authorized target space (docs/04) — empty list means the
+        # operator has explicitly NOT enumerated a boundary, which the
+        # loader records rather than assuming unrestricted production scope.
+        authorized_prefixes=tuple(
+            str(p) for p in ((raw.get("authorization") or {}).get("authorized_prefixes") or ())),
         randomization_enabled=bool(rz.get("enabled", False)),
         randomization_bounds_version=str(rz.get("bounds_version", "")),
         randomization_epoch=str(rz.get("epoch", "0")),

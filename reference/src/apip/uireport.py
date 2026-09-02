@@ -45,6 +45,14 @@ def render_correlation_report(report: dict, title: str = "Requester Attribution 
     banner = ('<div class="banner">DEGRADED — resource envelope reached; '
               'new requesters are not being tracked (authority unaffected: '
               'attribution has none).</div>' if degraded else "")
+    keying = report.get("handle_keying", "unknown")
+    if keying == "dev-fallback":
+        banner += ('<div class="banner warn">UNKEYED HANDLES — no deployment '
+                   'key is configured (APIP_DEPLOYMENT_KEY / '
+                   'APIP_DEPLOYMENT_KEY_FILE), so requester handles use a '
+                   'development fallback and are invertible by anyone who '
+                   'guesses the client address space. Configure a key before '
+                   'any real capture.</div>')
 
     return f"""<!doctype html>
 <html lang="en">
@@ -61,6 +69,7 @@ def render_correlation_report(report: dict, title: str = "Requester Attribution 
   .meta {{ color: #666; margin-bottom: 1.25rem; }}
   .banner {{ background: #fde8e8; color: #8a1f1f; border: 1px solid #e5b5b5;
             padding: .6rem .9rem; border-radius: 6px; margin-bottom: 1rem; }}
+  .banner.warn {{ background: #fdf3e0; color: #7a5215; border-color: #e0c9a0; }}
   table {{ border-collapse: collapse; width: 100%; margin-bottom: 1.5rem;
            background: #fff; border: 1px solid #ddd; border-radius: 6px; }}
   th, td {{ text-align: left; padding: .5rem .75rem; border-bottom: 1px solid #eee;
@@ -80,6 +89,7 @@ def render_correlation_report(report: dict, title: str = "Requester Attribution 
     th, td {{ border-color: #2a2e36; }}
     th {{ background: #22262e; color: #aaa; }}
     .banner {{ background: #3a2226; color: #f0b4b4; border-color: #6b3a3a; }}
+    .banner.warn {{ background: #33291a; color: #e8c98a; border-color: #6b5a34; }}
     .dim, .sub {{ color: #777; }}
     .handles code {{ color: #bbb; }}
   }}
@@ -89,7 +99,7 @@ def render_correlation_report(report: dict, title: str = "Requester Attribution 
 <main>
   <h1>{title}</h1>
   <p class="meta">{len(groups)} fingerprint group(s) · {report.get("tracked_requesters", 0)} requester(s) tracked
-     · schema {report.get("schema_version", "?")} · display-only</p>
+     · schema {report.get("schema_version", "?")} · handle keying: {keying} · display-only</p>
   {banner}
   <table>
     <thead><tr><th>Fingerprint</th><th>Probes</th><th>Requesters</th><th>Handles (pseudonymous)</th></tr></thead>

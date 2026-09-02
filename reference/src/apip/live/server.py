@@ -254,21 +254,54 @@ def _is_loopback(bind: str) -> bool:
 
 def _key_order(body: bytes) -> list[str]:
     """Extract the key order the client serialized (P5 feature), without
-    interpreting values. Deterministic scan of the raw body."""
+    interpreting values. Deterministic scan of the raw body.
+
+    v2.1.1 hardening (audit residual): the extractor is a lexical scan, not
+    a JSON parser — a hostile body could previously steer it into quoting a
+    long run of body text as "keys" (e.g. `"` + 10k chars + `"`), yielding
+    polluted features. Fails closed now: keys are bounded in length and
+    count, must satisfy a JSON-key charset, escape sequences are skipped
+    rather than scanned, and scan work is bounded by a step budget. An
+    ambiguous body yields a SHORTER order (possibly empty) — never a
+    guessed one.
+    """
+    import re as _re
+    key_ok = _re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
     order: list[str] = []
     i = 0
     n = len(body)
-    while i < n and len(order) < 32:
+    steps = 0
+    MAX_STEPS = 4096        # bound total scan work regardless of body shape
+    MAX_KEYS = 32
+    while i < n and len(order) < MAX_KEYS and steps < MAX_STEPS:
+        steps += 1
         if body[i:i + 1] == b'"':
-            j = body.find(b'"', i + 1)
-            if j < 0:
-                break
-            key = body[i + 1:j].decode("utf-8", "replace")
-            # a key is a string followed (after whitespace) by a colon
+            j = i + 1
+            parts = bytearray()
+            escaped = False
+            while j < n and len(parts) <= 64:
+                c = body[j:j + 1]
+                if escaped:
+                    # skip escaped char wholesale: an escaped quote or
+                    # backslash is content, never structure
+                    parts += c
+                    escaped = False
+                elif c == b"\\":
+                    escaped = True
+                elif c == b'"':
+                    break
+                else:
+                    parts += c
+                j += 1
+                if j - i > 128:   # bound per-key scan window
+                    break
+            if j >= n or escaped:
+                break               # unterminated key: fail closed
+            key = parts.decode("utf-8", "replace")
             k = j + 1
             while k < n and body[k:k + 1] in b" \t\r\n":
                 k += 1
-            if k < n and body[k:k + 1] == b":":
+            if k < n and body[k:k + 1] == b":" and key_ok.match(key):
                 if key not in order:
                     order.append(key)
             i = j + 1

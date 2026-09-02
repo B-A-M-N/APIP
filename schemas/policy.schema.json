@@ -4,32 +4,97 @@
   "title": "APIP Policy",
   "type": "object",
   "additionalProperties": false,
-  "required": ["policy_version", "mode", "scope", "thresholds", "limits", "safety"],
+  "required": [
+    "policy_version",
+    "mode",
+    "scope",
+    "thresholds",
+    "limits",
+    "safety"
+  ],
   "properties": {
-    "policy_version": {"type": "string", "minLength": 1},
-    "mode": {"enum": ["OFF", "OBSERVE", "SHADOW", "ENFORCE", "EMERGENCY"]},
-    "scope": {"type": "string", "minLength": 1},
+    "policy_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "enum": [
+        "OFF",
+        "OBSERVE",
+        "SHADOW",
+        "ENFORCE",
+        "EMERGENCY"
+      ]
+    },
+    "scope": {
+      "type": "string",
+      "minLength": 1
+    },
     "thresholds": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["observe_m", "fqdn_auto_m", "fqdn_auto_s", "ip_rate_m", "ip_rate_s", "ip_deny_m", "ip_deny_s"],
+      "required": [
+        "observe_m",
+        "fqdn_auto_m",
+        "fqdn_auto_s",
+        "ip_rate_m",
+        "ip_rate_s",
+        "ip_deny_m",
+        "ip_deny_s"
+      ],
       "properties": {
-        "observe_m": {"type": "integer", "minimum": 0, "maximum": 100},
-        "fqdn_auto_m": {"type": "integer", "minimum": 0, "maximum": 100},
-        "fqdn_auto_s": {"type": "integer", "minimum": 0, "maximum": 100},
-        "ip_rate_m": {"type": "integer", "minimum": 0, "maximum": 100},
-        "ip_rate_s": {"type": "integer", "minimum": 0, "maximum": 100},
-        "ip_deny_m": {"type": "integer", "minimum": 0, "maximum": 100},
-        "ip_deny_s": {"type": "integer", "minimum": 0, "maximum": 100},
+        "observe_m": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "fqdn_auto_m": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "fqdn_auto_s": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "ip_rate_m": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "ip_rate_s": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "ip_deny_m": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "ip_deny_s": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
         "rungs": {
           "type": "object",
           "description": "Per-rung automation floors (docs/25). Monotonicity (higher rung => floors at least as strict) must be validated by the policy linter.",
           "additionalProperties": false,
           "properties": {
-            "L1": {"$ref": "#/$defs/rungFloor"},
-            "L2": {"$ref": "#/$defs/rungFloor"},
-            "L4": {"$ref": "#/$defs/rungFloor"},
-            "L5": {"$ref": "#/$defs/rungFloor"}
+            "L1": {
+              "$ref": "#/$defs/rungFloor"
+            },
+            "L2": {
+              "$ref": "#/$defs/rungFloor"
+            },
+            "L4": {
+              "$ref": "#/$defs/rungFloor"
+            },
+            "L5": {
+              "$ref": "#/$defs/rungFloor"
+            }
           }
         }
       }
@@ -37,11 +102,22 @@
     "limits": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["max_auto_ttl_seconds"],
+      "required": [
+        "max_auto_ttl_seconds"
+      ],
       "properties": {
-        "max_auto_ttl_seconds": {"type": "integer", "minimum": 1},
-        "max_actions_per_bundle": {"type": "integer", "minimum": 1},
-        "max_auto_actions_per_tenant_window": {"type": "integer", "minimum": 1},
+        "max_auto_ttl_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_actions_per_bundle": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_auto_actions_per_tenant_window": {
+          "type": "integer",
+          "minimum": 1
+        },
         "max_challenged_transaction_fraction_per_hour": {
           "type": "number",
           "exclusiveMinimum": 0,
@@ -52,19 +128,44 @@
           "type": "integer",
           "minimum": 1,
           "description": "Allow-first segment denial alarm threshold (docs/26)."
+        },
+        "nominal_rate_ceiling_per_min": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Nominal L2 rate ceiling, requests/minute, before docs/29 rate_ceiling jitter. Required when an L2 rung floor is configured: a rate_limit action without a ceiling has no enforcement semantics (docs/25)."
+        },
+        "max_evidence_per_indicator": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "docs/23 evidence envelope: maximum evidence records considered per indicator; overflow is dropped deterministically with a reason code."
         }
       }
     },
     "safety": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["auto_prefix_deny", "auto_routing", "auto_wildcard_domain"],
+      "required": [
+        "auto_prefix_deny",
+        "auto_routing",
+        "auto_wildcard_domain"
+      ],
       "properties": {
-        "auto_prefix_deny": {"const": false},
-        "auto_routing": {"const": false},
-        "auto_wildcard_domain": {"type": "boolean"},
-        "allowlist_precedence": {"type": "boolean"},
-        "require_expiry": {"type": "boolean"},
+        "auto_prefix_deny": {
+          "const": false
+        },
+        "auto_routing": {
+          "const": false
+        },
+        "auto_wildcard_domain": {
+          "type": "boolean"
+        },
+        "allowlist_precedence": {
+          "type": "boolean"
+        },
+        "require_expiry": {
+          "type": "boolean"
+        },
         "no_ai_components": {
           "const": true,
           "description": "No-AI invariant flag (docs/28): platform must operate with zero AI/ML/LLM components."
@@ -78,21 +179,40 @@
       "properties": {
         "enabled_families": {
           "type": "array",
-          "items": {"type": "string", "enum": [
-            "beacon_periodicity", "dga_likelihood", "dns_tunneling",
-            "fastflux", "volume_anomaly", "first_seen_novelty",
-            "tls_metadata_mismatch", "sync_first_contact"
-          ]},
+          "items": {
+            "type": "string",
+            "enum": [
+              "beacon_periodicity",
+              "dga_likelihood",
+              "dns_tunneling",
+              "fastflux",
+              "volume_anomaly",
+              "first_seen_novelty",
+              "tls_metadata_mismatch",
+              "sync_first_contact"
+            ]
+          },
           "uniqueItems": true
         },
         "corroboration": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["distinct_families_for_rate_limit", "distinct_families_for_deny"],
+          "required": [
+            "distinct_families_for_rate_limit",
+            "distinct_families_for_deny"
+          ],
           "properties": {
-            "distinct_families_for_rate_limit": {"type": "integer", "minimum": 2},
-            "distinct_families_for_deny": {"type": "integer", "minimum": 3},
-            "deny_also_requires_external": {"type": "boolean"}
+            "distinct_families_for_rate_limit": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "distinct_families_for_deny": {
+              "type": "integer",
+              "minimum": 3
+            },
+            "deny_also_requires_external": {
+              "type": "boolean"
+            }
           }
         },
         "max_behavioral_m_contribution": {
@@ -106,25 +226,53 @@
     "segments": {
       "type": "object",
       "description": "Allow-first segment policies (docs/26), keyed by segment id.",
-      "additionalProperties": {"$ref": "#/$defs/segmentPolicy"}
+      "additionalProperties": {
+        "$ref": "#/$defs/segmentPolicy"
+      }
     },
     "randomization": {
       "type": "object",
       "description": "Seeded randomization bounds (docs/29). Bounds are policy; draws are recorded per decision.",
       "additionalProperties": false,
       "properties": {
-        "enabled": {"type": "boolean"},
-        "bounds_version": {"type": "string", "minLength": 1},
+        "enabled": {
+          "type": "boolean"
+        },
+        "bounds_version": {
+          "type": "string",
+          "minLength": 1
+        },
         "mechanisms": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "challenge_sampling": {"$ref": "#/$defs/randBounds"},
-            "rate_ceiling": {"$ref": "#/$defs/randBounds"},
-            "ttl_jitter": {"$ref": "#/$defs/randBounds"},
-            "shadow_review_sampling": {"$ref": "#/$defs/randBounds"},
-            "threshold_dither": {"$ref": "#/$defs/randBounds"}
+            "challenge_sampling": {
+              "$ref": "#/$defs/randBounds"
+            },
+            "rate_ceiling": {
+              "$ref": "#/$defs/randBounds"
+            },
+            "ttl_jitter": {
+              "$ref": "#/$defs/randBounds"
+            },
+            "shadow_review_sampling": {
+              "$ref": "#/$defs/randBounds"
+            },
+            "threshold_dither": {
+              "$ref": "#/$defs/randBounds"
+            }
           }
+        }
+      }
+    },
+    "replay": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reference_now": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,6})?Z$",
+          "description": "Replay clock (docs/10): pins evidence-recency evaluation to this instant so decision byte-replay is exact. Absent = live wall clock."
         }
       }
     }
@@ -133,35 +281,86 @@
     "rungFloor": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["m", "s"],
+      "required": [
+        "m",
+        "s"
+      ],
       "properties": {
-        "m": {"type": "integer", "minimum": 0, "maximum": 100},
-        "s": {"type": "integer", "minimum": 0, "maximum": 100}
+        "m": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "s": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        }
       }
     },
     "randBounds": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled"],
+      "required": [
+        "enabled"
+      ],
       "properties": {
-        "enabled": {"type": "boolean"},
-        "min": {"type": "number"},
-        "max": {"type": "number"},
-        "units": {"type": "string"}
+        "enabled": {
+          "type": "boolean"
+        },
+        "min": {
+          "type": "number"
+        },
+        "max": {
+          "type": "number"
+        },
+        "units": {
+          "type": "string"
+        }
       }
     },
     "segmentPolicy": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["mode", "onboarding_stage"],
+      "required": [
+        "mode",
+        "onboarding_stage"
+      ],
       "properties": {
-        "mode": {"enum": ["ALLOW_FIRST", "STANDARD"]},
-        "onboarding_stage": {"enum": ["ENUMERATE", "SIMULATE", "SHADOW", "CANARY", "ENFORCE", "REVIEW"]},
-        "owner": {"type": "string"},
-        "review_cadence_days": {"type": "integer", "minimum": 1},
-        "allowlist_ttl_days": {"type": "integer", "minimum": 1},
-        "max_denied_volume_alarm_per_hour": {"type": "integer", "minimum": 1},
-        "break_glass_profile": {"type": "string"}
+        "mode": {
+          "enum": [
+            "ALLOW_FIRST",
+            "STANDARD"
+          ]
+        },
+        "onboarding_stage": {
+          "enum": [
+            "ENUMERATE",
+            "SIMULATE",
+            "SHADOW",
+            "CANARY",
+            "ENFORCE",
+            "REVIEW"
+          ]
+        },
+        "owner": {
+          "type": "string"
+        },
+        "review_cadence_days": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "allowlist_ttl_days": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_denied_volume_alarm_per_hour": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "break_glass_profile": {
+          "type": "string"
+        }
       }
     }
   }

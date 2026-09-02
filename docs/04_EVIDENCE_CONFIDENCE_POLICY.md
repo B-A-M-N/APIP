@@ -99,6 +99,8 @@ The `annotation` class is the only admissible form for output of any AI/ML syste
 
 Two records are not independent merely because they came through two feeds. APIP should track upstream provenance where available so one original report re-published by multiple aggregators does not falsely count as independent corroboration.
 
+**Enforced in the reference scaffold (v2.1.1):** each `SourceProfile` carries an optional `upstream` provenance identity; corroboration counts **distinct upstream identities**, not feed names. Three resellers re-exporting one upstream corroborate **once**; the upstream's own first-party feed counts as the *same* identity as its re-exporters; unregistered sources can never merge with anything. The external-corroboration gate for behavioral deny and the curated-source weights both consume this identity arithmetic (`reference/src/apip/registry.py`, pinned by `ProvenanceIndependenceTests`).
+
 ## Freshness
 
 Every evidence type has a half-life or TTL. Example defaults:

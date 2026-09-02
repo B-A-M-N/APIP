@@ -104,9 +104,17 @@
       "type": "string"
     },
     "randomization": {
-      "type": ["object", "null"],
+      "type": [
+        "object",
+        "null"
+      ],
       "description": "Recorded draw enabling exact replay (docs/29); null when no randomized mechanism applied.",
-      "required": ["mechanism", "bounds_version", "seed_id", "draw"],
+      "required": [
+        "mechanism",
+        "bounds_version",
+        "seed_id",
+        "draw"
+      ],
       "properties": {
         "mechanism": {
           "enum": [
@@ -120,8 +128,12 @@
             "other"
           ]
         },
-        "bounds_version": {"type": "string"},
-        "seed_id": {"type": "string"},
+        "bounds_version": {
+          "type": "string"
+        },
+        "seed_id": {
+          "type": "string"
+        },
         "draw": {
           "type": "object",
           "description": "Mechanism-specific resulting values.",
@@ -129,7 +141,49 @@
         }
       },
       "additionalProperties": false
+    },
+    "selector": {
+      "$ref": "#/$defs/actionSelector"
     }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "actionSelector": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Typed enforcement selector (docs/25). Context-acting actions MUST carry client/protocol context; rate_limit MUST carry a ceiling.",
+      "properties": {
+        "scope_type": {
+          "enum": [
+            "destination_global",
+            "client_destination_pair",
+            "client_session",
+            "internal_host"
+          ]
+        },
+        "client": {
+          "type": "string"
+        },
+        "destination": {
+          "type": "string"
+        },
+        "protocol_class": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "rate_ceiling_per_min": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Requests/minute permitted (docs/25). Mandatory on rate_limit actions; drawn within docs/29 rate_ceiling bounds with the draw recorded."
+        }
+      },
+      "required": [
+        "scope_type"
+      ]
+    }
+  }
 }

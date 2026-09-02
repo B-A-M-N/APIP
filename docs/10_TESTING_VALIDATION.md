@@ -34,6 +34,9 @@ Properties:
 - **shared-infrastructure class caps the selected rung at L4 regardless of M (`docs/25`)**;
 - **every randomized draw lies within policy bounds; floors are never violated (`docs/29`)**;
 - **replay with recorded seed reproduces the exact randomized values (`docs/29`)**;
+- **decision byte-replay is exact at any later date when `[replay].reference_now` pins the recency clock — the packaged example policy ships pinned (`docs/04` freshness + `docs/10` replay harness, v2.1.1)**;
+- **a `rate_limit` decision without a concrete ceiling is refused by the enforcement exporters, and an L2 floor without a nominal ceiling is rejected at policy load (`docs/25`, v2.1.1)**;
+- **behavioral corroboration counts distinct upstream provenance identities, not feed names — resellers of one upstream corroborate once (`docs/04`, v2.1.1)**;
 - **an allow-first segment that has not completed onboarding cannot enforce (`docs/26`)**;
 - **no code path in scoring/policy/compile invokes model inference — enforced by dependency allowlist review (`docs/28`)**;
 - **virtual patches expire or retire on patch confirmation; orphaned VPs alarm (`docs/27`)**.

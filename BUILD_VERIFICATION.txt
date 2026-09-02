@@ -1,21 +1,44 @@
-APIP specification package verification — v2.1
+APIP specification package verification — v2.1.1
 Date: 2026-09-01
 
 Reference scaffold:
-- python -m unittest discover -s tests -v: PASS (120 tests)
+- python -m unittest discover -s tests -v: PASS (143 tests)
 - ./verify.sh: PASS
-- dry-run evaluation: PASS (6 synthetic indicators, SHADOW mode)
+- dry-run evaluation: PASS (6 synthetic indicators, SHADOW mode,
+  reference clock pinned by [replay].reference_now — byte-replay exact)
   - exact-FQDN C2 -> L4 domain block (dns_nxdomain, shadow)
   - shared-cloud IP -> L0 observe (identity-unsafe, context evidence below floors)
   - dedicated-IP C2 -> L5 IP deny (shadow)
   - first-seen DGA-like domain (single behavioral family) -> L0 OBSERVE
     (uncorroborated behavioral cap below all action floors)
   - C2 on shared CDN (2 behavioral families + external) -> L2 pair rate-limit
+    WITH drawn ceiling 232/min (bounds [120,240], recorded draw, rule
+    compiled as http.host + detection_filter with ceiling in metadata)
   - evidence payload smuggling points/origin/family -> NO_ACTION (inert)
-  - shared-CDN C2 domain -> L4 domain block (shadow) — the v1 shared-infra
-    safe harbor no longer suppresses action; L5 demoted, L4 retained
-- seeded TTL randomization: draws recorded per decision, within policy
-  bounds, replay-deterministic (CI-enforced)
+- seeded randomization: TTL jitter + rate-ceiling draws recorded per
+  decision, within policy bounds, replay-deterministic (CI-enforced)
+- compiled artifacts carry decision id, ceiling, and TTL metadata; the
+  exporter REFUSES a ceilingless rate_limit (raises, never emits an intent)
+
+v2.1.1 adversarial-audit residual closure (all pinned in
+tests/test_audit_residuals.py, 23 tests):
+- L2 rate ceiling: selector + recorded draw + exporter enforcement: PASS
+- fqdn pair rate-limits compile to real http.host rules: PASS
+- docs/23 envelopes exercised by a reference streaming detector
+  (apip/behavioral.py BD-1): bounded windows/events/emission,
+  stop-and-mark degradation, deterministic eviction: PASS
+- P5 key-order extractor hardened (bounded scan, charset, escape-aware,
+  hostile bodies fail closed): PASS
+- attribution handles keyed (HMAC-SHA-256, per-deployment key via
+  APIP_DEPLOYMENT_KEY / APIP_DEPLOYMENT_KEY_FILE; dev fallback bannered
+  in reports as UNKEYED HANDLES): PASS
+- replay clock pinning ([replay].reference_now): byte-exact replay: PASS
+- upstream provenance independence (resellers of one upstream
+  corroborate once): PASS
+- per-indicator evidence envelope (max_evidence_per_indicator,
+  deterministic truncation reason): PASS
+- lab adversary fidelity: churn scenario (full behavioral rotation
+  untraceable — engine claims nothing; partial churn linkable): PASS
 
 Data/interface validation:
 - JSON parse: PASS for all JSON schemas, sources.json, and JSON examples
@@ -69,13 +92,15 @@ Adversarial audit (AUDIT_ADVERSARIAL_2026_09_01.md):
   PASS (tests/test_adversarial_audit.py, 11 tests)
 
 Attribution lab (lab/, runnable demonstration):
-- ./lab/run.sh: 6/6 scenarios PASS (loopback-only, offline, no enforcement):
+- ./lab/run.sh: 7/7 scenarios PASS (loopback-only, offline, no enforcement):
   rotation (4 rotating IPs -> ONE fingerprint group), campaigns (3 toolchains
   -> 3 groups, no false links), formats (envoy+nginx logs -> containment
-  link), live (real HTTP through the challenge origin: P1/P4/P5 captured,
-  spoofed User-Agent stored nowhere, raw IPs pseudonymized), boundary
-  (decisions byte-identical with/without attribution), degradation
-  (stop-and-mark envelopes)
+  link), churn (full behavioral rotation UNTRACEABLE — stated plainly;
+  partial churn leaves value-matched containment links), live (real HTTP
+  through the challenge origin: P1/P4/P5 captured, spoofed User-Agent
+  stored nowhere, raw IPs pseudonymized), boundary (decisions
+  byte-identical with/without attribution), degradation (stop-and-mark
+  envelopes)
 
 v2.1 attack-surface closure (documented; scaffold coverage as noted):
 - plaintext-53 redirect-to-managed + resolver baseline: spec (FR-029, docs/24)

@@ -56,3 +56,22 @@ def draw_ttl_jitter(rng: ApipRng, nominal_ttl: int, lo: float, hi: float) -> tup
     actual = (nominal_ttl * frac_micros) // 1_000_000
     actual = max(1, min(actual, nominal_ttl))  # hard downstream clamp
     return actual, frac_micros
+
+
+def draw_scaled_integer(rng: ApipRng, nominal: int, lo: float, hi: float,
+                        minimum: int = 1) -> tuple[int, int]:
+    """Draw a value in [lo, hi] × nominal as a bounded integer.
+
+    Generic bounded-fraction draw (docs/29): used for the L2 rate ceiling
+    (fraction of the nominal per-minute ceiling) and any future mechanism
+    that scales a policy nominal. Integer fixed-point throughout; the
+    downstream clamp guarantees no draw escapes the bounds regardless of
+    RNG behavior. Returns (value, fraction_micros).
+    """
+    if nominal <= 0:
+        return 0, 1_000_000
+    lo_m = int(round(max(0.0, min(lo, hi)) * 1_000_000))
+    hi_m = int(round(max(lo, hi) * 1_000_000))
+    frac_micros = rng.next_uniform_micros(lo_m, hi_m)
+    value = max(minimum, min(nominal, (nominal * frac_micros) // 1_000_000))
+    return value, frac_micros

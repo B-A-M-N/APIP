@@ -49,6 +49,8 @@ Each family specifies: input, deterministic signal, corroboration requirements, 
 
 **Emitted fields:** jitter_ratio, interval_mean, interval_count, window, first_observed, destination (host-level identifier, pseudonymized per privacy policy).
 
+**Reference implementation (v2.1.1):** `reference/src/apip/behavioral.py` — a bounded, deterministic beacon-periodicity detector exercising the full docs/23 envelope contract in code: at most `max_windows` tracked (source,destination) pairs with overflow shed (counted, never silently evicted), at most `max_events` events before stop-and-mark degradation (a degraded detector under-detects — it can never over-detect), at most one emission per completed block of `min_events` gaps per window (bounded emission), a per-window gap retention bound, oldest-window-first deterministic eviction, and fixed-point integer arithmetic in the verdict path (|gap−median|·10⁶/median ≤ tolerance — no floats, no training, no inference). Its Detections fold into the standard evidence pipeline as `behavioral_beacon_periodicity` local-source records, where the corroboration lattice caps them exactly like any other behavioral evidence. Production streaming/backpressure around this detector is deployment code.
+
 ### BD-2 DGA-like domain structure
 
 **Input:** resolver query logs at the authorized resolver.

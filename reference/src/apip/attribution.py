@@ -1,5 +1,7 @@
 from __future__ import annotations
 import hashlib
+import hmac as _hmac
+import os
 from dataclasses import dataclass, field
 from .randomize import ApipRng
 
@@ -7,6 +9,71 @@ from .randomize import ApipRng
 # authoritative class in the registry; the evidence weight table carries no
 # entries for it and must never gain any.
 ATTRIBUTION_SOURCE_CLASS = "attribution"
+
+# ---------------------------------------------------------------------------
+# Deployment pseudonymization key (v2.1.1 audit-residual fix).
+#
+# Handles were previously unsalted SHA-256 prefixes of the client address.
+# Within one deployment the input space is low-entropy: anyone who can
+# guess the client IP space could invert every handle by brute force. The
+# fix is a keyed HMAC-SHA-256 with a per-deployment key, so handles are
+# unverifiable outside the deployment that holds the key while remaining
+# perfectly deterministic within it (replay/audit unchanged).
+#
+# Key sourcing, in order:
+#   1. APIP_DEPLOYMENT_KEY environment variable (hex or any string);
+#   2. the deployment key file named by APIP_DEPLOYMENT_KEY_FILE;
+#   3. a deterministic development fallback derived from nothing secret —
+#      allowed ONLY for the offline scaffold/tests, and marked in the
+#      report so an operator can never mistake it for protection.
+# Storage stays pseudonymous per deployment: keys must NOT be shared
+# across deployments (docs/30: handles must not be cross-deployment
+# joinable), and rotation re-baselines all handles.
+# ---------------------------------------------------------------------------
+
+_DEV_FALLBACK_KEY = "apip-reference-dev-key-do-not-use-in-production"
+_KEY_ENV = "APIP_DEPLOYMENT_KEY"
+_KEY_FILE_ENV = "APIP_DEPLOYMENT_KEY_FILE"
+
+
+def _load_deployment_key() -> tuple[bytes, str]:
+    """Returns (key_bytes, provenance_tag). Never raises: scaffold degrades
+    to the marked development key rather than crashing an offline pipeline."""
+    env = os.environ.get(_KEY_ENV)
+    if env:
+        return (env.encode("utf-8"), "env")
+    path = os.environ.get(_KEY_FILE_ENV)
+    if path:
+        try:
+            with open(path, "rb") as f:
+                data = f.read().strip()
+            if data:
+                return (data, "file")
+        except OSError:
+            pass
+    return (_DEV_FALLBACK_KEY.encode("utf-8"), "dev-fallback")
+
+
+_KEY_CACHE: tuple[bytes, str] | None = None
+
+
+def _key() -> tuple[bytes, str]:
+    global _KEY_CACHE
+    if _KEY_CACHE is None:
+        _KEY_CACHE = _load_deployment_key()
+    return _KEY_CACHE
+
+
+def reset_key_cache() -> None:
+    """Test/rotation hook: forget the cached deployment key."""
+    global _KEY_CACHE
+    _KEY_CACHE = None
+
+
+def deployment_key_provenance() -> str:
+    """'env' | 'file' | 'dev-fallback' — surfaced in reports so an operator
+    can see when handles are NOT keyed."""
+    return _key()[1]
 
 # Versioned probe set (docs/30). Fixed material; the presented subset/order is
 # drawn per (session, epoch) by the recorded ApipRng.
@@ -60,9 +127,17 @@ def similarity(a: dict[str, str], b: dict[str, str]) -> int:
 
 
 def handle_for(client_ref: str) -> str:
-    """Pseudonymous requester handle (docs/30): keyed hash of the client
-    identity at the chokepoint, never the raw identifier."""
-    return "rh--" + hashlib.sha256(client_ref.encode()).hexdigest()[:16]
+    """Pseudonymous requester handle (docs/30): keyed HMAC-SHA-256 of the
+    client identity at the chokepoint, never the raw identifier.
+
+    v2.1.1: keyed with the per-deployment key — an actor outside the
+    deployment (or a stolen report) can no longer brute-force the small
+    client-address space to invert handles. Deterministic within a
+    deployment for correlation; keys are per-deployment and rotatable.
+    """
+    key, _ = _key()
+    return "rh--" + _hmac.new(key, client_ref.encode("utf-8"),
+                              hashlib.sha256).hexdigest()[:16]
 
 
 # --- adapter contract validation (schemas/observed_transaction.schema.json) --
@@ -288,6 +363,7 @@ class CorrelationStore:
         return {
             "schema_version": self.SCHEMA_VERSION,
             "degraded": self.degraded,
+            "handle_keying": deployment_key_provenance(),
             "tracked_requesters": len(self._by_handle),
             "fingerprint_groups": [
                 {"fingerprint": fp, "requester_handles": sorted(handles),

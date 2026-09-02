@@ -7,7 +7,7 @@ from .scoring import (score_parts, EvidenceTable, DEFAULT_WEIGHTS,
                       SHARED_INFRA_KINDS as SHARED_INFRA_EVIDENCE,
                       NON_AUTHORITATIVE_CLASSES)
 from .registry import SourceRegistry, DEFAULT_REGISTRY
-from .randomize import ApipRng, draw_ttl_jitter
+from .randomize import ApipRng, draw_ttl_jitter, draw_scaled_integer
 
 # Interdiction ladder rungs (docs/25)
 RUNGS = ("NONE", "L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7")
@@ -78,6 +78,22 @@ class Policy:
     randomization_bounds_version: str = ""
     randomization_epoch: str = "0"      # wall-clock epoch bucket; see docs/29
     ttl_jitter: RandomizationMechanism = RandomizationMechanism(False, 0.8, 1.0)
+    # v2.1.1: L2 rate ceiling (docs/25 client-impact budget) + its jitter
+    # bounds (docs/29 rate_ceiling mechanism). A rate_limit without a
+    # ceiling is an intent, not a rule; the ceiling is always carried.
+    nominal_rate_ceiling_per_min: int = 0
+    rate_ceiling_jitter: RandomizationMechanism = RandomizationMechanism(False, 0.5, 1.0)
+    # freshness window backing the pinned-clock classifier (set by load_policy)
+    _recency_max_age_hours: float = 6.0
+    # v2.1.1 (audit residual): replay-clock pinning. When set (ISO-8601 Z),
+    # recency classification anchors to this instant instead of the wall
+    # clock, making decision byte-replay exact — not just within a
+    # freshness window. None = live wall clock (interactive use).
+    reference_now: str | None = None
+    # v2.1.1 (audit residual): per-indicator evidence envelope (docs/23).
+    # Caps the number of evidence records considered per indicator,
+    # bounding reason-code cardinality upstream of any streaming stage.
+    max_evidence_per_indicator: int = 64
 
 
 def _decision_id(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip: int,
@@ -131,17 +147,19 @@ def _behavioral_families(indicator: Indicator, registry: SourceRegistry) -> set[
 
 
 def _external_corroboration(indicator: Indicator, registry: SourceRegistry) -> tuple[bool, int]:
-    """Qualified external corroboration: independent, non-local, non-annotation,
-    auto-enforcement-allowed sources with positive-weight evidence."""
-    qualified: set[str] = set()
+    """Qualified external corroboration (v2.1.1): counted over DISTINCT
+    upstream provenance identities, not feed names — three resellers of one
+    upstream corroborate once (docs/04: independence is provenance, not feed
+    count). Auto-enforcement-allowed, non-local, non-annotation sources only."""
+    identities: set[str] = set()
     for ev in indicator.evidence:
         prof = registry.profile(ev.source_id)
         if prof.source_class in {"local", "annotation", "unregistered"}:
             continue
         if not (prof.independent and prof.auto_enforcement_allowed):
             continue
-        qualified.add(ev.source_id)
-    return (len(qualified) > 0, len(qualified))
+        identities.add(registry.independence_identity(ev.source_id))
+    return (len(identities) > 0, len(identities))
 
 
 def _cap_behavioral_m(m_total: int, bm: int, cap: int) -> int:
@@ -171,7 +189,7 @@ def select_rung(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip: 
                 behavioral_families: set[str], external_qualified: bool,
                 infra_state: str, dedicated_use: bool,
                 protocol_class: str | None = None,
-                client: str | None = None) -> tuple[str, str, list[str], ActionSelector | None]:
+                client: str | None = None) -> tuple[str, str, list[str], ActionSelector | None, list[dict]]:
     """Deterministic ladder selection (docs/25, v2.1 gates).
 
     Hard rules precede floors:
@@ -182,11 +200,15 @@ def select_rung(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip: 
         dedicated-use evidence; SHARED and UNKNOWN both demote (v2.1 fix);
       - L1 requires an interactive protocol class and a client selector;
       - L2 requires a client/destination pair selector — a destination-global
-        L2 is never emitted (v2.1 fix);
+        L2 is never emitted (v2.1 fix) — and carries a concrete rate ceiling
+        (docs/25): nominal, or drawn within docs/29 rate_ceiling bounds with
+        the draw recorded when randomization is enabled (v2.1.1 fix: the
+        scaffold previously emitted rate_limit rules with no ceiling at all);
       - L3/L6/L7 are approval-gated classes not auto-selected here.
     """
     reasons: list[str] = []
     deny_ok = True
+    rand_records: list[dict] = []
 
     # --- behavioral corroboration gate (v2.1): if behavioral evidence
     # contributes AT ALL, deny requires k families AND external corroboration.
@@ -270,12 +292,91 @@ def select_rung(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip: 
                     scope_type="client_session", client=client,
                     destination=indicator.value, protocol_class=protocol_class)
             elif r == "L2":
+                ceiling = policy.nominal_rate_ceiling_per_min
+                if policy.randomization_enabled and policy.rate_ceiling_jitter.enabled:
+                    # docs/29 rate_ceiling mechanism: the ceiling is drawn
+                    # within policy bounds. The seed uses ONLY fields present
+                    # in the final decision record (indicator identity, policy
+                    # version, M, S_ctx, scope, bounds version, epoch) — an
+                    # auditor holding the decision can reproduce the draw
+                    # exactly. Same auditability stance as ttl_jitter: bounds
+                    # enforcement carries the security, not seed secrecy.
+                    rng = ApipRng("|".join([
+                        "rate-ceiling", indicator.id, indicator.type,
+                        indicator.value, policy.version, str(m), str(s_ctx),
+                        policy.scope, policy.randomization_bounds_version,
+                        policy.randomization_epoch]))
+                    ceiling, frac_micros = draw_scaled_integer(
+                        rng, policy.nominal_rate_ceiling_per_min,
+                        policy.rate_ceiling_jitter.lo, policy.rate_ceiling_jitter.hi)
+                    rand_records.append({
+                        "mechanism": "rate_ceiling",
+                        "bounds_version": policy.randomization_bounds_version,
+                        "epoch": policy.randomization_epoch,
+                        "seed_id": "seed--rate-ceiling--"
+                                   + hashlib.sha256("|".join([
+                                       indicator.id, indicator.type, indicator.value,
+                                       policy.version, str(m), str(s_ctx), policy.scope,
+                                       policy.randomization_bounds_version,
+                                       policy.randomization_epoch]).encode()).hexdigest()[:12],
+                        "draw": {"ceiling_fraction_micros": int(frac_micros),
+                                 "ceiling_per_min": ceiling},
+                    })
                 selector = ActionSelector(
                     scope_type="client_destination_pair", client=client,
-                    destination=indicator.value, protocol_class=protocol_class)
+                    destination=indicator.value, protocol_class=protocol_class,
+                    rate_ceiling_per_min=ceiling)
             break
 
-    return rung, action, reasons, selector
+    return rung, action, reasons, selector, rand_records
+
+
+def _bounded_evidence(indicator: Indicator, policy: Policy) -> tuple[Indicator, int]:
+    """docs/23 evidence envelope: cap the records scored per indicator.
+
+    Deterministic order (stable input order), overflow dropped with a
+    reason — bounding reason-code cardinality and scorer work upstream of
+    any streaming stage. Returns the bounded indicator and the drop count.
+    """
+    cap = max(1, int(policy.max_evidence_per_indicator))
+    if len(indicator.evidence) <= cap:
+        return indicator, 0
+    bounded = Indicator(
+        id=indicator.id, type=indicator.type, value=indicator.value,
+        sources=indicator.sources, evidence=indicator.evidence[:cap],
+        tags=indicator.tags)
+    return bounded, len(indicator.evidence) - cap
+
+
+def _make_recency_classifier(policy: Policy):
+    """Bind the policy's recency window to the replay clock (v2.1.1).
+
+    When reference_now is set, decay is computed against the pinned instant
+    instead of the wall clock, so byte-replay of a decision batch is exact
+    at any later time. The freshness window is `_recency_max_age_hours`
+    (carried by load_policy), matching the live classifier's semantics.
+    Unset (interactive use) keeps the policy's own wall-clock classifier.
+    """
+    if policy.reference_now is None:
+        return policy.classify_recency
+    from datetime import datetime, timedelta, timezone
+    max_age = timedelta(hours=max(0.0, float(policy._recency_max_age_hours)))
+
+    def classify(ts: str) -> str:
+        if not ts:
+            return "stale"
+        try:
+            t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            now = datetime.fromisoformat(policy.reference_now.replace("Z", "+00:00"))
+        except ValueError:
+            return "stale"
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return "fresh" if abs(now - t) <= max_age else "stale"
+
+    return classify
 
 
 def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | None = None) -> Decision:
@@ -283,10 +384,18 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
     client = context.get("client")
     protocol_class = context.get("protocol_class")
 
+    # docs/23 evidence envelope: bound the records scored per indicator,
+    # bounding reason-cardinality and scorer work upstream of any stage.
+    indicator, ev_dropped = _bounded_evidence(indicator, policy)
+
     # Policy-owned scoring: evidence carries facts, the weight table and
-    # source registry carry authority (docs/04 v2.1).
+    # source registry carry authority (docs/04 v2.1). Recency runs on the
+    # policy clock — pinned to reference_now when set (exact replay).
     m_total, bm, s_ctx, s_ip, has_dedicated, has_unqualified, reasons = score_parts(
-        indicator, policy.evidence_table, policy.classify_recency, policy.source_registry)
+        indicator, policy.evidence_table, _make_recency_classifier(policy),
+        policy.source_registry)
+    if ev_dropped:
+        reasons = tuple(sorted(set(reasons) | {f"evidence_envelope_truncated:{ev_dropped}"}))
 
     behavioral_fams = _behavioral_families(indicator, policy.source_registry)
     cap = _behavioral_cap(behavioral_fams, policy)
@@ -323,6 +432,7 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
     disposition = "NO_ACTION"
     rung = "NONE"
     ttl = 0
+    rand_records: list[dict] = []
     selector: ActionSelector | None = None
     external_qualified, _ = _external_corroboration(indicator, policy.source_registry)
 
@@ -354,7 +464,7 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
             rung = "NONE"
             reasons = tuple(sorted(set(reasons) | {"prefix_requires_approval"}))
         else:
-            rung, action, ladder_reasons, selector = select_rung(
+            rung, action, ladder_reasons, selector, rand_records = select_rung(
                 indicator, policy, m, s_ctx, s_ip, behavioral_fams,
                 external_qualified, infra_state, has_dedicated,
                 protocol_class=protocol_class, client=client)
@@ -368,13 +478,16 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
                 disposition = "PROPOSE_OPERATOR_APPROVAL" if policy.mode == "ENFORCE" else "SHADOW_ACTION"
 
     did = _decision_id(indicator, policy, m, s_ctx, s_ip, action, disposition, rung)
+    ceiling_note = ""
+    if selector is not None and selector.rate_ceiling_per_min is not None:
+        ceiling_note = f", rate_ceiling_per_min={selector.rate_ceiling_per_min}"
     explanation = (
         f"M={m}, S_ctx={s_ctx}, S_ip={s_ip}, type={indicator.type}, infra={infra_state}, "
         f"families={len(behavioral_fams)}, external_qualified={external_qualified}, "
-        f"mode={policy.mode}, rung={rung}, disposition={disposition}, action={action}."
+        f"mode={policy.mode}, rung={rung}, disposition={disposition}, action={action}"
+        f"{ceiling_note}."
     )
 
-    randomization_record = None
     nominal_ttl = ttl
     if ttl > 0 and policy.randomization_enabled and policy.ttl_jitter.enabled:
         # Seed includes the wall-clock epoch bucket (docs/29): same indicator
@@ -393,14 +506,21 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
         # break auditability without adding security.
         rng = ApipRng(f"{did}|{policy.randomization_bounds_version}|{policy.randomization_epoch}")
         ttl, frac_micros = draw_ttl_jitter(rng, ttl, policy.ttl_jitter.lo, policy.ttl_jitter.hi)
-        randomization_record = {
+        rand_records.append({
             "mechanism": "ttl_jitter",
             "bounds_version": policy.randomization_bounds_version,
             "epoch": policy.randomization_epoch,
             "seed_id": f"seed--{did.split('--')[-1]}",
             "draw": {"ttl_fraction_micros": int(frac_micros), "ttl_seconds": ttl},
-        }
+        })
         explanation += f" ttl_jitter={frac_micros / 1_000_000:.3f}."
+
+    # v2.1.1: a decision may carry MULTIPLE recorded draws (e.g. rate_ceiling
+    # at selection + ttl_jitter on the TTL). Legacy single-object shape is
+    # kept when only one mechanism applied.
+    randomization_record = rand_records[0] if len(rand_records) == 1 else (rand_records or None)
+    if isinstance(randomization_record, list):
+        randomization_record = list(randomization_record)
 
     return Decision(
         id=did,

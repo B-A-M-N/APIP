@@ -33,6 +33,20 @@ max_auto_ttl_seconds = 3600
 max_new_auto_actions_per_batch = 100
 # L1 client-impact budget (docs/25): at most 5% of interactive transactions challenged/hour
 max_challenged_transaction_fraction_per_hour = 0.05
+# v2.1.1: L2 rate ceiling (docs/25 client-impact budget). A rate_limit rule
+# without a ceiling is not a rule; the drawn ceiling never exceeds this
+# nominal value (docs/29 rate_ceiling bounds below).
+nominal_rate_ceiling_per_min = 240
+# v2.1.1: docs/23 evidence envelope — records scored per indicator cap.
+max_evidence_per_indicator = 64
+
+# v2.1.1: replay clock (docs/10 deterministic-replay harness). When set,
+# evidence freshness is evaluated against this instant and decision
+# byte-replay is exact at any later time. Leave unset for live operation.
+# The example data is pinned so the packaged demo evaluates identically
+# regardless of when it is run.
+[replay]
+reference_now = "2026-09-01T20:00:00Z"
 
 [safety]
 auto_prefix_deny = false

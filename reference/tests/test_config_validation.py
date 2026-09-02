@@ -25,7 +25,8 @@ def _base():
                 "L5": {"m": 98, "s": 95},
             },
         },
-        "limits": {"max_auto_ttl_seconds": 3600},
+        "limits": {"max_auto_ttl_seconds": 3600,
+                   "nominal_rate_ceiling_per_min": 240},
         "safety": {"auto_prefix_deny": False, "auto_routing": False,
                    "allowlist_precedence": True, "no_ai_components": True},
         "behavioral": {

@@ -365,11 +365,79 @@ def scenario_degradation() -> bool:
          rep["degraded"] is True),
         ("TTL eviction deterministic and effective", evicted == 3),
         ("post-eviction report remains well-formed",
-         set(rep) == {"schema_version", "degraded", "tracked_requesters",
-                      "fingerprint_groups", "cross_fingerprint_links"}),
+         set(rep) == {"schema_version", "degraded", "handle_keying",
+                      "tracked_requesters", "fingerprint_groups",
+                      "cross_fingerprint_links"}),
     ]
     _dump("degradation", s, rep)
     return _print_result("degradation (docs/23 envelopes applied to docs/30)", claims)
+
+
+def scenario_churn() -> bool:
+    """The HONEST adversary: rotates IPs AND mutates the fingerprint.
+
+    The earlier rotation scenario was friendlier than reality — real
+    attackers rotate behavior too. This scenario states plainly what the
+    engine claims and does not: full-behavior rotation is UNTRACEABLE
+    across handles (by design — the engine never pretends otherwise), while
+    PARTIAL churn (attacker reuses some construction behaviors, because
+    changing everything is expensive and error-prone) leaves value-matched
+    containment links. Correlation is best-effort display output; nothing
+    enforcement-side consumes it.
+    """
+    from apip.attribution import extract_features
+
+    s = CorrelationStore()
+
+    # Stage 1: implant-a on IP #0. Full construction signature.
+    s.observe(_tx(_next_addr(0), "implant-a", "2026-09-01T19:00:00Z"))
+
+    # Stage 2: same operator, NEW IPs, FULL behavioral rotation: every
+    # observable construction behavior changed. (Borrow implant-b's entire
+    # template — a rewrite of the toolchain.)
+    s.observe(_tx(_next_addr(1), "implant-b", "2026-09-01T19:05:00Z"))
+    s.observe(_tx(_next_addr(2), "implant-b", "2026-09-01T19:06:00Z"))
+
+    # Stage 3: same operator again, PARTIAL churn: new TLS stack and new
+    # cache behavior (the two easiest things to change), but the HTTP
+    # library — and therefore header emission order and locale/encoding
+    # coherence — stays (changing it broke the implant's C2 protocol once,
+    # so the operator kept it).
+    churned = _tx(_next_addr(3), "implant-a", "2026-09-01T19:10:00Z",
+                  tls_ja4="t13d1514h2_ff00ff00ff00_001122334455",
+                  cache_behavior="revalidation_ignored")
+    s.observe(churned)
+
+    rep = s.report()
+    groups = rep["fingerprint_groups"]
+    links = rep["cross_fingerprint_links"]
+
+    feats_a = extract_features(_tx("x", "implant-a", "2026-09-01T19:00:00Z"))
+    feats_b = extract_features(_tx("x", "implant-b", "2026-09-01T19:05:00Z"))
+    feats_churn = extract_features(churned)
+    shared_a_churn = set(feats_a) & set(feats_churn)
+    matching_a_churn = {k for k in shared_a_churn if feats_a[k] == feats_churn[k]}
+    shared_a_b = set(feats_a) & set(feats_b)
+    matching_a_b = {k for k in shared_a_b if feats_a[k] == feats_b[k]}
+
+    claims = [
+        ("stage-1 + stage-2 + stage-3 all tracked (4 source IPs)",
+         rep["tracked_requesters"] == 4),
+        ("FULL rotation (stage 2) shares NO matching behavior values with "
+         "stage 1 — the engine has nothing to link and claims nothing",
+         len(matching_a_b) == 0),
+        ("PARTIAL churn (stage 3) retains >= 2 construction behaviors "
+         "matching stage 1 (header order, locale coherence)",
+         len(matching_a_churn) >= 2),
+        ("partial churn LINKS to stage 1 (value-matched containment)",
+         len(links) == 1),
+        ("engine never fabricates links from absence: 1 link for 1 real "
+         "partial-churn pair, no link for the fully-rotated pair",
+         all(l["shared_probes"] >= 2 for l in links)),
+    ]
+    _dump("churn", s, rep)
+    return _print_result("churn (docs/30: honest limits — full rotation is "
+                         "untraceable, partial churn is linkable)", claims)
 
 
 class TemporaryOut:
@@ -401,6 +469,7 @@ SCENARIOS = {
     "rotation": scenario_rotation,
     "campaigns": scenario_campaigns,
     "formats": scenario_formats,
+    "churn": scenario_churn,
     "live": scenario_live,
     "boundary": scenario_boundary,
     "degradation": scenario_degradation,

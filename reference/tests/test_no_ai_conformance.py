@@ -24,10 +24,12 @@ SECURITY_BEARING = {
 
 # Deterministic standard-library allowlist for security-bearing modules.
 # Anything outside this set (socket, http, subprocess, ctypes, ...) is a
-# supply-chain escape and fails the build.
+# supply-chain escape and fails the build. `os` is restricted to env/file
+# access for the deployment key (v2.1.1); `hmac` provides keyed
+# pseudonymization; both are deterministic, side-effect-free uses.
 STDLIB_ALLOWLIST = {
-    "__future__", "argparse", "dataclasses", "datetime", "hashlib",
-    "ipaddress", "itertools", "json", "math", "pathlib", "re",
+    "__future__", "argparse", "dataclasses", "datetime", "hashlib", "hmac",
+    "ipaddress", "itertools", "json", "math", "os", "pathlib", "re",
     "typing", "tomllib", "unittest",
 }
 

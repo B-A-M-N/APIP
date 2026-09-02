@@ -1,7 +1,7 @@
 {
   "manifest_version": "3",
   "package": "attack-path-interdiction-platform",
-  "spec_revision": "v2.1",
+  "spec_revision": "v2.1.1",
   "generated": "2026-09-01",
   "files": [
     {
@@ -10,15 +10,15 @@
     },
     {
       "path": "AUDIT_ADVERSARIAL_2026_09_01.md",
-      "sha256": "3201088c39b9bcb0fcd4ef9db6d74f04ec67ec3b6f577901bcfcc3c186754ca6"
+      "sha256": "3c6b0f1e7a89bdb7e115f5004841e67a6c6945f1ffe23d4cd017d39eed4f8e97"
     },
     {
       "path": "BUILD_VERIFICATION.txt",
-      "sha256": "ea1f211da323003861b118761f695efaef4f2167568fb3c899eff900b1749531"
+      "sha256": "d6e2febf253054418c846819032d8d7162723d07430cbc1fa37452fa25078c69"
     },
     {
       "path": "FULL_SPEC.md",
-      "sha256": "045d091bd721690d21fdf46d7d184365bbc0e94f2fd1497c990a7093a4bf4565"
+      "sha256": "e02a45f6b39a82945d5c687974e0b8ecdfe8eb6c901493d1edf3b641541e1921"
     },
     {
       "path": "README.md",
@@ -42,7 +42,7 @@
     },
     {
       "path": "docs/04_EVIDENCE_CONFIDENCE_POLICY.md",
-      "sha256": "ae44fdc5c6d822256a8363a6af87ed7496a6af59140cb94b4052dfbc358fb4ae"
+      "sha256": "35fb4c5ac91f6ecceff105d9986d922fd62647976c3ca7cc57a62f90f2df79a7"
     },
     {
       "path": "docs/05_DATA_AND_INTERFACES.md",
@@ -66,7 +66,7 @@
     },
     {
       "path": "docs/10_TESTING_VALIDATION.md",
-      "sha256": "4940848c385c0cd3f118a2fe38baa5469bb3a08ac26e68d4a17a588e210e5f3b"
+      "sha256": "60d1bd67e415f59682bdbc373b3414e7ff01e461f1f06361f900b2cb250d7583"
     },
     {
       "path": "docs/11_OPERATIONS_RUNBOOK.md",
@@ -118,7 +118,7 @@
     },
     {
       "path": "docs/23_BEHAVIORAL_DETECTION_SUITE.md",
-      "sha256": "422724eea8ce6ef679e67d50745427cdb4bdc412994b62ffcf33877695e2d6f3"
+      "sha256": "7e25933ddb2388b31f89ecd8c76018f6902bf832ce36e5be6b3cbcc524315481"
     },
     {
       "path": "docs/24_ENCRYPTION_AND_BYPASS_RESISTANCE.md",
@@ -126,7 +126,7 @@
     },
     {
       "path": "docs/25_LAYERED_INTERDICTION_AND_SHARED_INFRASTRUCTURE.md",
-      "sha256": "51813cf55505de0ad4d581d545043a97689a25305ecbe083f1aa6c9abafc3498"
+      "sha256": "5849f910d77d025083dd2dd3a1bc7169fdf912643eb48c7bc4555ea450a522b0"
     },
     {
       "path": "docs/26_ALLOW_FIRST_MODE_FOR_CRITICAL_SEGMENTS.md",
@@ -146,7 +146,7 @@
     },
     {
       "path": "docs/30_REQUESTER_ATTRIBUTION_AND_FINGERPRINTING.md",
-      "sha256": "b3b1daffec0d729da374be93dd77f561a872ff6244f85b9ce84ce7847c1279b1"
+      "sha256": "7d38d80f83647443f32fb73690d32615b0451ce7628df3559f01e5761665ad92"
     },
     {
       "path": "examples/access_log_sample.log",
@@ -162,7 +162,7 @@
     },
     {
       "path": "examples/policy.toml",
-      "sha256": "13bdef9afa54446ab80b4ebf74e4e301c264bc0d9bb395b8c56e8c540fe0b6bf"
+      "sha256": "a7809ee9677e03e42b538b78e2a0be487808a163dd5f3adf1c4069117f686a92"
     },
     {
       "path": "examples/transactions.jsonl",
@@ -170,7 +170,7 @@
     },
     {
       "path": "lab/README.md",
-      "sha256": "c2b2c8f23d85fd4aea77e27574aa59f2703032344b79bb47471aadf67eca62c6"
+      "sha256": "9e20c652b7cd4046442654b349e12655e2ce6695076d7425556e632bcc1dfcb3"
     },
     {
       "path": "lab/run.sh",
@@ -178,7 +178,7 @@
     },
     {
       "path": "lab/run_lab.py",
-      "sha256": "4808932c9596b7310adfeaddc88ab697c246fba5e466c8d1853537ed4024d11f"
+      "sha256": "25ce620a49742ef98f2885b0d383701a06aade96918aa497fdedee7c16c2d5b8"
     },
     {
       "path": "reference/README.md",
@@ -194,7 +194,11 @@
     },
     {
       "path": "reference/src/apip/attribution.py",
-      "sha256": "e309d50eefbc85aa16fd6fa16f4d974571dc3fa37b8924dc84200a762d8cc17c"
+      "sha256": "0a5bebd226e093266c2fe10ab6d30d87adf27e34ea2d3ebea874aa232f728de9"
+    },
+    {
+      "path": "reference/src/apip/behavioral.py",
+      "sha256": "eeb9bdd9a35100910228da3c3dba2accb218ec5f9c0e3b4367f92d657a3c2efd"
     },
     {
       "path": "reference/src/apip/cli.py",
@@ -202,7 +206,7 @@
     },
     {
       "path": "reference/src/apip/config.py",
-      "sha256": "986f389defdee54bf989cb8776ac587ea97c972298b10992a0b1b6eb136c9192"
+      "sha256": "638625a5dada9323d9d536b7099950903f60ef56617cbba5357cb88a0e77169c"
     },
     {
       "path": "reference/src/apip/exporters/__init__.py",
@@ -214,7 +218,7 @@
     },
     {
       "path": "reference/src/apip/exporters/suricata.py",
-      "sha256": "1eca983f903f55fd91aa9437694e7a47ceaf747399096f1225c1be49a7b102b0"
+      "sha256": "3033aa32e0fd49fe4846a3f7062184585f7881b82460e2b3410f5cdaa87a4f4b"
     },
     {
       "path": "reference/src/apip/io.py",
@@ -230,23 +234,23 @@
     },
     {
       "path": "reference/src/apip/live/server.py",
-      "sha256": "1e0a2af0b99038d5b491e6f71c5da1c138bd60ac9ec323de77d79a1bcdb42dcc"
+      "sha256": "78136823e8c942ce607d04fbddf2694f7ffd3dacb84ba90632a56c0e9a2625ad"
     },
     {
       "path": "reference/src/apip/models.py",
-      "sha256": "c339bf424d2ca7cce6516bdbfdbc447ba32dec363ace008c3fc2d4bb91502aa0"
+      "sha256": "1cba649fa35abf5f9d5fb13f6422dd8ba63000b03e07bc9a6b3b3b49aaf2c290"
     },
     {
       "path": "reference/src/apip/policy.py",
-      "sha256": "fa7180acf622140bf23652550c67566f90c9542ab489411e79d97044b07cacad"
+      "sha256": "f9d04e53f1293c627d93d3b4bb47117903348b0b41c517261bb20e8176f29e54"
     },
     {
       "path": "reference/src/apip/randomize.py",
-      "sha256": "8350a4ccd993a5db4a258724ade4ed0c9208a040e296269155054e70484ae71e"
+      "sha256": "731bbb4648333176cb2296794313d487e676fd50e36e04ac7be180fa821eba54"
     },
     {
       "path": "reference/src/apip/registry.py",
-      "sha256": "18144f129c13e4cb7987d907ff7742cb3aae941860d7ddd145133acafa8bba57"
+      "sha256": "a06bcaf16af0c1899f1665aafcffd737e1e6a2feed5e4ce1b6b4bfc10fe1de4b"
     },
     {
       "path": "reference/src/apip/scoring.py",
@@ -254,7 +258,7 @@
     },
     {
       "path": "reference/src/apip/uireport.py",
-      "sha256": "49bd7c94a68cb55c0172ce1dee0b9fb185261a282fdab93e279a2cb3e4e82a37"
+      "sha256": "5a8839fc85c6fd0d8d951d68fbc83d2384fedd0bad5b6a9bbaac650c9d0bd08e"
     },
     {
       "path": "reference/tests/test_adversarial_audit.py",
@@ -265,8 +269,12 @@
       "sha256": "c2c0103801f4d8fb5e829e46322d268d1d84f3f16d82ddae4d47527a8b1704e3"
     },
     {
+      "path": "reference/tests/test_audit_residuals.py",
+      "sha256": "24009170fbe3783a61192905251e9a269544c25d2c839f3e4dba306a4ef039a4"
+    },
+    {
       "path": "reference/tests/test_config_validation.py",
-      "sha256": "77a8d062806392280a03e1503a9147e7cef3bce999ad9e25a5fe7a84f6b5a031"
+      "sha256": "f644d65cc6395c6f864bb866cf110ae095cf7a900a3d5f3027d2fdf7812e609e"
     },
     {
       "path": "reference/tests/test_live_capture.py",
@@ -274,7 +282,7 @@
     },
     {
       "path": "reference/tests/test_no_ai_conformance.py",
-      "sha256": "549696f6a72e0b6f66e421e7660ca586c7945f1cd5a129683440345a618361e1"
+      "sha256": "ada7f1d09518ab27cf30df8814372c38ec80b1b9ba7bcf246eb4d9aa545ad762"
     },
     {
       "path": "reference/tests/test_policy.py",
@@ -306,7 +314,7 @@
     },
     {
       "path": "schemas/decision.schema.json",
-      "sha256": "7cbb534154075c8ee0abaf6e038ba61c8fc2fd18f64a4523cf2bacacd3ab3c6a"
+      "sha256": "593c81f7523dc752b948a7f948d98beb2578c925d9e85f5763495eb5c25e8431"
     },
     {
       "path": "schemas/indicator.schema.json",
@@ -318,7 +326,7 @@
     },
     {
       "path": "schemas/policy.schema.json",
-      "sha256": "96368adea6b9a95d04b384646ea99211dce85b154802daa69765934d4845ca55"
+      "sha256": "5db8f2763e0f0602e58f3e4c8718c578ce336bdac7b033957c875c07f1dc10d3"
     },
     {
       "path": "sources.json",

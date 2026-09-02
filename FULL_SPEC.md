@@ -2,7 +2,7 @@
 
 ## Specification revision
 
-This is the **v2.1 consolidated specification** (2026-09-01, rev 2.1). It integrates the upgraded design — behavioral detection, encryption/bypass resistance, layered interdiction, allow-first critical segments, virtual patching, AI-era posture, deterministic randomization, and requester attribution — as first-class parts of the platform. Companion documents `docs/23`–`docs/30` are normative alongside `docs/01`–`docs/22`. Where a companion document imposes a stricter safety requirement, the stricter requirement governs.
+This is the **v2.1 consolidated specification** (2026-09-01, rev 2.1; rev **2.1.1** closes the adversarial-audit residuals — rate-ceiling semantics, resource-envelope reference detector, keyed pseudonymization, pinned replay clock, provenance independence, evidence envelopes — see `AUDIT_ADVERSARIAL_2026_09_01.md`). It integrates the upgraded design — behavioral detection, encryption/bypass resistance, layered interdiction, allow-first critical segments, virtual patching, AI-era posture, deterministic randomization, and requester attribution — as first-class parts of the platform. Companion documents `docs/23`–`docs/30` are normative alongside `docs/01`–`docs/22`. Where a companion document imposes a stricter safety requirement, the stricter requirement governs.
 
 ## 1. Mission
 

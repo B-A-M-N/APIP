@@ -52,6 +52,8 @@ At proxy/WAF/secure-web-gateway actuators the operator already operates. Suspici
 
 Ceilings per (client, destination) pair at firewall/proxy. Converts C2 beaconing into detectable, throttled leakage rather than a working channel; preserves legitimate shared use because ceilings are per-pair, not per-destination-global. Feed for BD-1: a rate-limited pair that continues attempting at ceiling is strong continued-compromise evidence and feeds L6 justification.
 
+**Ceiling semantics (v2.1.1, mandatory):** every L2 decision carries a concrete `rate_ceiling_per_min` on its selector — `limits.nominal_rate_ceiling_per_min` from policy, or a draw within the docs/29 `rate_ceiling` bounds when randomization is enabled (draw recorded on the decision, reproducible from decision-record fields). A rate_limit without a ceiling is an intent, not a rule: enforcement compilers REFUSE it, and policy validation rejects an L2 floor configured without a nominal ceiling. A destination-global L2 remains prohibited — the pair selector is mandatory (v2.1).
+
 ### L3 — Egress allowlisting for fixed-function segments
 
 The strongest preventive control in the platform, and the one most aligned with OT guidance: for segments whose external communication requirements are **fixed and enumerable** (vendor remote access, historian uplink, time sync, update servers), egress is deny-by-default with an explicit allowlist. Every new egress destination is then an **approval event or an incident**, never silent. Onboarding a segment to L3 is approval-gated (change-managed, OT-owner signed off), but thereafter the enforcement itself is fully automatic: any destination not on the segment list is denied, logged, and raised as a first-seen egress incident (BD-6).

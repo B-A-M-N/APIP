@@ -40,6 +40,11 @@ class ActionSelector:
     destination: str | None = None
     protocol_class: str | None = None   # interactive_http | smtp | dns | ics | other
     host: str | None = None
+    # Rate-limit ceiling (docs/25 client-impact budget, docs/29 rate_ceiling
+    # mechanism): requests per minute the rule permits for the pair/session.
+    # A rate_limit action without this value has no ceiling semantics and is
+    # not exportable; the drawn (or nominal) ceiling is always carried.
+    rate_ceiling_per_min: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -60,7 +65,10 @@ class Decision:
     explanation: str
     selector: ActionSelector | None = None
     nominal_ttl_seconds: int = 0
-    randomization: dict[str, Any] | None = field(default=None)
+    # A single draw record (dict, legacy shape) or a list of draw records
+    # when multiple mechanisms applied to one decision (e.g. ttl_jitter +
+    # rate_ceiling). None when no randomized mechanism applied.
+    randomization: Any | None = field(default=None)
     attribution_refs: tuple[str, ...] = ()   # docs/30: display-only, never a decision input
 
     def to_dict(self) -> dict[str, Any]:

@@ -76,6 +76,24 @@ def validate_policy(raw: dict) -> list[str]:
         problems.append("uncorroborated behavioral cap must sit below the L4 deny floor")
     if not safety.get("allowlist_precedence", True):
         problems.append("allowlist_precedence=false is prohibited in the reference policy (docs/04)")
+    # v2.1.1: an L2 floor with no nominal rate ceiling means the platform
+    # would emit rate_limit rules with no ceiling semantics — the exact gap
+    # the audit named. Require the ceiling whenever L2 is automated.
+    rung_names = {k.upper() for k in rungs}
+    limits = raw.get("limits", {})
+    if "L2" in rung_names and int(limits.get("nominal_rate_ceiling_per_min", 0)) <= 0:
+        problems.append(
+            "nominal_rate_ceiling_per_min must be > 0 when an L2 floor is "
+            "configured (rate_limit without a ceiling is not a rule)")
+    rc = ((raw.get("randomization", {}).get("mechanisms") or {}).get("rate_ceiling") or {})
+    if rc.get("enabled") and not limits.get("nominal_rate_ceiling_per_min"):
+        problems.append("rate_ceiling randomization enabled but nominal_rate_ceiling_per_min is unset")
+    rn = (raw.get("replay") or {}).get("reference_now")
+    if rn is not None:
+        import re as _re
+        if not (isinstance(rn, str) and _re.match(
+                r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$", rn)):
+            problems.append("replay.reference_now must be ISO-8601 UTC (...Z)")
     return problems
 
 
@@ -103,6 +121,12 @@ def load_policy(path: str | Path) -> Policy:
         lo=float(mech.get("min", 0.8)),
         hi=float(mech.get("max", 1.0)),
     )
+    rmech = (rz.get("mechanisms") or {}).get("rate_ceiling") or {}
+    rate_ceiling_jitter = RandomizationMechanism(
+        enabled=bool(rmech.get("enabled", False)),
+        lo=float(rmech.get("min", 0.5)),
+        hi=float(rmech.get("max", 1.0)),
+    )
 
     allowlist = tuple(
         AllowlistEntry(
@@ -115,12 +139,18 @@ def load_policy(path: str | Path) -> Policy:
         for e in (raw.get("allowlist") or [])
     )
 
+    recency_max_age = float((raw.get("freshness") or {}).get("max_age_hours", 6.0))
+
     return Policy(
         version=raw["policy_version"],
         mode=raw["mode"],
         scope=raw["scope"],
-        classify_recency=_default_recency_classifier(
-            float((raw.get("freshness") or {}).get("max_age_hours", 6.0))),
+        classify_recency=_default_recency_classifier(recency_max_age),
+        # replay clock (docs/10): pin evaluation to an instant so byte-replay
+        # is exact. Reference scaffold: policy knob when present; production
+        # determinism harness derives it from the batch manifest.
+        reference_now=(raw.get("replay") or {}).get("reference_now"),
+        _recency_max_age_hours=recency_max_age,
         observe_m=int(t["observe_m"]),
         fqdn_auto_m=int(t["fqdn_auto_m"]),
         fqdn_auto_s=int(t["fqdn_auto_s"]),
@@ -139,8 +169,11 @@ def load_policy(path: str | Path) -> Policy:
         behavioral_deny_families=int(corr.get("distinct_families_for_deny", 3)),
         behavioral_deny_requires_external=bool(corr.get("deny_also_requires_external", True)),
         max_behavioral_m_contribution=int(b.get("max_behavioral_m_contribution", 60)),
+        max_evidence_per_indicator=int(l.get("max_evidence_per_indicator", 64)),
+        nominal_rate_ceiling_per_min=int(l.get("nominal_rate_ceiling_per_min", 0)),
         randomization_enabled=bool(rz.get("enabled", False)),
         randomization_bounds_version=str(rz.get("bounds_version", "")),
         randomization_epoch=str(rz.get("epoch", "0")),
         ttl_jitter=ttl_jitter,
+        rate_ceiling_jitter=rate_ceiling_jitter,
     )

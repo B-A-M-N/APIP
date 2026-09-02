@@ -39,30 +39,67 @@ speculation; every finding was demonstrated against the running code.
 
 ## Residual risks (stated, not hidden)
 
-1. The scaffold is a **decision engine**, not a deployed product: resource
-   envelopes for the *behavioral* suite are specified (docs/23) but the
-   reference has no streaming detector to bound; the shipped CLI loads
-   indicator files wholesale. An operator scaling this must implement the
-   envelope code, not just configure it.
-2. **L2 `rate_limit` has no rate parameter** — the rung is selected and
-   compiled as an intent, but ceiling values (per docs/25 client-impact
-   budgets) are production-compiler work. The scaffold would emit a rule
-   with no ceiling semantics.
+> **v2.1.1 status: residuals 2, 4, 5 CLOSED in code; residuals 1 and 3
+> closed as named. See the "Residual closure (v2.1.1)" section below.**
+
+1. ~~The scaffold is a **decision engine**, not a deployed product~~:
+   CLOSED AS NAMED for the detector gap — `apip/behavioral.py` now ships a
+   bounded streaming detector (BD-1 beacon periodicity) exercising the
+   docs/23 envelope contract (bounded windows, bounded events, bounded
+   per-window emission, stop-and-mark degradation, deterministic eviction).
+   What remains open is inherent: production-scale streaming, buffering,
+   and backpressure around the detector are deployment code, and the
+   shipped CLI still loads indicator files wholesale (batch is its
+   contract).
+2. ~~**L2 `rate_limit` has no rate parameter**~~: **CLOSED.** The L2
+   selector now carries `rate_ceiling_per_min` (docs/25 client-impact
+   budget) — nominal, or drawn within docs/29 `rate_ceiling` bounds with
+   the draw recorded and reproducible from decision-record fields. The
+   Suricata exporter REFUSES to compile a ceilingless rate_limit (raises),
+   compiles ceilings as `detection_filter:track by_src, count N,
+   seconds 60`, and fqdn pair rate-limits now compile as `http.host`
+   rules instead of vanishing while receipts claimed otherwise. Policy
+   validation rejects an L2 floor configured without a nominal ceiling.
+   (`tests/test_audit_residuals.py::RateCeilingTests`)
 3. The P5 key-order extractor is a best-effort lexical scan, not a JSON
    parser; exotic serializations could yield an empty or partial order.
-   It fails closed (empty feature → no contribution).
-4. Attribution handles are unsalted SHA-256 prefixes. Within one deployment
-   the input space (client IPs) is low-entropy; anyone who can guess the IP
-   space can invert handles. This is acceptable for per-deployment
-   pseudonymization (docs/09 threat model: handles must not be
-   cross-deployment joinable), but it is NOT anonymization against a
-   determined insider — salted HMAC with a deployment key would be the
-   production upgrade.
-5. Recency in the scaffold is wall-clock anchored (`datetime.now`), so
-   byte-replay of decisions is only exact within a freshness window.
-   Production replay must pin the reference clock (the policy schema
-   already carries the knob; the deterministic-replay harness in docs/10
-   describes the anchoring).
+   It fails closed (empty feature → no contribution). **HARDENED
+   (v2.1.1)**: bounded scan budget, bounded key count/length, JSON-key
+   charset validation, escape-aware scanning; hostile bodies yield an
+   empty order rather than polluted features.
+   (`tests/test_audit_residuals.py::P5HardeningTests`)
+4. ~~Attribution handles are unsalted SHA-256 prefixes~~: **CLOSED.**
+   Handles are now keyed HMAC-SHA-256 under a per-deployment key
+   (`APIP_DEPLOYMENT_KEY` env or `APIP_DEPLOYMENT_KEY_FILE`), so the
+   low-entropy client-address space can no longer be brute-forced from a
+   stolen report. Determinism within a deployment (and therefore
+   correlation and replay) is unchanged; rotation of the key re-baselines
+   handles by design; keys must not be shared across deployments. Absent
+   a key, the scaffold degrades to a marked dev fallback and the report
+   itself prints an UNKEYED HANDLES banner.
+   (`tests/test_audit_residuals.py::KeyedHandleTests`)
+5. ~~Recency is wall-clock anchored, so byte-replay is only exact within a
+   freshness window~~: **CLOSED.** `Policy.reference_now` (policy knob
+   `[replay].reference_now`) pins the recency clock; the packaged example
+   policy pins it, so the demo evaluates byte-identically at any date.
+   (`tests/test_audit_residuals.py::ReplayClockTests`)
+6. **Independence was asserted per feed** (two records were counted as two
+   sources merely for arriving through two feeds — docs/04 says they are
+   not): **CLOSED.** `SourceProfile.upstream` carries provenance;
+   corroboration counts DISTINCT upstream identities — three resellers of
+   one upstream corroborate once.
+   (`tests/test_audit_residuals.py::ProvenanceIndependenceTests`)
+7. **Unbounded per-indicator evidence** (reason growth by distinct kind):
+   **CLOSED.** `limits.max_evidence_per_indicator` (docs/23 envelope) caps
+   scored records with a deterministic truncation reason.
+   (`tests/test_audit_residuals.py::EvidenceEnvelopeTests`)
+8. **Lab adversary never rotated behavior** (the rotation scenario was
+   friendlier than reality): **CLOSED.** Lab scenario `churn` now runs the
+   honest adversary — full behavioral rotation is demonstrated UNTRACEABLE
+   (the engine claims nothing), partial churn leaves value-matched
+   containment links. The HTTP/2 and real-TLS-stack fidelity limits of the
+   loopback lab remain and are inherent to an offline stdlib-only
+   demonstration (documented in lab/README.md).
 
 ## Verdict
 
@@ -78,3 +115,22 @@ charset, freshness default, handle normalization) — all demonstrations of
 the same failure mode: an invariant stated in docs but not enforced in
 the last mile of code. That failure mode is exactly what regression
 tests are for, and every gap now has one.
+
+## Residual closure (v2.1.1)
+
+Every residual named by this audit and the follow-up verdict was closed
+with code + regression tests (`tests/test_audit_residuals.py`, 23 tests)
+or closed-as-named with the boundary stated:
+
+| residual | status | enforcement |
+|---|---|---|
+| L2 rate_limit had no ceiling | **CLOSED** | selector carries drawn/nominal ceiling; exporter refuses ceilingless; draw recorded + replayable; policy validation requires the nominal |
+| fqdn rate-limits compiled to nothing | **CLOSED** (found during closure) | http.host + detection_filter rules; ceiling in metadata |
+| docs/23 envelopes unexercised | **CLOSED** | `apip/behavioral.py` BD-1: bounded windows/events/emission, stop-and-mark degradation, deterministic eviction |
+| P5 lexical scan steerable | **HARDENED** | bounded budget, charset, escape-aware; hostile bodies fail closed |
+| unsalted handles | **CLOSED** | keyed HMAC-SHA-256 per deployment; unkeyed state bannered in reports |
+| wall-clock-only replay | **CLOSED** | `reference_now` pin; example policy ships pinned |
+| asserted independence | **CLOSED** | `upstream` provenance; corroboration counts upstream identities |
+| unbounded per-indicator evidence | **CLOSED** | `max_evidence_per_indicator` envelope + truncation reason |
+| lab adversary never rotated behavior | **CLOSED** | lab `churn` scenario: full rotation untraceable (stated), partial churn linkable |
+| production streaming/backpressure | open, inherent | deployment code around the reference detector; CLI batch contract unchanged |

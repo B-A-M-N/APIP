@@ -38,8 +38,11 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 line = line.strip()
                 if not line:
                     continue
+                obj = json.loads(line)
+                if obj.get("rejected"):
+                    continue   # live-capture rejection marker, not a record
                 try:
-                    store.observe(json.loads(line))
+                    store.observe(obj)
                 except TransactionRejected as e:
                     raise SystemExit(
                         f"transaction record rejected at {args.transactions}:{lineno}: {e}")

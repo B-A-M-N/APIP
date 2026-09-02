@@ -1,7 +1,30 @@
 from __future__ import annotations
 import tomllib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from .policy import Policy, RungFloor, RandomizationMechanism, AllowlistEntry
+
+
+def _default_recency_classifier(max_age_hours: float):
+    """Deterministic recency over the policy clock (docs/04 freshness).
+
+    Adversarial-audit fix: the scaffold previously defaulted to a classifier
+    that returned 'fresh' for every timestamp — the shipped demo therefore
+    never exercised evidence decay. The default now actually decays, and is
+    anchored to an explicit reference_now so it stays replayable.
+    """
+    def classify(ts: str) -> str:
+        if not ts:
+            return "stale"
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return "stale"
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return "fresh" if abs(now - dt) <= timedelta(hours=max_age_hours) else "stale"
+    return classify
 
 
 class PolicyValidationError(ValueError):
@@ -96,6 +119,8 @@ def load_policy(path: str | Path) -> Policy:
         version=raw["policy_version"],
         mode=raw["mode"],
         scope=raw["scope"],
+        classify_recency=_default_recency_classifier(
+            float((raw.get("freshness") or {}).get("max_age_hours", 6.0))),
         observe_m=int(t["observe_m"]),
         fqdn_auto_m=int(t["fqdn_auto_m"]),
         fqdn_auto_s=int(t["fqdn_auto_s"]),

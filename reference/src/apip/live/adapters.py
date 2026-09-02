@@ -36,13 +36,20 @@ def adapter(name: str):
 
 def _safe_client(ref: str) -> str | None:
     """Accept only well-formed address refs; log injection attempts are
-    rejected rather than sanitized into something plausible."""
-    ref = ref.strip("[]")
+    rejected rather than sanitized into something plausible.
+
+    Adversarial-audit fix: the ref is normalized to the ADDRESS ONLY (port
+    stripped) so the same client seen through two terminators — one logging
+    ip:port, one logging bare IP — derives the same pseudonymous handle.
+    Ephemeral ports previously fragmented one client into unbounded handles.
+    """
+    ref = ref.strip("[]").strip()
+    addr = ref.rsplit(":", 1)[0] if ref.count(":") == 1 else ref
     try:
-        ipaddress.ip_address(ref.split(":")[0] if ref.count(":") == 1 else ref)
-        return ref
+        ipaddress.ip_address(addr)
     except ValueError:
         return None
+    return addr
 
 
 @adapter("envoy")

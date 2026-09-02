@@ -225,12 +225,20 @@ class CorrelationStore:
         del self._by_handle[oldest.handle]
 
     def prune_expired(self, now_iso: str, ttl_seconds: int) -> int:
-        """TTL eviction, deterministic on (now, last_seen, handle)."""
+        """TTL eviction, deterministic on (now, last_seen, handle).
+
+        Adversarial-audit fix: records stamped far in the FUTURE previously
+        survived eviction forever (a requester able to influence its own
+        logged timestamps could pin state in the bounded store). Future-
+        stamped entries beyond the TTL horizon are now treated as expired —
+        bad clocks lose their records, per TM-009 (clock manipulation).
+        """
         from datetime import datetime, timedelta
         try:
             now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
         except ValueError:
             return 0
+        horizon = timedelta(seconds=ttl_seconds)
         expired = []
         for s in self._by_handle.values():
             try:
@@ -238,8 +246,10 @@ class CorrelationStore:
             except ValueError:
                 expired.append(s.handle)
                 continue
-            if seen + timedelta(seconds=ttl_seconds) < now:
-                expired.append(s.handle)
+            if seen > now + horizon:
+                expired.append(s.handle)          # future-stamped: treat as stale
+            elif seen + horizon < now:
+                expired.append(s.handle)          # genuinely aged out
         for h in expired:
             del self._by_handle[h]
         return len(expired)

@@ -9,8 +9,12 @@
       "sha256": "358a1e4c8de634947349f5f5d3b1a13ff5b150348d7df58c2103a17e84b65180"
     },
     {
+      "path": "AUDIT_ADVERSARIAL_2026_09_01.md",
+      "sha256": "3201088c39b9bcb0fcd4ef9db6d74f04ec67ec3b6f577901bcfcc3c186754ca6"
+    },
+    {
       "path": "BUILD_VERIFICATION.txt",
-      "sha256": "01678e81e4679d194ae488b9a9dd622a5a50c24a2824a76d3e7693837beaafd8"
+      "sha256": "ea1f211da323003861b118761f695efaef4f2167568fb3c899eff900b1749531"
     },
     {
       "path": "FULL_SPEC.md",
@@ -190,15 +194,15 @@
     },
     {
       "path": "reference/src/apip/attribution.py",
-      "sha256": "0a7044d030c62587dbb6e044fe588a35725a958bcbe90993bd5023494fc4d240"
+      "sha256": "e309d50eefbc85aa16fd6fa16f4d974571dc3fa37b8924dc84200a762d8cc17c"
     },
     {
       "path": "reference/src/apip/cli.py",
-      "sha256": "d35c7f8b3a575e5caacc66e3a14b96ec1a66b66488eba98b237c25036c0b1ceb"
+      "sha256": "062db6e3e9159467c98f8e4dcb29c22951540c4a932b2e4981e6aef962864f4c"
     },
     {
       "path": "reference/src/apip/config.py",
-      "sha256": "a2d7a57448cafc0375ccf5ee57514ae10030b5c87c2d4e3e5a650947cc35b2ea"
+      "sha256": "986f389defdee54bf989cb8776ac587ea97c972298b10992a0b1b6eb136c9192"
     },
     {
       "path": "reference/src/apip/exporters/__init__.py",
@@ -214,7 +218,7 @@
     },
     {
       "path": "reference/src/apip/io.py",
-      "sha256": "9a7ff014f30340bd2b8c04e93a8fb9488f08e7d27517b3fa9049dccd81f141ad"
+      "sha256": "c6c5f75adaedc4ff7b812adf2d5b91b38688c7ff1621f346942f73ae1583527a"
     },
     {
       "path": "reference/src/apip/live/__init__.py",
@@ -222,7 +226,7 @@
     },
     {
       "path": "reference/src/apip/live/adapters.py",
-      "sha256": "5bdd2de1e3652afde3d0ef8b3aa392132bc1b3d5b58c9e8479756f3a9e5baef0"
+      "sha256": "1053138311c1cf2d4739ae38c8f1e33a0c75645de24cf944dad3091e0da6c483"
     },
     {
       "path": "reference/src/apip/live/server.py",
@@ -234,7 +238,7 @@
     },
     {
       "path": "reference/src/apip/policy.py",
-      "sha256": "2045157baceda7c6ef21d306a05236ad57ee99c0d132f368be6868d1365798e3"
+      "sha256": "fa7180acf622140bf23652550c67566f90c9542ab489411e79d97044b07cacad"
     },
     {
       "path": "reference/src/apip/randomize.py",
@@ -251,6 +255,10 @@
     {
       "path": "reference/src/apip/uireport.py",
       "sha256": "49bd7c94a68cb55c0172ce1dee0b9fb185261a282fdab93e279a2cb3e4e82a37"
+    },
+    {
+      "path": "reference/tests/test_adversarial_audit.py",
+      "sha256": "4e17e2ff7463de24f9e75f2624d5437ddea702a70e783c1b2a236af00db654c5"
     },
     {
       "path": "reference/tests/test_attribution.py",

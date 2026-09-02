@@ -1,7 +1,13 @@
 from __future__ import annotations
-import json, ipaddress
+import json, re, ipaddress
 from pathlib import Path
 from .models import Indicator, Evidence
+
+# Zone-file/rule-safe FQDN form: LDH + dots only, after IDNA. Adversarial
+# audit fix: 'evil.com;' previously passed canonicalization and reached the
+# RPZ zone file, where ';' begins a comment — indicator-controlled comment
+# injection into a compiled enforcement artifact. The charset is now closed.
+_FQDN_SAFE = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+)*$")
 
 def _canonicalize(kind: str, value: str) -> str:
     value = value.strip()
@@ -9,7 +15,12 @@ def _canonicalize(kind: str, value: str) -> str:
         v = value.rstrip(".").lower()
         if not v or " " in v or "/" in v:
             raise ValueError(f"invalid fqdn: {value!r}")
-        return v.encode("idna").decode("ascii")
+        v = v.encode("idna").decode("ascii")
+        if not _FQDN_SAFE.match(v):
+            raise ValueError(f"invalid fqdn (unsafe characters): {value!r}")
+        if any(len(label) > 63 for label in v.split(".")) or len(v) > 253:
+            raise ValueError(f"invalid fqdn (label/length): {value!r}")
+        return v
     if kind == "ipv4":
         return str(ipaddress.IPv4Address(value))
     if kind == "ipv6":

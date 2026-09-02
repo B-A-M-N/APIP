@@ -380,6 +380,17 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
         # Seed includes the wall-clock epoch bucket (docs/29): same indicator
         # + policy draws differently across epochs; replay within an epoch is
         # exact. Fixed-point arithmetic on integer microseconds of the draw.
+        #
+        # Adversarial-audit note (docs/29 TM-020 reconciliation): the seed is
+        # derived from the decision id + bounds version + epoch, all of which
+        # appear in the decision record — so ANYONE holding one decision can
+        # reproduce its draw. This is deliberate: replay/audit requires it,
+        # and docs/29's security claim never rested on seed secrecy. It rests
+        # on (a) draws confined to policy bounds — knowing the seed yields no
+        # out-of-bounds value, and (b) the epoch component, which makes
+        # prediction of the NEXT epoch's draws require predicting operator
+        # epoch rotation. Do not "harden" this by hiding the seed; that would
+        # break auditability without adding security.
         rng = ApipRng(f"{did}|{policy.randomization_bounds_version}|{policy.randomization_epoch}")
         ttl, frac_micros = draw_ttl_jitter(rng, ttl, policy.ttl_jitter.lo, policy.ttl_jitter.hi)
         randomization_record = {

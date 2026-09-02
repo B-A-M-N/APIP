@@ -2,7 +2,7 @@ APIP specification package verification — v2.1
 Date: 2026-09-01
 
 Reference scaffold:
-- python -m unittest discover -s tests -v: PASS (109 tests)
+- python -m unittest discover -s tests -v: PASS (120 tests)
 - ./verify.sh: PASS
 - dry-run evaluation: PASS (6 synthetic indicators, SHADOW mode)
   - exact-FQDN C2 -> L4 domain block (dns_nxdomain, shadow)
@@ -58,6 +58,15 @@ Requester attribution collection channel (docs/30, offline reference form):
   value-matched containment links
 - decisions carry NO attribution refs unless a transaction log is supplied;
   the report is display-only output
+
+Adversarial audit (AUDIT_ADVERSARIAL_2026_09_01.md):
+- 13 red-team probes against the running code; 5 defects demonstrated and
+  FIXED with regression tests (RPZ comment injection, always-fresh recency
+  default, cross-format handle fragmentation, rejection-marker loader crash,
+  future-timestamp state pinning); 3 accepted-with-documentation (seed
+  publication rationale, P1 hop sensitivity, reason growth residual);
+  smuggling/annotation-isolation/corroboration/bounds attacks all held.
+  PASS (tests/test_adversarial_audit.py, 11 tests)
 
 Attribution lab (lab/, runnable demonstration):
 - ./lab/run.sh: 6/6 scenarios PASS (loopback-only, offline, no enforcement):

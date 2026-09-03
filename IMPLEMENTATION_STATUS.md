@@ -279,6 +279,30 @@ the decision path / differential oracle is unchanged:
   the module's own "never loosen" invariant. The merge now only re-affirms an
   entry already governed by the global allowlist; a new value is dropped.
   Pinned by `test_overlay_may_not_introduce_new_allowlist_value`.
+- **Overlay without a `mode` silently downgraded the tenant.** `build_overlay`
+  defaulted an absent `mode` to `SHADOW`, and `_stricter_mode` treated that
+  fabricated SHADOW as tenant intent — so a threshold-only overlay stepped a
+  global `ENFORCE` down to `SHADOW` for the whole tenant, violating the
+  monotonic "never loosen" invariant. An overlay that omits `mode` now carries
+  the internal `UNSET` sentinel, and `_stricter_mode` returns the global mode
+  unchanged (identity, like every other overlay field). The sentinel never
+  survives the merge; the effective policy always has a real mode. Explicit
+  weaker modes still opt a tenant down; explicit stronger modes are still
+  clamped to the global. Pinned by `test_overlay_without_mode_keeps_global_mode`
+  and the explicit-weaker/stronger siblings.
+- **Overlay scope narrowing used exact-set intersection on a containment
+  hierarchy.** `_narrow_domains`/`_narrow_prefixes` compared entries by exact
+  string equality, but `in_scope` authorizes by suffix (domains) and subnet
+  (prefixes) — so a genuine sub-boundary narrowing (`tenant.corp.test` over
+  `corp.test`, `10.1.0.0/16` over `10.0.0.0/8`) was silently dropped and the
+  broader global boundary kept. The merge now honors any overlay value that is
+  at-or-below a global boundary by the same containment `in_scope` uses, while
+  refusing unrelated values and strict super-boundaries (widening); the global
+  still governs when nothing valid is declared (never emptied to nothing).
+  Pinned by `test_overlay_narrows_domains_by_suffix_containment`,
+  `test_overlay_domain_outside_global_stays_global`,
+  `test_overlay_domain_superdomain_is_refused`,
+  `test_overlay_narrows_prefixes_by_subnet_containment`.
 - **Dispatch double-apply under lease handoff / crash.** `_dispatch_pending`
   SELECTed `state='pending'` rows with no claim, so a lease handoff (or a crash
   between SELECT and apply) could dispatch the same action twice. Dispatch now
@@ -302,11 +326,11 @@ the decision path / differential oracle is unchanged:
   unauthenticated `/health` disclosed adapter modes, zones, authorized scopes
   and registry detail (now liveness-only; rich health stays behind operator auth).
   Pinned by the `api_harness` tests in `tests/test_audit_regressions.py`.
-- **Regression lock.** `tests/test_audit_regressions.py` (15 tests) pins every
+- **Regression lock.** `tests/test_audit_regressions.py` (22 tests) pins every
   fix above, including the two-layer tenant narrowing (`_narrow_domains` open-global
   fix from the first pass).
 
-Full product suite: 183 tests pass, `pyright --project pyproject.toml
+Full product suite: 190 tests pass, `pyright --project pyproject.toml
 src/apip tests` reports 0 errors, the acceptance drive passes 20/20 against a
 real UDP resolver, and the decision path / differential oracle is unchanged.
 

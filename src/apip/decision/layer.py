@@ -32,6 +32,15 @@ from apip.decision.policy import AllowlistEntry, Policy, RungFloor
 # global operator did not authorize).
 _MODE_RANK = {"OFF": 0, "OBSERVE": 1, "SHADOW": 2, "ENFORCE": 3, "EMERGENCY": 4}
 
+# Sentinel an overlay builder emits for a mode the overlay author did NOT
+# declare. ``build_overlay`` (loader.py) defaults an absent ``mode`` to this
+# so ``_stricter_mode`` treats "overlay says nothing about mode" as "keep the
+# global mode" — the identity, matching every other overlay field. An overlay
+# that omits mode must not silently force SHADOW onto the tenant (that stepped
+# a global ENFORCE down to SHADOW). The sentinel is internal: it never survives
+# the merge, and the effective policy always carries one of the five real modes.
+_OVERLAY_MODE_UNSET = "UNSET"
+
 
 def _max_int(global_v: int, overlay_v: int) -> int:
     return max(global_v, overlay_v)
@@ -42,49 +51,88 @@ def _min_int(global_v: int, overlay_v: int) -> int:
 
 
 def _stricter_mode(global_mode: str, overlay_mode: str) -> str:
-    """The effective mode is the LESS auto-action one (lower rank). An overlay
-    in a stronger mode than global is clamped back to the global (it may not
+    """The effective mode is the LESS auto-action one (lower rank) — but only
+    when the overlay EXPLICITLY declared a mode. An overlay that leaves mode
+    unset (sentinel) keeps the global mode unchanged (identity). An overlay in
+    a stronger mode than global is clamped back to the global (it may not
     demand enforcement the operator did not authorize)."""
+    if overlay_mode == _OVERLAY_MODE_UNSET:
+        return global_mode
     gr = _MODE_RANK.get(global_mode, 2)
     or_ = _MODE_RANK.get(overlay_mode, 2)
     return overlay_mode if or_ < gr else global_mode
 
 
 def _narrow_domains(global_domains, overlay_domains):
-    """Overlay may only NARROW the authorized domain boundary: effective is the
-    intersection. An overlay declaring nothing keeps the global; an overlay
-    declaring domains outside the global contributes nothing outside it (the
-    tenant cannot widen scope). When the GLOBAL declares no domain boundary
-    (an open/unrestricted control plane), the overlay's own boundary is honored
-    as the narrower scope — mirroring ``_narrow_prefixes`` — so a tenant
-    narrowing an open global to its own domains is not emptied to nothing."""
+    """Overlay may only NARROW the authorized domain boundary.
+
+    ``authorized_domains`` is a SUFFIX hierarchy — ``in_scope`` authorizes a
+    value equal to a governed suffix ``or`` ending ``.<suffix>`` (policy.py) —
+    so narrowing is CONTAINMENT, not exact-set membership. An overlay value is
+    honored iff it is at-or-below some global suffix (``o == d or
+    o.endswith('.'+d)``), which keeps a genuine sub-domain narrowing
+    (tenant.corp.test over corp.test) while refusing both unrelated domains and
+    a strict super-domain (corp.test over tenant.corp.test — a widening). Empty
+    overlay keeps the global; an overlay declaring nothing valid stays the
+    global (never emptied to nothing, never widened); an OPEN global (no
+    declared domain boundary) honors the overlay's own boundary as the narrower
+    scope, mirroring ``_narrow_prefixes``."""
     if not overlay_domains:
         return global_domains
-    g = set(global_domains)
+    g = [d.lower().rstrip(".") for d in global_domains]
     if not g:
-        # Global was unrestricted over domains: nothing to intersect, so the
-        # overlay's declared boundary IS the narrower scope (never widen, and
-        # never empty an open policy to unintentional-nothing).
-        return tuple(sorted(overlay_domains))
-    # Overlay may not ADD a domain the global operator did not authorize.
-    merged = {d for d in overlay_domains if d in g}
-    # If it declares only out-of-scope domains, the effective boundary stays the
-    # global (intersection with global is exactly the authorized subset; we do
-    # NOT empty it — an attacker must not shrink a tenant's blast radius to
-    # unintentional-nothing, but we also never widen it).
-    if not merged:
-        merged = g
-    return tuple(sorted(merged))
+        # Global was unrestricted over domains: the overlay's declared boundary
+        # IS the narrower scope (never widen; never empty an open policy to
+        # unintentional-nothing).
+        return tuple(d.lower().rstrip(".") for d in sorted(overlay_domains))
+    merged = [
+        o for o in (d.lower().rstrip(".") for d in overlay_domains)
+        if any(o == d or o.endswith("." + d) for d in g)
+    ]
+    # If no overlay value is within the global boundary, keep the global
+    # (an attacker must not shrink a tenant's blast radius to nothing, but we
+    # also never widen it).
+    return tuple(sorted(merged or g))
 
 
 def _narrow_prefixes(global_prefixes, overlay_prefixes):
+    """Overlay may only NARROW the authorized prefix boundary.
+
+    Mirror of ``_narrow_domains`` for the ADDRESS hierarchy: ``in_scope``
+    authorizes a value that is a subnet of a governed prefix (policy.py), so an
+    overlay prefix is honored iff it is a SUBNET OF some global prefix. That
+    keeps a genuine subnet narrowing (10.1.0.0/16 over 10.0.0.0/8) while
+    refusing both unrelated and wider super-net prefixes (10.0.0.0/8.is_not_a_
+    subnet_of 10.1.0.0/16 — a widening). ``subnet_of`` is False across IPv4/IPv6
+    so a mixed-version overlay value is dropped. Empty overlay keeps the global;
+    an overlay declaring nothing valid stays the global; an OPEN global (no
+    prefix boundary) honors the overlay's own boundary."""
     if not overlay_prefixes:
         return global_prefixes
-    g = set(global_prefixes)
-    if g:
-        merged = [p for p in overlay_prefixes if p in g]
-        return tuple(sorted(merged)) if merged else tuple(sorted(g))
-    return overlay_prefixes   # global was unrestricted; overlay declares a boundary
+    g = [str(p) for p in global_prefixes]
+    if not g:
+        return tuple(sorted(str(p) for p in overlay_prefixes))
+    import ipaddress
+    nets = [ipaddress.ip_network(p, strict=False) for p in g]
+    merged = []
+    for p in (str(x) for x in overlay_prefixes):
+        cand = ipaddress.ip_network(p, strict=False)
+        # compare only SAME-family networks: subnet_of across IPv4/IPv6 is False,
+        # but type-wise subnet_of() is per-family — guard the family explicitly
+        # (mirrors in_scope's family check in policy.py).
+        keep = False
+        for n in nets:
+            if isinstance(cand, ipaddress.IPv4Network) and isinstance(n, ipaddress.IPv4Network):
+                if cand.subnet_of(n):
+                    keep = True
+                    break
+            if isinstance(cand, ipaddress.IPv6Network) and isinstance(n, ipaddress.IPv6Network):
+                if cand.subnet_of(n):
+                    keep = True
+                    break
+        if keep:
+            merged.append(str(cand))
+    return tuple(sorted(merged or g))
 
 
 def _merge_rung_floors(global_floors, overlay_floors) -> dict[str, RungFloor]:

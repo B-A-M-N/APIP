@@ -480,9 +480,17 @@ def build_overlay(raw: dict, raw_text: str, *, source_registry=None,
         str(ipaddress.ip_network(str(p), strict=False))
         for p in (authz.get("authorized_prefixes") or ()))
 
+    # An overlay that does not declare a mode must NOT silently force one onto
+    # the tenant (defaulting to SHADOW stepped a global ENFORCE down to SHADOW
+    # for every threshold-only overlay). Absence carries the ``UNSET`` sentinel
+    # into the merge, which treats it as "keep the global mode" (identity). The
+    # sentinel is internal to the merge and never survives it — the effective
+    # policy always carries one of the five real modes.
+    _mode = str(raw.get("mode", "UNSET")).upper()
+
     return Policy(
         version=str(raw.get("policy_version", "")),
-        mode=str(raw.get("mode", "SHADOW")).upper(),
+        mode=_mode,
         scope=str(raw.get("scope", "*")),
         observe_m=int(t.get("observe_m", 0)),
         fqdn_auto_m=int(t.get("fqdn_auto_m", 0)),

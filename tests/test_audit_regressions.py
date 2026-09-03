@@ -241,6 +241,131 @@ def test_overlay_may_not_introduce_new_allowlist_value():
 
 
 # ---------------------------------------------------------------------------
+# overlay mode sentinel (absence = keep global) + containment narrowing
+# ---------------------------------------------------------------------------
+
+def test_overlay_without_mode_keeps_global_mode():
+    """An overlay that ONLY tightens a threshold and never declares a mode must
+    NOT silently step the global ENFORCE down to SHADOW (the old builder default
+    fabricated a SHADOW the tenant never asked for). Absence = keep global."""
+    g = load_policy_text(GLOBAL_TOML)          # mode = "ENFORCE"
+    tighten = _overlay_text('policy_version="m1"\nscope="*"\n'
+                            '[thresholds]\nfqdn_auto_m = 98')
+    eff = merge_policy_overlay(g, tighten)
+    assert eff.mode == "ENFORCE"               # unchanged
+    assert eff.fqdn_auto_m == 98               # tightening still applied
+    # only the mode is identity; the threshold override survives
+
+
+def test_overlay_explicit_weaker_mode_is_allowed():
+    """An overlay EXPLICITLY stating a weaker mode (less auto-action) is honored
+    — that is the tenant's conscious opt-down, not a silent downgrade."""
+    g = load_policy_text(GLOBAL_TOML)
+    optdown = _overlay_text('policy_version="m2"\nmode="SHADOW"\nscope="*"\n')
+    eff = merge_policy_overlay(g, optdown)
+    assert eff.mode == "SHADOW"
+
+
+def test_overlay_explicit_stronger_mode_is_clamped():
+    """An overlay may not DEMAND a stronger mode than the global operator
+    authorized; EMERGENCY over ENFORCE is clamped back to ENFORCE."""
+    g = load_policy_text(GLOBAL_TOML)
+    escalate = _overlay_text('policy_version="m3"\nmode="EMERGENCY"\nscope="*"\n')
+    eff = merge_policy_overlay(g, escalate)
+    assert eff.mode == "ENFORCE"
+
+
+def test_overlay_narrows_domains_by_suffix_containment():
+    """authorized_domains is a SUFFIX hierarchy (in_scope authorizes
+    value==suffix or value.endswith('.suffix')): a genuine sub-domain narrowing
+    must be honored, not dropped by exact-set-intersection."""
+    g = load_policy_text(GLOBAL_TOML)          # ["test"]
+    narrow = _overlay_text('policy_version="s1"\nmode="ENFORCE"\n'
+                           '[authorization]\nauthorized_domains = ["tenant.test"]')
+    eff = merge_policy_overlay(g, narrow)
+    assert set(eff.authorized_domains) == {"tenant.test"}   # honored
+
+
+def test_overlay_domain_outside_global_stays_global():
+    """An overlay domain that is neither equal to nor a sub-domain of any global
+    suffix never widens; the effective boundary stays the global."""
+    g = load_policy_text(GLOBAL_TOML)
+    outside = _overlay_text('policy_version="s2"\nmode="ENFORCE"\n'
+                            '[authorization]\nauthorized_domains = ["evil.example"]')
+    eff = merge_policy_overlay(g, outside)
+    assert set(eff.authorized_domains) == {"test"}   # not widened, not emptied
+
+
+def test_overlay_domain_superdomain_is_refused():
+    """An overlay value that is a strict SUPER-domain of the global suffix is a
+    widening (it would cover more than the global authorizes); it is refused
+    and the narrower global boundary is kept."""
+    g = load_policy_text("""
+policy_version = "narrow.global"
+mode = "ENFORCE"
+scope = "tenant-world"
+allowlist = []
+[thresholds]
+observe_m = 40
+fqdn_auto_m = 90
+fqdn_auto_s = 85
+ip_rate_m = 90
+ip_rate_s = 85
+ip_deny_m = 98
+ip_deny_s = 95
+[limits]
+max_auto_ttl_seconds = 600
+max_evidence_per_indicator = 64
+nominal_rate_ceiling_per_min = 1000
+[authorization]
+authorized_domains = ["tenant.test"]
+[safety]
+allowlist_precedence = true
+no_ai_components = true
+""")
+    widen = _overlay_text('policy_version="s3"\nmode="ENFORCE"\n'
+                          '[authorization]\nauthorized_domains = ["test"]')
+    eff = merge_policy_overlay(g, widen)
+    assert set(eff.authorized_domains) == {"tenant.test"}   # not broadened
+
+
+def test_overlay_narrows_prefixes_by_subnet_containment():
+    """authorized_prefixes is crossed in scope by subnet: a genuine subnet
+    narrowing must be honored over exact-set-intersection."""
+    g = load_policy_text("""
+policy_version = "pfx.global"
+mode = "ENFORCE"
+scope = "*"
+allowlist = []
+[thresholds]
+observe_m = 40
+fqdn_auto_m = 90
+fqdn_auto_s = 85
+ip_rate_m = 90
+ip_rate_s = 85
+ip_deny_m = 98
+ip_deny_s = 95
+[limits]
+max_auto_ttl_seconds = 600
+max_evidence_per_indicator = 64
+nominal_rate_ceiling_per_min = 1000
+[authorization]
+authorized_prefixes = ["10.0.0.0/8"]
+[safety]
+allowlist_precedence = true
+no_ai_components = true
+""")
+    narrow = _overlay_text('policy_version="p1"\nmode="ENFORCE"\n'
+                           '[authorization]\nauthorized_prefixes = ["10.1.0.0/16"]')
+    eff = merge_policy_overlay(g, narrow)
+    assert set(eff.authorized_prefixes) == {"10.1.0.0/16"}   # honored
+    wider = _overlay_text('policy_version="p2"\nmode="ENFORCE"\n'
+                          '[authorization]\nauthorized_prefixes = ["0.0.0.0/0"]')
+    eff_w = merge_policy_overlay(g, wider)
+    assert set(eff_w.authorized_prefixes) == {"10.0.0.0/8"}   # supernet refused
+
+
+# ---------------------------------------------------------------------------
 # OpenC2 export: unknown action + no fabricated target
 # ---------------------------------------------------------------------------
 

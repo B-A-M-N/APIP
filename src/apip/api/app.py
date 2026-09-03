@@ -119,7 +119,21 @@ def build_app(config: ServiceConfig,
 
     @app.post("/ingest")
     async def ingest(request: Request, src: dict = Depends(_ingest_source)) -> dict:
+        # Bound the ingest body: an unbounded read lets an authenticated source
+        # (or a gateway to it) stream an arbitrarily large payload and exhaust
+        # controller memory. Reject oversized bodies up front (DoS guard).
+        MAX_INGEST_BYTES = 10 * 1024 * 1024  # 10 MiB
+        length_header = request.headers.get("content-length")
+        if length_header is not None:
+            try:
+                if int(length_header) > MAX_INGEST_BYTES:
+                    raise HTTPException(413,
+                                        "ingest body exceeds the 10 MiB limit")
+            except ValueError:
+                pass
         body = await request.body()
+        if len(body) > MAX_INGEST_BYTES:
+            raise HTTPException(413, "ingest body exceeds the 10 MiB limit")
         channel = IngestChannel(
             source_id=src["source_id"],
             allowed_source_ids=frozenset(
@@ -158,14 +172,19 @@ def build_app(config: ServiceConfig,
 
     @app.get("/health")
     def health() -> dict:
+        """Unauthenticated liveness probe for orchestrators — returns ONLY
+        liveness, never the richer snapshot (adapter modes, zone names,
+        authorized_domains, registry), which would disclose the defensive
+        topology to anyone who can reach the port. Rich health stays behind
+        operator auth on /adapters and /adapter."""
         try:
             h = controller.health()
         except DatabaseUnavailable:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
                                 "database unavailable")
-        out = dict(h)
-        out["api_version"] = API_VERSION
-        return out
+        return {"status": h.get("status", "degraded"),
+                "degraded": h.get("degraded", []),
+                "api_version": API_VERSION}
 
     @app.get("/ready")
     def ready() -> dict:
@@ -260,7 +279,12 @@ def build_app(config: ServiceConfig,
 
     @app.post("/actions/{action_id}/revoke")
     def revoke_action(action_id: str,_op: dict = Depends(_operator)) -> dict:
-        result = controller.revoke_action(action_id, _op["actor"])
+        try:
+            result = controller.revoke_action(action_id, _op["actor"])
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
         return result
 
     @app.get("/policy")
@@ -287,6 +311,13 @@ def build_app(config: ServiceConfig,
     def policy_stage(payload: dict, _op: dict = Depends(_operator)) -> dict:
         from apip.decision.loader import validate_policy
         import hashlib as _hash, tomllib
+        # Enforce the closed mode set at the API boundary so an arbitrary mode
+        # string never enters policy_versions (which has no CHECK) and later
+        # surfaces as an unbound action-mode value.
+        mode = str(payload.get("mode", "SHADOW")).upper()
+        if mode not in {"OFF", "OBSERVE", "SHADOW", "ENFORCE", "EMERGENCY"}:
+            raise HTTPException(400, f"invalid mode {mode!r}; must be one of "
+                                     "OFF/OBSERVE/SHADOW/ENFORCE/EMERGENCY")
         text = payload.get("text", "")
         version = str(payload.get("version", "")).strip() or "beta"
         try:
@@ -298,7 +329,7 @@ def build_app(config: ServiceConfig,
         rev = controller.ledger.next_policy_revision(version)
         controller.ledger.stage_policy(
             policy_version=version, revision=rev, content_sha256=sha,
-            raw_text=text, mode=str(payload.get("mode", "SHADOW")).upper(),
+            raw_text=text, mode=mode,
             staged_by=_op["actor"], problems=problems)
         return {"version": version, "revision": rev, "content_sha256": sha,
                 "accepted": not problems, "problems": problems}
@@ -317,7 +348,11 @@ def build_app(config: ServiceConfig,
     @app.post("/policy/promote")
     def policy_promote(payload: dict, _op: dict = Depends(_operator)) -> dict:
         version = str(payload.get("version", "")).strip()
-        revision = int(payload.get("revision", -1))
+        try:
+            revision = int(payload.get("revision", -1))
+        except (TypeError, ValueError):
+            raise HTTPException(400,
+                                "revision must be an integer") from None
         try:
             controller.ledger.promote_policy(version, revision, _op["actor"])
         except ValueError as e:

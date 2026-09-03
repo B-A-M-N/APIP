@@ -914,3 +914,12 @@ class SyncFirstContactDetector:
             extra={"distinct_hosts": len(st.hosts),
                    "sync_window_s": self._sync_s,
                    "first_contact_at": st.first_contact_iso})
+
+    def as_evidence(self, det: Detection) -> dict:
+        return det.as_evidence_fields()
+
+    def health(self) -> dict:
+        return {"name": self.KIND, "degraded": self.degraded,
+                "tracked_destinations": len(self._table),
+                "detections": self.detections,
+                "suppressed_new_dsts": self.suppressed_new_dsts}

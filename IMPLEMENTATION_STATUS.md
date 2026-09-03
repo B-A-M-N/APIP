@@ -56,6 +56,8 @@ The reference is never imported into the production process.
 | Triple authorization-boundary scope check | BETA SUPPORTED | policy `in_scope` + controller dispatch + adapter scope (RPZ `_in_adapter_scope`, Suricata home-net) |
 | Component-level health (multi-adapter, defense-in-depth) | BETA SUPPORTED | `ControllerState.snapshot`, `Controller.adapters_status` — every configured adapter surfaces; any unhealthy adapter degrades overall status |
 | Component-level health | BETA SUPPORTED | `ControllerState.snapshot`, `rpz.health` |
+| HA leader-election + lease (single-winner dispatch/expiry/verify across controllers on one ledger) | BETA SUPPORTED | `controller_leases` (migration 3), atomic optimistic-CAS `claim_leadership`, lease-gated worker loops, bounded follower takeover; `tests/test_ha_lease.py` |
+| Per-tenant policy layering (tighten-only overlay onto the global active policy) | BETA SUPPORTED | `tenant_overlays` + `indicators.tenant_id` (migration 4), deterministic monotonic `merge_policy_overlay` (`src/apip/decision/layer.py`); `tests/test_tenant_overlay.py` |
 | Standards interop, emit-only (OpenC2 / CACAO / OCSF) | PRODUCT IMPLEMENTED | `src/apip/interop/` — `decision_to_openc2` / `decision_to_cacao` / `decision_to_ocsf`, exercised by `tests/test_interop.py` (23 tests); surface at `apip decision interop`.
 
   **Deterministic + AI-free output only.** These serializers map the canonical `Decision` onto OpenC2 commands, CACAO 2.0 playbooks, and OCSF Detection-Finding events. They are emit-only: pure functions of a decision with an injectable clock (byte-reproducible), and they never parse external control/response messages back into the decision path (docs/28 preserved). No claim of full OpenC2/CACAO/OCSF profile compliance — they map the spec's vocabulary (docs/05). |
@@ -66,11 +68,17 @@ The reference is never imported into the production process.
 |--------|--------|
 | `beacon_periodicity` (BD-1) | PRODUCT IMPLEMENTED — deterministic detector in `src/apip/telemetry/behavioral.py`, parity-checked against `reference/behavioral.py`. Emits `local` evidence only; detector degradation reduces authority (stop-and-mark). |
 | `first_seen_novelty` (BD-6) | PRODUCT IMPLEMENTED — same, second implemented family. |
-| `dga_likelihood`, `dns_tunneling`, `fastflux`, `volume_anomaly`, `tls_metadata_mismatch`, `sync_first_contact` | **PENDING / SPECIFIED** — explicitly `PENDING_FAMILIES`. Enum presence ≠ detector existence. |
+| `dga_likelihood`, `dns_tunneling`, `fastflux`, `volume_anomaly`, `tls_metadata_mismatch`, `sync_first_contact` | PRODUCT IMPLEMENTED — all six extended families (BD-2/3/4/5/7/8) are real bounded, deterministic detectors in `src/apip/telemetry/behavioral.py` (`DgaDetector`, `DnsTunnelingDetector`, `FastFluxDetector`, `VolumeAnomalyDetector`, `TlsMetadataMismatchDetector`, `SyncFirstContactDetector`), each with direct unit tests in `tests/test_behavioral_detectors.py`. `PENDING_FAMILIES` is empty (no family is enum-presence-only). These families have **no** reference-oracle parity (the reference only ever implemented BD-1/BD-6) — they are a product extension proven by direct tests, not oracle parity. |
 
-Live behavioral *detection* in the enforcement path is **FUTURE** for the
-beta. The decision engine does consume `behavioral_*` evidence kinds (with
-policy-set caps), but you don't need a live detector to exercise the beta loop.
+**Live detection wiring (docs/23 as a feed):** `src/apip/telemetry/feed.py` provides `LiveBehavioralFeed` — a deterministic, AI-free, stdlib-only feed that owns the enabled detector instances, exposes typed intake (`on_dns_query` / `on_dns_answer` / `on_flow` / `on_tls`), and folds emitted `Detection`s onto KNOWN indicators via `attach_to_indicators` (a detection for a domain nobody ingested stays dormant — no authority is invented from thin air). It carries the detectors' resource envelopes and P1-23 epoch discipline. Exercised by `tests/test_behavioral_feed.py`. This raises the behavioral surface to PRODUCT IMPLEMENTED; live *streaming ingestion from a real DNS/flow/TLS source* remains **FUTURE** (the feed is a library + evidence frontier awaiting a datasource, matching the reference's observe-only live layer).
+
+Live behavioral detection is implemented as a deterministic evidence
+frontier: all 8 detector families emit, and `LiveBehavioralFeed` wires them
+onto existing indicators. *Streaming ingestion from a live DNS/flow/TLS
+source* (a datasource feeding `on_dns_query` / `on_flow` / `on_tls`) is
+**FUTURE** for the beta. The decision engine does consume `behavioral_*`
+evidence kinds (with policy-set caps), and detector output never invents
+authority — it only ever folds onto indicators that already exist.
 
 ### Attribution
 
@@ -126,12 +134,73 @@ to `unregistered`, malformed evidence → batch rejected, insufficient evidence 
 NO_ACTION, adapter-unavailable → action fails without a fabricated success) all
 fail safely.
 
-Two product bugs were found and fixed during this run: (1) a timezone
-mis-serialization in `controller/engine.py` that aged fresh evidence to
-`stale` for non-UTC servers (silencing its decision weight), and (2) a narrow
-column list in `ledger/repo.py: actions_due_for_expiry` that crashed the
-controlled expiry/revoke path with `KeyError('fragment')`. Both are covered by
-the differential oracle suite (`tests/test_differential_oracle.py`).
+**Re-runnable acceptance driver (`lab/acceptance.py`):** the 20-step loop is
+now a one-command executable a reviewer can (re)run from a fresh clone. It
+drives the REAL product wiring — `controller.pipeline.decide_indicator`,
+`Controller.approve_decision`, `_dispatch_one`, `_verify_action`,
+`_remove_action` — against a scratch Postgres, and proves every enforcement
+step with a **real UDP DNS query** against `lab/resolver.py` (a stdlib-only
+loopback resolver that re-reads the APIP RPZ zone on every query). It exits 0
+ONLY when all 20 steps pass and **skips cleanly (exit 0) when no Postgres is
+reachable** (`--socket-dir` overrides the unix-socket path); the always-on
+baseline stays green without a database.
+`PYTHONPATH="lab:." .venv-apip/bin/python lab/acceptance.py`
+
+Verified end-to-end on 2026-09-03 by **B-A-M-N**: SHADOW-leg proves the
+monitor-only zone is NOT consumed (real DNS keeps the baseline 10.99.0.9);
+after the operator "goes to enforcement" (reified as a controller stop+start
+against the same ledger — the step-20 restart-survival check), the ENFORCE-leg
+proves a real live `NXDOMAIN` (rcode 3), an independent live-DNS verify, revoke
+→ baseline restored (10.99.0.9), and TTL expiry through the controlled path.
+
+One semantic honesty note the driver documents: reaching an exact-FQDN RPZ
+action in this beta is an **operator approval** (`PROPOSE_OPERATOR_APPROVAL`)
+of a proposed high-impact action. The deterministic engine for a bare FQDN
+crosses no client/pair context and yields `OBSERVE` (L0) — the engine observes
+but never invents an enforcement intention; the operator keys it. Approving a
+PROPOSE decision tags the action mode `SHADOW`, but the compiled **adapter's
+posture governs live enforcement** — an ENFORCE-posture adapter writes a live
+(non-monitor-only) zone and live-DNS-verifies NXDOMAIN, which the driver
+asserts rather than trusting the action-row mode tag.
+
+### Multi-tenancy + HA
+
+**HA single-winner lease (task #13, B-A-M-N, 2026-09-03):** multiple
+controllers on the same ledger must not double-dispatch or double-expire.
+A single-row `controller_leases` table plus an optimistic compare-and-swap
+(`UPDATE controller_leases SET leader_id=... WHERE singleton AND
+(leader_id=%s OR expires_at <= %s) RETURNING leader_id`) grants **exactly one**
+winner per lease window; every worker loop re-checks the lease on each
+iteration, so only the live lease holder runs pending-dispatch, the expiry
+sweep, and verification. A follower observes the current leader and attempts an
+orderly takeover once the lease expires — bounded, no split-brain. `stop()`
+releases the lease. Proved by `tests/test_ha_lease.py` (4 tests): single-winner,
+expired-lease-reclaimable, release-is-noop-for-non-holder, and two-controller
+lease-gated single-worker contention.
+
+**Per-tenant policy layering (task #14, B-A-M-N, 2026-09-03):** a tenant of a
+shared deployment may overlay the GLOBAL active policy with a
+**tighten-only fragment** — the effective policy for that tenant is at least as
+restrictive as the global on every overridable control. `merge_policy_overlay`
+(`src/apip/decision/layer.py`) is a PURE, deterministic, monotonic function of
+two `Policy` objects (no I/O, no clock): it may **raise** decision thresholds /
+rung floors, require **more** behavioral corroboration, **lower** caps,
+**narrow** the authorization boundary (intersection), and only **re-affirm**
+governed allowlist entries the global operator already allowlisted (an overlay
+can never introduce a NEW suppressed value — that would loosen the control; see
+the audit note below). A loosing overlay is not an error at runtime — the merge
+CLAMPS it back to the global, so an all-default overlay is the identity and a
+deliberately loosening overlay cannot widen scope. `build_overlay`
+(`loader.py`) produces the partial overlay whose permissive defaults make
+"absent means keep global" work. `DecisionPipeline.load_active_policy_effective`
+resolves which policy governs `decide_indicator` (explicit `tenant_id`, else the
+indicator's own `tenant_id`); `Controller.create_action_from_decision` uses the
+tenant's effective policy for its scope check. Proved by
+`tests/test_tenant_overlay.py`: monotonic tighten (raise/lower honored, loosing
+clamped), overlay-cannot-widen-scope, rung/corroboration monotonicity, mode /
+allowlist semantics, and a scratch-DB integration test showing a tenant with a
+stricter overlay gets a no-less-permissive decision than the global on
+identical evidence.
 
 **Failure-mode + property suite:** `tests/test_failure_modes.py` (27 tests)
 exercises the real production modules with no running Postgres/DNS required.
@@ -172,9 +241,74 @@ oracle still passes):
   request time. `_operator` now honors the injected config (fails closed when
   no token is configured).
 
-Full product suite: 152 tests pass, `pyright --project pyproject.toml
-src/apip tests` reports 0 errors, and the decision path / differential oracle
-is unchanged.
+**Second adversarial audit (2026-09-03, B-A-M-N)** — a deeper boundary pass
+over four independent reviewer tracks (adapters, controller/HA, scoring,
+API/CLI/interop). Every finding was verified against source before the fix;
+the decision path / differential oracle is unchanged:
+
+- **RPZ/Suricata adapter fragment-injection.** The adapter `validate()` methods
+  checked only a `startswith`/keyword prefix, so a `fragment` carrying a
+  newline passed `validate` and was written to the zone/ruleset file verbatim —
+  injecting an arbitrary RR/rule. Both `validate()` methods now refuse any
+  fragment containing a newline/carriage-return (plus RPZ multi-line parens). Pinned by
+  `test_rpz_validate_rejects_multiline_zone_injection`,
+  `test_suricata_validate_rejects_multiline_ruleset_injection`.
+- **RPZ ENFORCE verified a file write alone when no resolver was configured.**
+  In ENFORCE the contract is resolver-confirmed NXDOMAIN; with `verify_query_server`
+  unset it reported success on zone-file presence — a fabricated success. `verify`
+  now fails closed (no independent resolver → not verified). Pinned by
+  `test_rpz_enforce_verify_fails_closed_without_resolver`.
+- **Suricata `validate` never re-checked adapter home-net scope nor target
+  exactness.** Scope (defense-in-depth layer 3) and selector-never-broadens
+  were enforced only at `compile`; a candidate outside the authorized prefix
+  (or targeting a different IP than the selector) passed `validate`. Both are
+  now re-checked at `validate`. Pinned by
+  `test_suricata_validate_rechecks_home_net_scope`,
+  `test_suricata_validate_catches_exactness_mismatch`.
+- **Suricata fqdn http.host rate-limit dead-end.** `compile()` legitimately
+  produces an fqdn pair-scoped intent rule, but `validate()` refused all
+  `_PAIR_SCOPED` selectors — so a compilable action could never be applied
+  (validate/apply/verify/revoke all raised). `validate` now distinguishes the
+  IP pair-scoped case (still refused: would broaden to destination-global)
+  from the fqdn http.host case, which is bound by its `content:"<host>"` field
+  and validates. Pinned by `test_suricata_fqdn_http_intent_rule_validates`.
+- **Overlay allowlist could LOOSEN the global control.** `_union_allowlist`
+  unioned the overlay's allowlist into the effective policy, letting a tenant
+  introduce a brand-new allowlisted value and suppress enforcement the global
+  operator would apply (the tenant whitelisting its own C2 surface) — violating
+  the module's own "never loosen" invariant. The merge now only re-affirms an
+  entry already governed by the global allowlist; a new value is dropped.
+  Pinned by `test_overlay_may_not_introduce_new_allowlist_value`.
+- **Dispatch double-apply under lease handoff / crash.** `_dispatch_pending`
+  SELECTed `state='pending'` rows with no claim, so a lease handoff (or a crash
+  between SELECT and apply) could dispatch the same action twice. Dispatch now
+  atomically claims each action (`pending → dispatching` via one UPDATE guarded
+  by `state='pending'`); a second winner skipped. Migration #5 extends the
+  `actions` CHECK to include `dispatching`; the reconcile sweep re-queues a
+  discovered `dispatching` action that sat past a full reconcile window.
+- **OpenC2 export fabricated targets.** An unknown action crashed on an
+  unguarded `_ACTUATOR_MAP[action]` (KeyError); a bind-less `firewall_deny`
+  fabricated a device named after the decision id; a CIDR/port destination
+  fabricated a `0.0.0.0/0` source the decision never asserted. The emitter now
+  guards the actuator map (falls back to `openc2:actuator:unknown:1.0`), never
+  invents a target from a decision id, and omits the unasserted source.
+  Pinned by `test_openc2_unknown_action_is_guarded`,
+  `test_openc2_does_not_fabricate_target_from_decision_id`,
+  `test_openc2_cidr_has_no_fabricated_source`.
+- **Operator API 500s and disclosure.** Unknown-action revoke raised a 500
+  (now 404); a non-integer promote `revision` raised 500 (now 400); `policy_stage`
+  accepted an arbitrary `mode` (now validated against the closed set → 400);
+  `/ingest` buffered an unbounded body (now capped at 10 MiB → 413);
+  unauthenticated `/health` disclosed adapter modes, zones, authorized scopes
+  and registry detail (now liveness-only; rich health stays behind operator auth).
+  Pinned by the `api_harness` tests in `tests/test_audit_regressions.py`.
+- **Regression lock.** `tests/test_audit_regressions.py` (15 tests) pins every
+  fix above, including the two-layer tenant narrowing (`_narrow_domains` open-global
+  fix from the first pass).
+
+Full product suite: 183 tests pass, `pyright --project pyproject.toml
+src/apip tests` reports 0 errors, the acceptance drive passes 20/20 against a
+real UDP resolver, and the decision path / differential oracle is unchanged.
 
 ---
 

@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from apip.decision.loader import load_policy_text
+from apip.decision.layer import merge_policy_overlay
+from apip.decision.loader import build_overlay, load_policy_text
 from apip.decision.policy import Policy, evaluate
 from apip.domain.models import Evidence, Indicator
 from apip.ledger.repo import Ledger
@@ -50,6 +51,31 @@ class DecisionPipeline:
             now_fn=now_fn or now_iso_utc)
         return policy, dict(row)
 
+    def load_active_policy_effective(self, registry: SourceRegistry,
+                                     *, tenant_id: str | None = None,
+                                     now_fn=None) -> tuple[Policy, dict] | None:
+        """Load the active policy, merging a tenant overlay (if any) onto it.
+
+        ``tenant_id=None`` (a global-only tenant) returns the global policy
+        unchanged — identical to ``load_active_policy``. With a tenant overlay
+        present, the deterministic monotonic merge in layer.py applies so the
+        effective policy is at least as restrictive as the global."""
+        loaded = self.load_active_policy(registry, now_fn)
+        if loaded is None:
+            return None
+        policy, policy_row = loaded
+        if tenant_id is None:
+            return loaded
+        overlay_row = self._ledger.get_tenant_overlay(tenant_id)
+        if overlay_row is None:
+            return loaded
+        import tomllib
+        overlay = build_overlay(
+            tomllib.loads(overlay_row["raw_text"]),
+            overlay_row["raw_text"], source_registry=registry,
+            now_fn=now_fn or now_iso_utc)
+        return merge_policy_overlay(policy, overlay), policy_row
+
     def indicator_from_rows(self, ind_row: dict, ev_rows: list[dict]) -> Indicator:
         def _utc_iso(value) -> str:
             """Emit true UTC ISO-8601. psycopg2 returns tz-aware datetimes in
@@ -81,14 +107,23 @@ class DecisionPipeline:
         )
 
     def decide_indicator(self, indicator_id: str, actor: str,
-                         batch_id: str | None = None) -> dict | None:
+                         batch_id: str | None = None,
+                         tenant_id: str | None = None) -> dict | None:
         """Re-evaluate one indicator from ledger state; append the decision.
-        Returns the decision row (or None when no policy is active)."""
+        Returns the decision row (or None when no policy is active).
+
+        ``tenant_id`` resolves which effective policy governs: an explicit
+        value, else the indicator's own tenant assignment. A tenant with an
+        overlay gets the merge(global, overlay) policy; everyone else the
+        global policy exactly (unchanged behavior for prior callers)."""
         ind_row = self._ledger.get_indicator(indicator_id)
         if ind_row is None:
             return None
         registry = self.registry_from_sources(self._ledger.list_sources())
-        loaded = self.load_active_policy(registry)
+        if tenant_id is None:
+            tenant_id = ind_row.get("tenant_id")
+        loaded = self.load_active_policy_effective(
+            registry, tenant_id=tenant_id)
         if loaded is None:
             return None
         policy, policy_row = loaded

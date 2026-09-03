@@ -188,6 +188,56 @@ CREATE INDEX idx_audit_at ON audit_events(at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_dedup
     ON decisions (decision_id, content_hash);
 """),
+    (3, "controller leader lease (HA)", """
+-- Single-row, whole-cluster leader lease for the controller workers
+-- (dispatch/expiry/verify). A freshly-started controller seeds the row as
+-- expired (epoch) so leadership is always immediately reclaimable; whoever
+-- wins the atomic compare-and-set owns the worker loops until the lease
+-- lapses (dead/failed leader) and another controller takes over. This keeps
+-- multiple controllers pointed at the same ledger from double-dispatching or
+-- double-expiring the same action.
+CREATE TABLE controller_leases (
+    singleton    BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    leader_id    TEXT NOT NULL,
+    acquired_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO controller_leases (singleton, leader_id, expires_at)
+VALUES (TRUE, '', '1970-01-01T00:00:00Z')
+ON CONFLICT (singleton) DO NOTHING;
+"""),
+    (4, "per-tenant policy overlays", """
+-- A tenant of a shared deployment may overlay the GLOBAL active policy with a
+-- tighten-only fragment: it may RAISE decision thresholds / rung floors,
+-- require more behavioral corroboration, LOWER caps, and ADD governed
+-- allowlist entries -- never loosen the global boundary or control. The
+-- effective policy for that tenant is merge(global, overlay) computed
+-- deterministically at decide-time (see decision/layer.py). indicators carry
+-- an OPTIONAL tenant_id so the pipeline can select the right effective policy;
+-- NULL means "global only".
+CREATE TABLE tenant_overlays (
+    tenant_id     TEXT PRIMARY KEY,
+    overlay_sha256 TEXT NOT NULL,
+    raw_text      TEXT NOT NULL,
+    created_by    TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    problems      JSONB
+);
+ALTER TABLE indicators ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_indicators_tenant ON indicators(tenant_id);
+"""),
+    (5, "action dispatch claim state", """
+-- Add the transient 'dispatching' state used by the controller's atomic
+-- dispatch claim. A pending action is claimed (pending -> dispatching) in one
+-- UPDATE guarded by state='pending', so exactly one leader dispatches it, and
+-- a crash between claim and apply leaves it dispatching for the next leader's
+-- reconcile to re-queue (unclaim_action) rather than double-apply. Replaces the
+-- constraint that lacked this state.
+ALTER TABLE actions DROP CONSTRAINT IF EXISTS actions_state_check;
+ALTER TABLE actions ADD CONSTRAINT actions_state_check CHECK (state IN
+    ('pending','dispatching','applied','verified','failed','expired','revoked','drifted'));
+"""),
 ]
 
 

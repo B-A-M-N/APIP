@@ -383,6 +383,142 @@ def build_policy(raw: dict, raw_text: str, *, source_registry, now_fn,
     )
 
 
+def validate_overlay(raw: dict, global_raw: dict) -> list[str]:
+    """Stage-time tighten-only check for a tenant overlay (task #11, feature 2).
+
+    These are *advice* surfaced at staging time — the authoritative monotonic
+    guarantee is the runtime clamp in ``merge_policy_overlay``, which applies
+    even if a loosing overlay slips through. Problems here tell the operator
+    early what the overlay would (and would not) do.
+    """
+    problems: list[str] = []
+    # shape safety reuses the full policy validator (it is a real policy shape)
+    problems.extend(validate_policy(raw))
+    g_t = global_raw.get("thresholds") or {}
+    o_t = raw.get("thresholds") or {}
+    for name in ("observe_m", "fqdn_auto_m", "fqdn_auto_s",
+                 "ip_rate_m", "ip_rate_s", "ip_deny_m", "ip_deny_s"):
+        gv = g_t.get(name)
+        ov = o_t.get(name)
+        if gv is None or ov is None:
+            continue
+        if int(ov) < int(gv):
+            problems.append(
+                f"overlay would LOOSEN threshold {name} ({ov} < global {gv}); "
+                "the runtime clamps it back to the global (monotonic)")
+    g_l = global_raw.get("limits") or {}
+    o_l = raw.get("limits") or {}
+    for name, kind in (("max_auto_ttl_seconds", "cap"),
+                       ("max_evidence_per_indicator", "cap"),
+                       ("max_behavioral_m_contribution", "cap")):
+        gv, ov = g_l.get(name), o_l.get(name)
+        if gv is not None and ov is not None and ov >= gv and name != "max_behavioral_m_contribution":
+            problems.append(
+                f"overlay cap {name} ({ov}) is not stricter than global ({gv}); "
+                "raise-only is clamped")
+    if o_l.get("max_behavioral_m_contribution") is not None:
+        if g_l.get("max_behavioral_m_contribution") is not None and \
+                raw.get("limits", {}).get("max_behavioral_m_contribution") >= \
+                g_l.get("max_behavioral_m_contribution", 1 << 31):
+            problems.append(
+                "overlay max_behavioral_m_contribution not stricter than global")
+    g_auth = global_raw.get("authorization") or {}
+    o_auth = raw.get("authorization") or {}
+    g_domains = {str(d).strip().lower().rstrip(".")
+                 for d in (g_auth.get("authorized_domains") or ())}
+    o_domains = {str(d).strip().lower().rstrip(".")
+                 for d in (o_auth.get("authorized_domains") or ())}
+    if o_domains - g_domains:
+        problems.append(
+            "overlay proposes authorized_domains outside the global boundary "
+            "(never widen scope)")
+    if o_auth.get("reference_unrestricted") is True and not (
+        G := g_auth.get("authorized_domains") or g_auth.get("authorized_prefixes")):
+        problems.append("overlay must not set reference_unrestricted=true")
+    return problems
+
+
+def build_overlay(raw: dict, raw_text: str, *, source_registry=None,
+                  now_fn=None) -> Policy:
+    """Build a PARTIAL ``Policy`` from a tenant overlay TOML.
+
+    Only the override fields the author wrote are non-default; everything else
+    keeps the permissive ``Policy`` default so the merge clamp in
+    ``layer.merge_policy_overlay`` treats absence as "keep global". This is a
+    relaxed builder (no full validation pressure) but still bounds field
+    ranges the way ``validate_policy`` does for the fields it accepts.
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+    from apip.decision.policy import AllowlistEntry, RungFloor  # noqa: PLC0415
+
+    now_fn = now_fn or (lambda: "1970-01-01T00:00:00Z")
+    t = raw.get("thresholds") or {}
+    l = raw.get("limits") or {}
+    s = raw.get("safety") or {}
+    b = raw.get("behavioral") or {}
+    corr = b.get("corroboration") or {}
+    authz = raw.get("authorization") or {}
+    _ref_unrestricted = bool(authz.get("reference_unrestricted", False))
+
+    rung_floors = {}
+    for key, fl in (t.get("rungs") or {}).items():
+        rung_floors[key.upper()] = RungFloor(m=int(fl["m"]), s=int(fl["s"]))
+
+    allowlist = tuple(
+        AllowlistEntry(
+            value=str(e["value"]),
+            scope=str(e.get("scope", raw.get("scope", "*"))),
+            owner=str(e.get("owner", "")),
+            ticket=str(e.get("ticket", "")),
+            expires_at=e.get("expires_at"),
+            canonical=str(e["value"]),
+        )
+        for e in (raw.get("allowlist") or []))
+
+    import ipaddress
+    prefixes = tuple(
+        str(ipaddress.ip_network(str(p), strict=False))
+        for p in (authz.get("authorized_prefixes") or ()))
+
+    return Policy(
+        version=str(raw.get("policy_version", "")),
+        mode=str(raw.get("mode", "SHADOW")).upper(),
+        scope=str(raw.get("scope", "*")),
+        observe_m=int(t.get("observe_m", 0)),
+        fqdn_auto_m=int(t.get("fqdn_auto_m", 0)),
+        fqdn_auto_s=int(t.get("fqdn_auto_s", 0)),
+        ip_rate_m=int(t.get("ip_rate_m", 0)),
+        ip_rate_s=int(t.get("ip_rate_s", 0)),
+        ip_deny_m=int(t.get("ip_deny_m", 0)),
+        ip_deny_s=int(t.get("ip_deny_s", 0)),
+        max_auto_ttl_seconds=int(l.get("max_auto_ttl_seconds", 1 << 31)),  # lenient default
+        auto_prefix_deny=bool(s.get("auto_prefix_deny", False)),
+        auto_routing=bool(s.get("auto_routing", False)),
+        auto_wildcard_domain=bool(s.get("auto_wildcard_domain", False)),
+        allowlist=allowlist,
+        allowlist_precedence=bool(s.get("allowlist_precedence", True)),
+        rung_floors=rung_floors,
+        behavioral_rate_limit_families=int(corr.get("distinct_families_for_rate_limit", 0)),
+        behavioral_deny_families=int(corr.get("distinct_families_for_deny", 0)),
+        behavioral_deny_requires_external=bool(
+            corr.get("deny_also_requires_external", False)),
+        max_behavioral_m_contribution=int(
+            b.get("max_behavioral_m_contribution", 1 << 31)),  # cap-safe default
+        max_evidence_per_indicator=int(l.get("max_evidence_per_indicator", 1 << 31)),
+        authorized_prefixes=prefixes,
+        authorized_domains=tuple(
+            str(d).strip().lower().rstrip(".")
+            for d in (authz.get("authorized_domains") or ())),
+        reference_unrestricted=_ref_unrestricted,
+        enabled_behavioral_families=tuple(str(x) for x in b.get("enabled_families") or ()),
+        max_new_auto_actions_per_batch=(
+            int(l["max_new_auto_actions_per_batch"])
+            if l.get("max_new_auto_actions_per_batch") is not None else None),
+        source_registry=source_registry,
+        now_fn=now_fn,
+    )
+
+
 def load_policy_text(text: str, *, source_registry=None, now_fn=None) -> Policy:
     """Parse + validate + build from TOML text (staging path)."""
     raw = tomllib.loads(text)

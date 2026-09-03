@@ -18,3 +18,4 @@ from apip.telemetry.behavioral import (  # noqa: F401
     IMPLEMENTED_FAMILIES,
     PENDING_FAMILIES,
 )
+from apip.telemetry.feed import LiveBehavioralFeed  # noqa: F401

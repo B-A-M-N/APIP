@@ -10,7 +10,7 @@ Rules:
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import psycopg2
 import psycopg2.extras
@@ -123,15 +123,17 @@ VALUES (%s,%s,%s,%s,%s,%s)
                     "demoted": demoted})
         return True
 
-    def upsert_indicator(self, ind: Indicator, batch_id: str) -> None:
+    def upsert_indicator(self, ind: Indicator, batch_id: str,
+                         tenant_id: str | None = None) -> None:
         with self.db.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-INSERT INTO indicators (indicator_id, itype, value, tags)
-VALUES (%s,%s,%s,%s)
+INSERT INTO indicators (indicator_id, itype, value, tags, tenant_id)
+VALUES (%s,%s,%s,%s,%s)
 ON CONFLICT (indicator_id) DO UPDATE SET
-    last_seen = now(), tags = EXCLUDED.tags
-""", (ind.id, ind.type, ind.value, list(ind.tags)))
+    last_seen = now(), tags = EXCLUDED.tags,
+    tenant_id = COALESCE(EXCLUDED.tenant_id, indicators.tenant_id)
+""", (ind.id, ind.type, ind.value, list(ind.tags), tenant_id))
                 # source refs are NOT FK'd to sources: a channel-certified
                 # upstream id may be asserted before the operator registers
                 # it; unregistered ids simply carry zero authority at
@@ -268,6 +270,43 @@ WHERE state IN ('applied','verified','drifted') AND expires_at IS NOT NULL
 SELECT * FROM actions WHERE state='pending' ORDER BY created_at LIMIT %s
 """, (limit,))
 
+    def claim_pending_action(self, action_id: str) -> bool:
+        """Atomically claim a pending action for dispatch.
+
+        The claim flips state pending -> dispatching in ONE UPDATE guarded by
+        ``state='pending'``, so exactly one controller (the first to win the
+        CAS) dispatches it. A second controller racing the same row gets
+        ``RETURNING`` nothing and skips. This makes dispatch idempotent even
+        across a lease handoff or a crash between SELECT and apply: the loser
+        never double-applies, and a re-queue after a crash returns the action
+        to pending for the next leader to re-claim.
+        """
+        row = self.db.query_one("""
+UPDATE actions SET state='dispatching', last_reconciled_at=now()
+WHERE action_id=%s AND state='pending'
+RETURNING action_id
+""", (action_id,))
+        return bool(row)
+
+    def unclaim_action(self, action_id: str) -> None:
+        """Return a claimed-but-not-applied action to pending (crash between
+        claim and apply). Does nothing if the state moved on."""
+        self.db.execute("""
+UPDATE actions SET state='pending', last_reconciled_at=now()
+WHERE action_id=%s AND state='dispatching'
+""", (action_id,))
+
+    def actions_stuck_dispatching(self, older_than: datetime) -> list[dict]:
+        """Actions wedged in 'dispatching' (a leader died mid-apply) older than
+        a full reconcile window — safe for the next leader to re-queue. A live
+        in-flight apply bumps last_reconciled_at, so it stays excluded."""
+        return self.db.query("""
+SELECT * FROM actions
+WHERE state='dispatching' AND last_reconciled_at IS NOT NULL
+  AND last_reconciled_at < %s
+ORDER BY created_at
+""", (older_than,))
+
     def actions_needing_verification(self, older_than: datetime, limit: int = 100) -> list[dict]:
         return self.db.query("""
 SELECT * FROM actions WHERE state IN ('applied','verified')
@@ -386,22 +425,100 @@ FROM policy_versions ORDER BY staged_at DESC, revision DESC""")
             "SELECT event_id, at, actor, event_type, subject, detail "
             "FROM audit_events ORDER BY event_id DESC LIMIT %s", (limit,))
 
+    # -- HA leader lease -----------------------------------------------------------
+
+    def claim_leadership(self, leader_id: str, lease_s: int,
+                         now: datetime) -> bool:
+        """Atomic optimistic claim of the single-cluster worker lease.
+
+        True only for the single winner. Gives an expired lease to
+        ``leader_id``; renews an unexpired lease only if this controller
+        already holds it. One guarded UPDATE — never a read-then-write — so two
+        controllers can't both observe "expired" and both win (Postgres row
+        lock serializes them; the second sees ``expires_at`` already bumped).
+        """
+        row = self.db.query_one("""
+UPDATE controller_leases
+SET leader_id=%s, acquired_at=%s, expires_at=%s, heartbeat_at=now()
+WHERE singleton AND (leader_id=%s OR expires_at <= %s)
+RETURNING leader_id
+""", (leader_id, now, (now + timedelta(seconds=lease_s)).replace(microsecond=0),
+      leader_id, now))
+        return bool(row) and row["leader_id"] == leader_id
+
+    def release_lease(self, leader_id: str) -> None:
+        """Best-effort release on clean stop; never blocks leadership. A
+        caller that is not the current leader is a no-op."""
+        self.db.execute(
+            "UPDATE controller_leases SET expires_at=now() "
+            "WHERE singleton AND leader_id=%s", (leader_id,))
+
+    def lease_state(self) -> dict | None:
+        return self.db.query_one(
+            "SELECT leader_id, acquired_at, expires_at, heartbeat_at "
+            "FROM controller_leases WHERE singleton")
+
     # -- indicators --------------------------------------------------------------
 
-    def list_indicators(self, limit: int = 50) -> list[dict]:
+    def list_indicators(self, limit: int = 50,
+                        tenant_id: str | None = None) -> list[dict]:
+        if tenant_id is not None:
+            return self.db.query(
+                "SELECT indicator_id, itype, value, first_seen, last_seen, tags, "
+                "tenant_id FROM indicators WHERE tenant_id=%s "
+                "ORDER BY last_seen DESC LIMIT %s", (tenant_id, limit))
         return self.db.query(
-            "SELECT indicator_id, itype, value, first_seen, last_seen, tags "
-            "FROM indicators ORDER BY last_seen DESC LIMIT %s", (limit,))
+            "SELECT indicator_id, itype, value, first_seen, last_seen, tags, "
+            "tenant_id FROM indicators ORDER BY last_seen DESC LIMIT %s", (limit,))
 
     def get_indicator(self, indicator_id: str) -> dict | None:
         return self.db.query_one(
             "SELECT * FROM indicators WHERE indicator_id=%s", (indicator_id,))
+
+    def set_indicator_tenant(self, indicator_id: str, tenant_id: str | None,
+                             actor: str) -> bool:
+        row = self.db.query_one(
+            "UPDATE indicators SET tenant_id=%s WHERE indicator_id=%s "
+            "RETURNING indicator_id", (tenant_id, indicator_id))
+        if row:
+            self.audit(actor, "indicator.tenant", indicator_id, {"tenant": tenant_id})
+        return bool(row)
 
     def indicator_evidence(self, indicator_id: str) -> list[dict]:
         return self.db.query(
             "SELECT evidence_id, kind, source_id, channel_source, observed_at, "
             "detail, recorded_at, batch_id FROM evidence WHERE indicator_id=%s "
             "ORDER BY evidence_id", (indicator_id,))
+
+    # -- tenant policy overlays ---------------------------------------------------
+
+    def upsert_tenant_overlay(self, *, tenant_id: str, raw_text: str,
+                              overlay_sha256: str, created_by: str,
+                              problems: list[str] | None = None) -> None:
+        self.db.execute("""
+INSERT INTO tenant_overlays
+    (tenant_id, overlay_sha256, raw_text, created_by, problems)
+VALUES (%s,%s,%s,%s,%s)
+ON CONFLICT (tenant_id) DO UPDATE SET
+    overlay_sha256 = EXCLUDED.overlay_sha256,
+    raw_text = EXCLUDED.raw_text,
+    created_by = EXCLUDED.created_by,
+    created_at = now(),
+    problems = EXCLUDED.problems
+""", (tenant_id, overlay_sha256, raw_text, created_by,
+      psycopg2.extras.Json(problems) if problems else None))
+        self.audit(created_by, "policy.overlay.upsert", tenant_id,
+                   {"sha256": overlay_sha256})
+
+    def get_tenant_overlay(self, tenant_id: str) -> dict | None:
+        return self.db.query_one(
+            "SELECT tenant_id, overlay_sha256, raw_text, created_by, created_at, "
+            "problems FROM tenant_overlays WHERE tenant_id=%s", (tenant_id,))
+
+    def list_tenant_overlays(self) -> list[dict]:
+        return self.db.query(
+            "SELECT tenant_id, overlay_sha256, created_by, created_at "
+            "FROM tenant_overlays ORDER BY created_at DESC")
 
     # -- health -------------------------------------------------------------------
 

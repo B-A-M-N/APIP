@@ -62,7 +62,8 @@ def _resolve_target(decision: Decision) -> dict[str, Any]:
     destination_global -> domain / ipv4 / ipv6; host-quarantine (L6) ->
     device; client-scoped -> a device/process pair is left as-is on the
     destination to avoid inventing a client identity. ``None`` target when
-    the action carries no selectable object (e.g. pure ``query``).
+    the action carries no selectable object (e.g. pure ``query`` or a
+    bind-less decision) — a target is never FABRICATED from a decision id.
     """
     if decision.action in {"none", "observe"}:
         return {}
@@ -72,18 +73,26 @@ def _resolve_target(decision: Decision) -> dict[str, Any]:
         if host:
             return {"device": {"hostname": host}}
         return {}
-    if sel is None or sel.scope_type == "internal_host":
-        host = (getattr(sel, "host", None)
-                if sel is not None else None) or decision.id
-        return {"device": {"hostname": host}}
+    if sel is None:
+        # No bound object on the decision: emitting a made-up device would
+        # fabricate a target that nothing in the record supports. Emit the
+        # action with no target rather than invent one.
+        return {}
+    if sel.scope_type == "internal_host":
+        host = getattr(sel, "host", None)
+        if host:
+            return {"device": {"hostname": host}}
+        return {}
     dest = getattr(sel, "destination", "") or ""
     if not dest:
         return {}
     if "." in dest and ":" not in dest and "/" not in dest:
         return {"domain_name": {"value": dest.rstrip(".")}}
     if "/" in dest or ":" in dest:
-        return {"ipv4_connection": {"src_addr": "0.0.0.0/0",
-                                    "dst_addr": dest}}
+        # Emit the actual destination bound. The decision carries no source
+        # scope, so hardcoding ``src_addr: 0.0.0.0/0`` would fabricate "any
+        # source" the decision never asserted — omit it.
+        return {"ipv4_connection": {"dst_addr": dest}}
     return {"ipv4_addr": {"value": dest}}
 
 
@@ -131,7 +140,8 @@ def decision_to_openc2(
         "command_id": decision.content_hash or decision.id,
         "action": _ACTION_MAP.get(decision.action, "query"),
         "target": target,
-        "actuator": {"specifiers": {}, "type": _ACTUATOR_MAP[decision.action]},
+        "actuator": {"specifiers": {}, "type": _ACTUATOR_MAP.get(
+            decision.action, "openc2:actuator:unknown:1.0")},
         "modifiers": _modifiers(decision, now),
         "metadata": {
             "source": decision.policy_version,

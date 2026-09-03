@@ -166,6 +166,18 @@ class RpzAdapter:
                 raise AdapterError("selector destination does not match rule owner (never broadens)")
         if "*" in owner:
             raise AdapterError("wildcard selectors are not permitted in beta")
+        # zone-file injection guard: the fragment must be a SINGLE zone line.
+        # A newline (or multi-line paren group) here could inject arbitrary
+        # RRs into the zone file, and `startswith` alone cannot detect it. The
+        # emit boundary sanitizes the comment; this re-refuses any line
+        # structure that survived (defense in depth, selector-never-broadens
+        # for the artifact itself).
+        if "\n" in fragment or "\r" in fragment:
+            raise AdapterError("fragment may not contain a newline (zone injection)")
+        if "(" in fragment or ")" in fragment:
+            raise AdapterError("fragment may not contain multi-line parens (zone injection)")
+        if fragment.count(";") > 1:
+            raise AdapterError("fragment may not contain multiple comment markers")
         expected = f"{owner}. IN CNAME ."
         if not fragment.startswith(expected):
             raise AdapterError(
@@ -304,7 +316,15 @@ class RpzAdapter:
             "owner": owner,
             "rule_present": True,
         }
-        if self._mode == "ENFORCE" and self.config.verify_query_server:
+        if self._mode == "ENFORCE":
+            if not self.config.verify_query_server:
+                # ENFORCE's contract is resolver-confirmed suppression; without
+                # a resolver to ask, "verified" would be a fabricated success
+                # based on a file write alone. Fail closed instead.
+                return {"ok": False,
+                        "error": "ENFORCE requires verify_query_server for "
+                                 "independent NXDOMAIN verification",
+                        "observed": observed}
             dns = self._dns_query_nxdomain(owner)
             observed["dns"] = dns
             if not dns.get("queried"):

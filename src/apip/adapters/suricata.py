@@ -277,20 +277,51 @@ class SuricataAdapter:
             int(rule_id.split("sid:", 1)[1])
         except ValueError:
             raise AdapterError(f"invalid sid in rule id {rule_id!r}")
+        # ruleset-injection guard: the fragment must be a SINGLE rule line. A
+        # newline here injects arbitrary follow-on rules into the ruleset file
+        # verbatim (apply appends `candidate["fragment"]` as-is); the emit
+        # boundary sanitizes structure, and validate re-refuses anything that
+        # survived (defense in depth, selector-never-broadens for the artifact).
+        if "\n" in fragment or "\r" in fragment:
+            raise AdapterError("fragment may not contain a newline (ruleset injection)")
         # selector-never-broadens: a destination must match the rule's exact
-        # target; a pair/session scope with no boundable client is refused
-        # (the adapter never broadens to destination-global).
+        # target. A pair/session-scoped IP selector with no boundable client
+        # is refused (the adapter never broadens to destination-global); but an
+        # fqdn pair-scoped http.host intent rule IS bound by its host field,
+        # so it validates as long as the fragment carries that exact host.
         scope_type = selector.get("scope_type", "destination_global")
         dest = selector.get("destination")
-        exact = selector.get("exact_ip") or dest
+        exact_ip = selector.get("exact_ip")
         if not any(k in fragment for k in ("apip_decision", "metadata:")):
             raise AdapterError("fragment missing decision metadata")
-        if exact and not isinstance(exact, str):
+        if exact_ip is not None and not isinstance(exact_ip, str):
             raise AdapterError("selector exact_ip must be a string")
         if scope_type in _PAIR_SCOPED:
-            raise AdapterError(
-                "suricata validate refuses a pair/session-scoped selector "
-                "(cannot be faithfully represented as destination-global)")
+            if exact_ip is not None:
+                raise AdapterError(
+                    "suricata validate refuses a pair/session-scoped IP selector "
+                    "(no boundable client; would broaden to destination-global)")
+            # fqdn http.host intent: the host content field IS the exact pair
+            # bound — never a bare `http any -> any any` broadcast.
+            if not dest or f'content:"{dest}"' not in fragment:
+                raise AdapterError(
+                    "fqdn pair-scoped rule must carry http.host content bound "
+                    "to the selector destination (never broadens)")
+        # defense in depth layer 3 (scope): the adapter enforces its own
+        # home-net boundary INDEPENDENTLY of policy/controller even at
+        # validate time, so a candidate IP target outside the configured
+        # authorized prefixes is refused here too — not only at compile. This
+        # applies to exact-IP rules only.
+        if exact_ip is not None:
+            if not self._in_adapter_scope(exact_ip):
+                raise AdapterError(
+                    f"target {exact_ip} outside adapter home-net scope "
+                    f"{sorted(str(n) for n in self._authorized)}")
+            # selector-never-broadens: the exact target must be the single
+            # address the rule actually fires on — never a wider parent.
+            if f"-> {exact_ip} " not in fragment:
+                raise AdapterError(
+                    "fragment does not target the selector exact_ip (never broadens)")
         return {"ok": True, "mode": self._mode, "rule_id": rule_id}
 
     # -- apply / verify / revoke ---------------------------------------------------

@@ -84,6 +84,10 @@ class ControllerState:
         self.degraded_reasons: list[str] = []
         self.policy_loaded: bool = False
         self.policy_version: str | None = None
+        # HA leadership (local view; the DB lease is the authoritative state)
+        self.is_leader: bool = False
+        self.leader_id: str | None = None
+        self.lease_s: int | None = None
         self.lock = threading.Lock()
 
     def snapshot(self, *, db_health: dict, ledger: Ledger | None,
@@ -146,6 +150,11 @@ class ControllerState:
                     "last_ok": self.last_reconcile_ok,
                     "last_error": self.last_reconcile_error,
                 },
+                "leadership": {
+                    "is_leader": self.is_leader,
+                    "leader_id": self.leader_id,
+                    "lease_s": self.lease_s,
+                },
                 "degraded": degraded,
             }
 
@@ -165,6 +174,24 @@ class Controller:
         self.adapter = self._adapters[RpzAdapter.name]
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        # HA leader identity + lease window (config-derived; correctness rests
+        # on the DB compare-and-set, not this local value).
+        self._leader_id = "controller--" + uuid.uuid4().hex[:12]
+        self._lease_s = int(2 * max(1, self.config.controller.reconcile_interval_s))
+        self._lease_lock = threading.Lock()
+
+    def _acquire_or_renew_lease(self) -> bool:
+        """Refresh the worker lease atomically; True only for the live leader.
+        Safe to call from any worker (guarded here in-process; the DB guard is
+        authoritative)."""
+        with self._lease_lock:
+            now = datetime.now(timezone.utc)
+            holder = self.ledger.claim_leadership(
+                self._leader_id, self._lease_s, now)
+            self.state.leader_id = self._leader_id
+            self.state.lease_s = self._lease_s
+            self.state.is_leader = holder
+            return holder
 
     def _adapter_for(self, fragment: dict) -> EnforcementAdapter:
         """Route a fragment to the adapter that compiled it. Unknown adapter
@@ -202,6 +229,10 @@ class Controller:
         for t in self._threads:
             t.join(timeout=10)
         try:
+            self.ledger.release_lease(self._leader_id)
+        except Exception:
+            pass    # a follower's release is a no-op; never blocks shutdown
+        try:
             self.ledger.audit(CONTROLLER_ACTOR, "controller.stop", "", {})
         except Exception:
             pass
@@ -229,8 +260,16 @@ class Controller:
             self.state.policy_loaded = False
 
     def current_policy(self) -> Policy | None:
+        return self.effective_policy_for(None)
+
+    def effective_policy_for(self, tenant_id: str | None) -> Policy | None:
+        """The policy governing ``tenant_id``: the GLOBAL active policy, or —
+        when the tenant has a registered overlay — the deterministic
+        merge(global, overlay) that is at least as restrictive as the global.
+        ``None`` (global-only) matches ``current_policy`` exactly."""
         registry = self.pipeline.registry_from_sources(self.ledger.list_sources())
-        loaded = self.pipeline.load_active_policy(registry, now_fn=now_iso_utc)
+        loaded = self.pipeline.load_active_policy_effective(
+            registry, tenant_id=tenant_id, now_fn=now_iso_utc)
         return loaded[0] if loaded else None
 
     def _active_policy_revision(self) -> str | None:
@@ -245,7 +284,13 @@ class Controller:
         """Compile a decision into an action through the adapter, with the
         controller-layer scope check (defense in depth layer 2; the decision
         engine checked layer 1, the adapter re-checks layer 3)."""
-        policy = self.current_policy()
+        # defense-in-depth layer 2 uses the TENANT's effective policy (global, or
+        # the tighten-only merge with the tenant's overlay) so a narrowed tenant
+        # boundary is honored at the controller scope check too, not just at the
+        # decision engine.
+        ind_row = self.ledger.get_indicator(decision.indicator_id)
+        tenant_id = ind_row.get("tenant_id") if ind_row else None
+        policy = self.effective_policy_for(tenant_id)
         if policy is None:
             raise RuntimeError("no active policy; refusing to create actions")
         if decision.disposition not in ("SHADOW_ACTION", "AUTO_ENFORCE",
@@ -362,7 +407,10 @@ class Controller:
     def _dispatch_loop(self) -> None:
         while not self._stop.wait(self.config.controller.reconcile_interval_s):
             try:
-                self._dispatch_pending()
+                # HA: only the live lease holder dispatches pending actions.
+                # A follower attempts takeover each loop and otherwise observes.
+                if self._acquire_or_renew_lease():
+                    self._dispatch_pending()
             except DatabaseUnavailable as e:
                 self.state.last_reconcile_error = f"dispatch: {e}"
             except Exception as e:   # worker must never die silently
@@ -370,6 +418,11 @@ class Controller:
 
     def _dispatch_pending(self) -> None:
         for action in self.ledger.actions_needing_dispatch():
+            # Atomic claim: exactly one leader dispatches each pending action.
+            # If another controller already claimed it (lease handoff race /
+            # crash between SELECT and apply), skip — the loser never applies.
+            if not self.ledger.claim_pending_action(action["action_id"]):
+                continue
             self._dispatch_one(action)
 
     def _dispatch_one(self, action: dict) -> None:
@@ -412,14 +465,22 @@ class Controller:
 
     def _reconcile_loop(self) -> None:
         # first pass promptly after start
-        while not self._stop.wait(2.0):
+        while not self._stop.wait(1.0):
             break
         while not self._stop.is_set():
             started = time.monotonic()
             try:
-                self._reconcile_pass()
-                self.state.last_reconcile_ok = True
-                self.state.last_reconcile_error = None
+                # HA: expiry/verify sweeps run ONLY while holding the worker
+                # lease — a second controller on the same ledger can't double-
+                # remove or double-verify a rule. A follower still refreshes
+                # health and attempts takeover on the next loop.
+                if self._acquire_or_renew_lease():
+                    self._reconcile_pass()
+                    self.state.last_reconcile_ok = True
+                    self.state.last_reconcile_error = None
+                else:
+                    self.state.last_reconcile_ok = False
+                    self.state.last_reconcile_error = "follower (not lease leader)"
             except DatabaseUnavailable as e:
                 self.state.last_reconcile_ok = False
                 self.state.last_reconcile_error = f"reconcile: {e}"
@@ -434,6 +495,15 @@ class Controller:
 
     def _reconcile_pass(self) -> None:
         now = datetime.now(timezone.utc)
+        # 0. crash-recovery of a claimed-but-never-applied dispatch: a leader
+        #    that was mid-apply when it died leaves the action 'dispatching'.
+        #    Return any such action (untouched for a full reconcile window,
+        #    so we never yank an actually in-flight apply) to pending so the
+        #    next leader re-claims and applies it.
+        stale = now - timedelta(seconds=max(
+            10, 3 * self.config.controller.reconcile_interval_s))
+        for action in self.ledger.actions_stuck_dispatching(stale):
+            self.ledger.unclaim_action(action["action_id"])
         # 1. expiry sweep: TTL reached -> remove via controlled path
         for action in self.ledger.actions_due_for_expiry(now):
             self._remove_action(action, CONTROLLER_ACTOR, "ttl_expired",

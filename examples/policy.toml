@@ -55,6 +55,14 @@ authorized_prefixes = [
   "198.51.100.0/24",
   "203.0.113.0/24",
 ]
+# v2.3 (audit P1-1): explicit resolver/domain scope. A non-IP target is
+# authorized iff it equals or is a subdomain of a governed suffix here — it
+# is never authorized merely because 'the IP boundary does not apply'. The
+# demo data lives under the reserved `.invalid` TLD; production MUST list its
+# real domains.
+authorized_domains = [
+  "invalid",
+]
 
 # v2.2 (docs/25 L1 client-impact budget): the measured interactive
 # transaction volume of the trailing hour — the denominator the challenge
@@ -63,6 +71,23 @@ authorized_prefixes = [
 # both are set. Unset = fail closed for the budget (zero challenges).
 [measurement]
 interactive_transactions_per_hour = 1000
+
+# v2.3 (audit P0-3): governed infrastructure registry. `dedicated_use` and
+# `verified_rollback` are CONTROL-PLANE safety facts — a feed may never
+# assert them. They are SERVER-derived only for the values the operator
+# lists here as governed infrastructure. A feed asserting one on any other
+# value contributes zero (control_plane_claim_unverified). This is what lets
+# the demo's `indicator--demo-ip-dedicated` legitimately reach L5 while a
+# poisoned feed can never self-grant the same privilege.
+[governed]
+dedicated_use = [
+  "198.51.100.44",
+]
+verified_rollback = [
+  "198.51.100.44",
+  "c2-demo.invalid",
+  "c2-on-cdn-demo.invalid",
+]
 
 # v2.1.1: replay clock (docs/10 deterministic-replay harness). When set,
 # evidence freshness is evaluated against this instant and decision
@@ -97,15 +122,13 @@ distinct_families_for_rate_limit = 2
 distinct_families_for_deny = 3
 deny_also_requires_external = true
 
-# v2: allow-first segment (docs/26). Example OT DMZ segment in SHADOW stage.
-[segments.ot-dmz-a]
-mode = "ALLOW_FIRST"
-onboarding_stage = "SHADOW"
-owner = "ot-ops"
-review_cadence_days = 90
-allowlist_ttl_days = 180
-max_denied_volume_alarm_per_hour = 50
-break_glass_profile = "QUARANTINE_ALLOWLIST"
+# v3 (audit P1-32): a `[segments.*]` allow-first block was previously carried
+# here but the reference RUNTIME does not implement it — a safety-bearing
+# field the parser accepted but silently ignored. Per the audit rule (accept
+# it => implement it or fail), the runtime now REJECTS `segments` at load, and
+# the runnable example no longer ships it. Segment policy (docs/26) remains a
+# forward spec of the control-plane contract (docs/29/drafts), not a reference
+# behavior — see OpenAPI's DRAFT-FUTURE framing.
 
 # v2: seeded randomization bounds (docs/29). Draws are recorded per decision.
 [randomization]
@@ -124,14 +147,11 @@ min = 0.5
 max = 1.0
 units = "fraction_of_nominal_ceiling"
 
-[randomization.mechanisms.challenge_sampling]
-enabled = true
-min = 0.1
-max = 1.0
-units = "fraction_of_eligible_clients"
-
-[randomization.mechanisms.threshold_dither]
-enabled = true
-min = 0.9
-max = 1.1
-units = "fraction_of_policy_threshold"
+# Note (audit P1-7..11): only mechanisms the engine actually wires may be
+# declared. A mechanism listed here that the engine does not implement would
+# be a silently inert knob — an operator would believe a defense was active
+# (challenge sampling, BD threshold dithering) that never happened. The
+# reference engine implements exactly: ttl_jitter and rate_ceiling. Anything
+# else is rejected at load (unsupported randomization mechanism). These two
+# aspirational docs/29 mechanisms (challenge_sampling, threshold_dither) are
+# therefore NOT declared here until they are genuinely wired.

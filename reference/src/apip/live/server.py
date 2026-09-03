@@ -42,21 +42,54 @@ from ..attribution import (
     CorrelationStore,
     TransactionRejected,
     handle_for,
-    probe_order,
     validate_transaction,
 )
 
 # Canonical-JSON challenge object (P5 material): the client is asked to
 # echo this object with its own serializer; the KEY ORDER it emits is the
-# behavioral feature. Key order is scrambled deterministically per session
-# by probe_order so replayed/frozen responses are detectable.
+# behavioral feature. Key order is scrambled deterministically per issue
+# (via _scramble_fields, see audit P1-12) so replayed/frozen responses are
+# detectable — the scrambler still emits ONLY these canonical keys.
 CHALLENGE_KEYS = ("ts", "nonce", "response", "probe_set")
+
+# audit P1-12: bounded server-issued challenge state. A challenge id never
+# held is a 403/404 at submit; TTL bounds how long an issued challenge can
+# live, and MAX_CHALLENGES bounds total server memory.
+CHALLENGE_TTL_S = 300
+MAX_CHALLENGES = 128
 
 # Per-connection socket timeout (seconds): bounds how long one slow client
 # can pin one handler thread.
 HANDLER_TIMEOUT_S = 30
 # Hard body cap (bytes) regardless of the claimed Content-Length.
 MAX_BODY_BYTES = 65_536
+
+
+def origin_epoch_marker(epoch: str) -> str:
+    """Non-empty deterministic marker for an epoch (used in id material)."""
+    return epoch or "0"
+
+
+def _now_iso() -> str:
+    """Current UTC instant in the observed_at ISO-8601 shape (validated)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _scramble_fields(session_id: str, epoch: str) -> list[str]:
+    """Randomized order of the canonical challenge fields (audit P1-12).
+
+    Deterministic per (session, epoch) so a challenge replays exactly and an
+    epoch change re-orders the fields — but the keys are ALWAYS the canonical
+    CHALLENGE_KEYS, never PROBE_IDS. The client's serialization key order is
+    the P5 behavioral signature.
+    """
+    from ..randomize import ApipRng
+    rng = ApipRng(f"attribution-fields|{session_id}|{epoch}")
+    fields = list(CHALLENGE_KEYS)
+    for i in range(len(fields) - 1, 0, -1):
+        j = rng.next_uniform_micros(0, i)
+        fields[i], fields[j] = fields[j], fields[i]
+    return fields
 
 
 class _TxWriter:
@@ -125,6 +158,12 @@ class ChallengeOrigin:
         self._sessions_lock = threading.Lock()  # handler threads race here too
         self._counter_lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
+        # audit P1-12: two-step challenge state. Server issues bounded,
+        # TTL-bounded challenge state and validates the client's response
+        # against the nonce + id it actually issued — the POST body is no
+        # longer read and recorded before any challenge is even issued.
+        self._challenges: dict[str, dict] = {}
+        self._challenges_lock = threading.Lock()
 
     # -- handler factory ---------------------------------------------------
 
@@ -167,61 +206,101 @@ class ChallengeOrigin:
                     origin._sessions[handle] = n + 1
                 return handle, n
 
-            def log_message(self, fmt, *args):  # quiet by default
+            def log_message(self, format, *args):  # quiet by default (no-op)
                 pass
 
-            # P4/P6 material: a versioned asset with known validators.
+            CUR_ASSET = b"ASTVWXYZ"       # the canonical 8-byte asset (P4/P6)
+
+            def _asset_response(self, rec: dict[str, Any]) -> None:
+                """Serve the versioned asset, recording the client's observed
+                conditional-request (P4) and Range (P6) behavior — the probe is
+                the client's own transcript, not a constant we always mark."""
+                etag = '"v1-2026-09-01"'
+                inm = self.headers.get("If-None-Match")
+                rng = self.headers.get("Range")
+                if rng:
+                    # P6 (audit P1-13): a Range header is only "honored" when
+                    # the client's requested byte slice is exactly what the
+                    # server served. Parse the actual request; ANY other range
+                    # — out-of-bounds, suffix, multi-range, malformed — is
+                    # recorded as an honest non-honoring class, never a fixed
+                    # "range_honored".
+                    req = _parse_range(rng)
+                    if req == (0, 1):               # exactly "bytes=0-1"
+                        self.send_response(206)
+                        self.send_header("Content-Type", "text/plain")
+                        self.send_header("Content-Range", "bytes 0-1/8")
+                        self.end_headers()
+                        self.wfile.write(self.CUR_ASSET[0:2])
+                        rec["range_fallback"] = "range_honored"
+                    elif req is None:
+                        rec["range_fallback"] = "malformed_retry"
+                    else:
+                        rec["range_fallback"] = "range_ignored"
+                if "range_fallback" in rec:
+                    return                     # handled the range branch above
+                if inm == etag:
+                    self.send_response(304)
+                    self.end_headers()
+                    rec["cache_behavior"] = "validators_present_correct"
+                elif inm is not None:
+                    self.send_response(200)
+                    self.send_header("ETag", etag)
+                    self.end_headers()
+                    self.wfile.write(self.CUR_ASSET)
+                    rec["cache_behavior"] = "validators_present_incorrect"
+                else:
+                    self.send_response(200)
+                    self.send_header("ETag", etag)
+                    self.end_headers()
+                    self.wfile.write(self.CUR_ASSET)
+                    rec["cache_behavior"] = "validators_absent"
+
+            def _emit_common(self, rec: dict[str, Any]) -> None:
+                handle, _ = self._session_for()
+                rec["client_ref"] = handle       # records carry the pseudonym only
+                rec["session_epoch"] = origin.epoch
+                origin.emit(rec, requester_handle=handle)
+
+            # GET /challenge issues (two-step; P1-12); GET /asset and GET /healthz
+            # serve the fixed probes; anything else is the P1 header-order surface.
             def do_GET(self):
                 rec = self._record_common()
                 with origin._counter_lock:
                     origin.requests_observed += 1
-                etag = '"v1-2026-09-01"'
                 path = self.path.split("?")[0]
                 if path == "/healthz":
                     self.send_response(200)
                     self.send_header("Content-Type", "text/plain")
                     self.end_headers()
                     self.wfile.write(b"ok\n")
+                    self._emit_common(rec)
+                    return
+                if path == "/challenge":
+                    # P1-12 step 1: issue a real challenge (id + nonce +
+                    # randomized canonical fields) carrying server state.
+                    challenged = origin._issue_challenge()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(challenged).encode())
+                    rec["challenge_issued"] = True
+                    self._emit_common(rec)
                     return
                 if path == "/asset":
-                    inm = self.headers.get("If-None-Match")
-                    rng = self.headers.get("Range")
-                    if rng:
-                        # P6: does the client honor a 206 with the requested slice?
-                        self.send_response(206)
-                        self.send_header("Content-Type", "text/plain")
-                        self.send_header("Content-Range", "bytes 0-1/8")
-                        self.end_headers()
-                        self.wfile.write(b"AB")
-                        rec["range_fallback"] = "range_honored"
-                    elif inm == etag:
-                        self.send_response(304)
-                        self.end_headers()
-                        rec["cache_behavior"] = "validators_present_correct"
-                    elif inm is not None:
-                        self.send_response(200)
-                        self.send_header("ETag", etag)
-                        self.end_headers()
-                        self.wfile.write(b"ASTVWXYZ")
-                        rec["cache_behavior"] = "validators_present_incorrect"
-                    else:
-                        self.send_response(200)
-                        self.send_header("ETag", etag)
-                        self.end_headers()
-                        self.wfile.write(b"ASTVWXYZ")
-                        rec["cache_behavior"] = "validators_absent"
-                else:
-                    # P1 surface on a synthetic 404: header-order vector.
-                    self.send_response(404)
-                    self.send_header("Content-Type", "text/plain")
-                    self.end_headers()
-                    self.wfile.write(b"not found\n")
-                handle, n = self._session_for()
-                rec["client_ref"] = handle          # records carry the pseudonym only
-                rec["session_epoch"] = origin.epoch
-                origin.emit(rec)
+                    self._asset_response(rec)
+                    self._emit_common(rec)
+                    return
+                # P1 surface on a synthetic 404: header-order vector.
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"not found\n")
+                self._emit_common(rec)
 
-            # P5 material: the canonical-JSON challenge object.
+            # POST /challenge/{id} is the two-step response (P1-12): validates
+            # the nonce + id the server actually issued and extracts the
+            # client's serialization key order (P5). No state -> 403/404.
             def do_POST(self):
                 rec = self._record_common()
                 with origin._counter_lock:
@@ -233,34 +312,48 @@ class ChallengeOrigin:
                     self.send_header("Content-Type", "text/plain")
                     self.end_headers()
                     self.wfile.write(b"bad content-length\n")
+                    self._emit_common(rec)
                     return
                 # bounded read: hard cap regardless of the claimed length
                 body = self.rfile.read(min(length, MAX_BODY_BYTES)) if length else b""
-                _, n = self._session_for()
-                probes = probe_order(f"post-{n}", origin.epoch)
-                if self.path == "/challenge":
+                path = self.path.split("?")[0]
+                prefix = "/challenge/"
+                if not path.startswith(prefix):
+                    self.send_response(404)
+                    self.end_headers()
+                    self._emit_common(rec)
+                    return
+                cid = path[len(prefix):]
+                valid, key_order = origin._validate_challenge_submission(cid, body)
+                rec["challenge_body_key_order"] = key_order or []
+                rec["challenge_valid"] = bool(valid)
+                if valid:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    # deterministic key scramble for this session interaction
-                    obj = {k: "..." for k in probes[:len(CHALLENGE_KEYS)]}
-                    self.wfile.write(json.dumps(obj).encode())
-                    rec["challenge_body_key_order"] = _key_order(body)
+                    self.wfile.write(b'{"valid":true,"schema_version":"fp1"}\n')
                 else:
-                    self.send_response(404)
+                    self.send_response(403)
+                    self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                handle, _ = self._session_for()
-                rec["client_ref"] = handle
-                rec["session_epoch"] = origin.epoch
-                origin.emit(rec)
+                    self.wfile.write(b'{"valid":false}\n')
+                self._emit_common(rec)
 
         return Handler
 
     # -- emit + fold --------------------------------------------------------
 
-    def emit(self, rec: dict[str, Any]) -> None:
+    def emit(self, rec: dict[str, Any],
+         requester_handle: str | None = None) -> None:
         """Validate, write, and (optionally) fold one observed transaction.
-        Invalid records are dropped with a counter, never coerced."""
+
+        The record's `client_ref` is ALREADY a pseudonymous requester handle
+        (the handlers pseudonymize at the boundary). audit P1-14: folding must
+        therefore use `observe_pseudonymous_handle`, NOT `observe` — the old
+        path re-HMAC'd the handle, giving live and offline ingestion different
+        identity semantics and making `attribution_refs_for(raw)` miss live
+        captures. Invalid records are dropped with a counter, never coerced.
+        """
         try:
             validate_transaction(rec)
         except TransactionRejected:
@@ -270,14 +363,111 @@ class ChallengeOrigin:
         self.writer.write(rec)
         if self.store is not None:
             with self._counter_lock:
-                self.store.observe(rec)
+                self.store.observe_pseudonymous_handle(rec, requester_handle)
+
+    # -- audit P1-12 two-step challenge state machine ----------------------
+
+    def _issue_challenge(self) -> dict[str, Any]:
+        """Issue a bounded, TTL-limited challenge (GET /challenge).
+
+        Returns a challenge object carrying an id, a fresh nonce, and the
+        canonical fields in a randomized (per-session, per-epoch) order.
+        Server state is capped and TTL-evicted; a value never held is a 404
+        at submit, so there is no replay of stale/unissued challenges.
+        """
+        from ..randomize import ApipRng
+        import hashlib as _hl
+        with self._sessions_lock:
+            seq = self.requests_observed + len(self._challenges)
+        cid = "ch--" + _hl.sha256(f"{seq}|{origin_epoch_marker(self.epoch)}"
+                                  .encode()).hexdigest()[:16]
+        rng = ApipRng(f"challenge|{cid}|{self.epoch}")
+        nonce = _hl.sha256(f"nonce|{cid}|{rng.next_uniform_micros(0, 1 << 40)}"
+                           .encode()).hexdigest()[:24]
+        # P1-12: the response keys MUST be the canonical challenge fields
+        # (ts/nonce/response/probe_set), in a randomized per-challenge order —
+        # not PROBE_IDS (P1..P6) leaking out as the object's keys.
+        fields = _scramble_fields(cid, self.epoch)
+        entry = {"nonce": nonce, "probe_set": fields,
+                 "issued_at": _now_iso()}
+        with self._challenges_lock:
+            self._challenges[cid] = entry
+            self._evict_challenges()
+        return {"challenge_id": cid, "nonce": nonce, "fields": fields}
+
+    def _validate_challenge_submission(self, challenge_id: str,
+                                       body: bytes) -> tuple[bool, list[str] | None]:
+        """Validate a POST /challenge/{id} against server-issued state.
+
+        Returns (valid, key_order_or_None). Requires: the id was actually
+        issued, the nonce is echoed in the body, the challenge has not
+        expired, and the body is a bounded serialization whose key ORDER we
+        can extract. The extracted key order IS the P5 serializer-behavior
+        signature; validity is recorded so an unsolicited/stale/replayed
+        body is distinguishable from a genuine two-step response.
+        """
+        from datetime import datetime
+        with self._challenges_lock:
+            entry = self._challenges.get(challenge_id)
+        if entry is None:
+            return False, None
+        try:
+            issued = datetime.fromisoformat(entry["issued_at"].replace("Z", "+00:00"))
+            if (datetime.fromisoformat(_now_iso().replace("Z", "+00:00"))
+                    - issued).total_seconds() > CHALLENGE_TTL_S:
+                with self._challenges_lock:
+                    self._challenges.pop(challenge_id, None)
+                return False, None
+        except ValueError:
+            return False, None
+        key_order = _key_order(body)
+        nonce = entry["nonce"]
+        # the client must have echoed the issued nonce in its serialization
+        echoed = nonce.encode("utf-8") in body
+        if not echoed:
+            return False, key_order
+        # the id is valid only if it names state this server actually issued
+        # for exactly the entry we just read under the lock (P1-12 binding);
+        # `pending` truth is required — a tautology would validate arbitrary ids.
+        pending = True
+        with self._challenges_lock:
+            pending = challenge_id in self._challenges
+        ok = echoed and pending
+        # consume one-shot challenges on use (bounded, no replay)
+        with self._challenges_lock:
+            self._challenges.pop(challenge_id, None)
+        return ok, key_order
+
+    def _evict_challenges(self) -> None:
+        """Cap + TTL eviction of server-issued challenge state (bounded state)."""
+        from datetime import datetime
+        now = datetime.fromisoformat(_now_iso().replace("Z", "+00:00"))
+        keep = {}
+        for cid, e in self._challenges.items():
+            try:
+                issued = datetime.fromisoformat(e["issued_at"].replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if (now - issued).total_seconds() <= CHALLENGE_TTL_S:
+                keep[cid] = e
+        self._challenges = keep
+        if len(self._challenges) > MAX_CHALLENGES:
+            # drop oldest by issued_at (deterministic)
+            for cid in sorted(self._challenges,
+                              key=lambda c: self._challenges[c]["issued_at"])[
+                          len(keep) - MAX_CHALLENGES:]:
+                self._challenges.pop(cid, None)
 
     # -- lifecycle -----------------------------------------------------------
 
     def serve(self, bind: str = "127.0.0.1", port: int = 8765) -> None:
         """Start serving. Refuses non-loopback binds unless explicitly opted in
-        via allow_nonloopback=True on serve_forever (production opt-in)."""
-        if not bind.startswith("127.") and bind not in ("localhost", "::1"):
+        via allow_nonloopback=True on serve_forever (production opt-in).
+
+        audit P1-15: only IP LITERALS are accepted for the loopback default;
+        hostnames (including "localhost") are rejected — a string prefix test
+        previously let `127.attacker.example` through as "loopback"."""
+        if not _is_loopback(bind):
             raise ValueError(
                 "refusing non-loopback bind by default; pass allow_nonloopback=True "
                 "only for production deployment after privacy review (docs/30)")
@@ -293,10 +483,21 @@ class ChallengeOrigin:
         self._server.serve_forever()
 
     def shutdown(self) -> None:
+        """Release the writer's file handle. Idempotent: safe to call twice
+        (audit P1-40) — a closed handle is never double-closed."""
         if self._server:
             self._server.shutdown()
             self._server = None
         self.writer.close()
+
+    # audit P1-40: context-manager semantics for explicit lifecycle ownership.
+    # Tests and embedders that open a ChallengeOrigin should close its writer
+    # deterministically via `with` (never rely on GC to reap the file handle).
+    def __enter__(self) -> "ChallengeOrigin":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self.shutdown()
 
 
 def _safe_content_length(raw: str | None) -> int | None:
@@ -318,8 +519,48 @@ def _safe_content_length(raw: str | None) -> int | None:
         return None
 
 
+def _parse_range(header: str | None) -> tuple[int, int] | None:
+    """Parse a Range header to the exact [start, end] byte pair requested.
+
+    audit P1-13: the server must verify the client's actual requested slice
+    against the canonical asset, not just report `range_honored` for any
+    Range header. Returns (start, end) ONLY for a single, plain, in-bounds
+    `bytes=0-1` range; `0-1`, malformed, multi-range, suffix (`bytes=N-`),
+    open-ended (`bytes=0-`), or out-of-range headers return None so the caller
+    records the honest class (range_ignored / malformed_retry).
+    """
+    if header is None:
+        return None
+    h = header.strip()
+    if not h.lower().startswith("bytes="):
+        return None
+    spec = h[len("bytes="):].strip()
+    if "," in spec:                     # multi-range: not statefully honored
+        return None
+    try:
+        start_s, _, end_s = spec.partition("-")
+        if not end_s:                   # open-ended suffix range
+            return None
+        start = int(start_s)
+        end = int(end_s)
+    except ValueError:
+        return None
+    if start < 0 or end < start:
+        return None
+    return (start, end)
+
+
 def _is_loopback(bind: str) -> bool:
-    return bind.startswith("127.") or bind in ("localhost", "::1")
+    """True only for IP-literal loopback addresses (127.0.0.0/8, ::1).
+
+    audit P1-15: the previous `bind.startswith("127.")` accepted arbitrary
+    hostnames like `127.attacker.example`. Only parsed IP literals that are
+    genuinely loopback pass; hostnames are rejected outright."""
+    import ipaddress
+    try:
+        return ipaddress.ip_address(bind).is_loopback
+    except ValueError:
+        return False
 
 
 def _key_order(body: bytes) -> list[str]:

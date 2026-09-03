@@ -5,8 +5,46 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "apip-reference"
 version = "0.1.0"
-description = "Dry-run reference scaffold for APIP"
+description = "Deterministic, dependency-free dry-run reference scaffold for the APIP attack-path interdiction platform"
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.11"
+authors = [
+  { name = "B-A-M-N", email = "benevolentjoker@gmail.com" },
+]
+keywords = [
+  "security",
+  "network-access-control",
+  "deterministic",
+  "reference-implementation",
+  "attribution",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Information Technology",
+  "Intended Audience :: System Administrators",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: System :: Networking",
+  "Typing :: Typed",
+]
+#
+# Determinism + no-AI invariant (CONTRIBUTING.md): this package deliberately
+# declares NO runtime dependency surface — the scaffold is stdlib-only so a
+# decision path can never pull an inference SDK. Leaving the key absent (rather
+# than "= []") is itself the enforced contract, checked by
+# tests/test_no_ai_conformance.py. Tests use optional gated deps
+# (jsonschema/PyYAML) as cross-checks only, for their own env, never here.
+
+# Console entry point. The scaffold is deterministic, dependency-free, and
+# offline/dry-run (docs/28, RELEASES.md); `apip` exposes the same evaluation
+# tooling as `python -m apip.cli`.
+[project.scripts]
+apip = "apip.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

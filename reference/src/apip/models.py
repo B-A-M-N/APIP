@@ -50,6 +50,33 @@ class ActionSelector:
         return {k: v for k, v in asdict(self).items() if v is not None}
 
 @dataclass(frozen=True)
+class CompiledArtifact:
+    """One successfully compiled adapter fragment (audit P1-26/P1-27).
+
+    Receipts are generated from these, never by inspecting `Decision.action`
+    — a decision that rendered no artifact produces no receipt. Carries BOTH
+    the decision-specific fragment identity (rule id + fragment hash) and the
+    whole-bundle identity (bundle id + bundle hash) so later verify/revoke/
+    reconcile can target one rule without disturbing the rest (docs/07,
+    TM-008).
+
+    `monitoring_only` (audit P1-25) is TRUE when the exported form is a
+    monitoring/intent rule (e.g. a dry-run Suricata `alert + detection_filter`
+    that a real cluster policy has not made into an enforcement actuator) —
+    never silently upgrade it to an equivalent of the typed selector.
+    """
+    decision_id: str
+    adapter: str
+    rule_id: str
+    fragment: str                 # this decision's rendered text/zone line
+    fragment_hash: str            # decision-specific (rule id / zone owner)
+    bundle_id: str
+    bundle_hash: str              # hash over the whole combined artifact
+    status: str = "dry_run"
+    monitoring_only: bool = False
+
+
+@dataclass(frozen=True)
 class Decision:
     id: str
     indicator_id: str
@@ -70,6 +97,12 @@ class Decision:
     # rate_ceiling). None when no randomized mechanism applied.
     randomization: Any | None = field(default=None)
     attribution_refs: tuple[str, ...] = ()   # docs/30: display-only, never a decision input
+    # P1-10 (audit): action-instance identity — a content hash over the FULL
+    # parameterized output (disposition, action, rung, selector, ttl, draw).
+    # Distinct from `id` (the LOGICAL decision, which persists across epochs);
+    # receipts/reconciliation/revocation reference the exact action INSTANCE.
+    # Empty for non-actionable decisions that emit no enforcement artifact.
+    content_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

@@ -17,12 +17,17 @@ External cross-check: `verify.sh` additionally validates with the real
 `jsonschema` package when it is installed (optional, never required).
 """
 import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 PKG = Path(__file__).resolve().parent.parent.parent
 SCHEMAS = PKG / "schemas"
+REFERENCE = PKG / "reference"
 
 SUPPORTED_KEYWORDS = {
     "$schema", "$id", "title", "description", "type", "enum", "const",
@@ -163,9 +168,44 @@ def _load(name):
     return json.loads((SCHEMAS / name).read_text(encoding="utf-8"))
 
 
+def generate_artifacts():
+    """Run the reference CLI `evaluate` into a TemporaryDirectory and return
+    the emitted JSON artifact bytes keyed by filename.
+
+    Clean-checkout safety (audit P0/P1-39): artifact conformance tests must
+    NEVER read ignored local state (`examples/generated` is gitignored). They
+    regenerate fresh fixtures on every run, so the suite stays green on a bare
+    `git clean -xffd` checkout and never depends on artifacts a prior local run
+    happened to leave behind. Other test modules (e.g. the independent-audit
+    regression) import this helper so every consumer builds its own fixtures
+    rather than depending on a shared ignored directory."""
+    out = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ, PYTHONPATH=str(REFERENCE / "src"))
+        subprocess.run(
+            [sys.executable, "-m", "apip.cli", "evaluate",
+             str(PKG / "examples" / "indicators.json"),
+             "--policy", str(PKG / "examples" / "policy.toml"),
+             "--out", tmp, "--demo-trust-fixture"],
+            cwd=REFERENCE, env=env, check=True, capture_output=True)
+        for name in ("decisions.json", "receipts.json"):
+            out[name] = (Path(tmp) / name).read_bytes()
+    return out
+
+
 class EngineOutputConformanceTests(unittest.TestCase):
     """Every artifact the reference engine emits must satisfy its schema —
-    the exact check whose absence let v2.1.1 ship invalid decisions."""
+    the exact check whose absence let v2.1.1 ship invalid decisions.
+
+    Clean-checkout safety (audit P0/P1-39): these artifact tests never read
+    ignored local state (`examples/generated` is gitignored). They regenerate
+    fresh fixtures into a TemporaryDirectory on every run, so the suite is
+    green on a bare `git clean -xffd` checkout and never depends on artifacts
+    a prior local run happened to leave behind."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._artifacts = generate_artifacts()
 
     def _validate_all(self, schema_name, instances):
         schema = _load(schema_name)
@@ -181,13 +221,11 @@ class EngineOutputConformanceTests(unittest.TestCase):
 
     def test_generated_decisions_conform(self):
         self._validate_all("decision.schema.json",
-                           json.loads((PKG / "examples" / "generated" /
-                                       "decisions.json").read_text()))
+                           json.loads(self._artifacts["decisions.json"]))
 
     def test_generated_receipts_conform(self):
         self._validate_all("action_receipt.schema.json",
-                           json.loads((PKG / "examples" / "generated" /
-                                       "receipts.json").read_text()))
+                           json.loads(self._artifacts["receipts.json"]))
 
     def test_example_indicators_conform(self):
         self._validate_all("indicator.schema.json",
@@ -218,6 +256,31 @@ class EngineOutputConformanceTests(unittest.TestCase):
             validate(raw, schema, schema)
         except _SchemaError as e:
             self.fail(f"examples/policy.toml fails policy.schema.json: {e}")
+
+    def test_governed_policy_validates_against_schema(self):
+        """v2.3 (audit P0-3): the [governed] registry is part of the policy
+        schema contract — a policy carrying it must validate, and a hostile
+        shape (non-array / non-string) must be rejected at the schema level."""
+        import tomllib
+        schema = _load("policy.schema.json")
+        base = tomllib.loads((PKG / "examples" / "policy.toml").read_text())
+        good = dict(base)
+        good["governed"] = {
+            "dedicated_use": ["198.51.100.44"],
+            "verified_rollback": ["198.51.100.44", "c2-demo.invalid"],
+        }
+        try:
+            validate(good, schema, schema)
+        except _SchemaError as e:
+            self.fail(f"governed policy fails policy.schema.json: {e}")
+        bad = dict(base)
+        bad["governed"] = {"dedicated_use": "not-an-array"}   # must be a list
+        with self.assertRaises(_SchemaError):
+            validate(bad, schema, schema)
+        bad2 = dict(base)
+        bad2["governed"] = {"verified_rollback": [1, 2]}     # values must be str
+        with self.assertRaises(_SchemaError):
+            validate(bad2, schema, schema)
 
 
 class SchemaKeywordSupportTests(unittest.TestCase):
@@ -266,3 +329,88 @@ class SchemaKeywordSupportTests(unittest.TestCase):
         self.assertEqual(unknown, [],
                          "schemas use keywords the conformance validator "
                          "does not implement (extend it): " + "; ".join(unknown))
+
+    def test_no_duplicate_json_object_keys(self):
+        """audit P1-33: a duplicate object key in a JSON schema is silently
+        collapsed by `json.loads` — the LAST occurrence wins and the drift is
+        lost. policy.schema.json previously declared
+        `max_challenged_transaction_fraction_per_hour` twice. Lint every
+        shipped schema for duplicate keys BEFORE ordinary json loading loses
+        the evidence: any duplicate key in any object fails loudly here."""
+        dups: list[str] = []
+
+        def object_pairs_hook(pairs):
+            seen = set()
+            for key, _ in pairs:
+                if key in seen:
+                    dups.append(key)
+                seen.add(key)
+            return dict(pairs)
+
+        for p in sorted(SCHEMAS.glob("*.json")):
+            try:
+                json.loads(p.read_text(encoding="utf-8"),
+                           object_pairs_hook=object_pairs_hook)
+            except json.JSONDecodeError as e:
+                self.fail(f"{p.name}: not valid JSON: {e}")
+        self.assertEqual(
+            dups, [],
+            "duplicate JSON object key(s) in a shipped schema — a duplicate "
+            "is silently collapsed by json.loads and the drift is lost "
+            "(audit P1-33): " + ", ".join(f"{d!r}" for d in dups))
+
+    def test_indicator_type_enum_agrees_across_contracts(self):
+        """audit P1-29: the indicator `type` vocabulary must be ONE canonical
+        model. JSON Schema, OpenAPI, and the runtime loader (apip.io
+        _INDICATOR_TYPES) previously disagreed (schema sha256/certificate_
+        fingerprint vs OpenAPI file_hash/cert_fingerprint vs runtime 5 types).
+        The reference runtime's loadable set is canonical: an indicator type
+        it cannot load must not appear in any contract, because a schema-valid
+        indicator that fails at ingest is a silent contract lie. File-hash /
+        certificate-family / network-fingerprint indicator kinds are
+        DRAFT-FUTURE control-plane types, not reference input types."""
+        from apip.io import _INDICATOR_TYPES
+
+        # JSON schema enum
+        schema = json.loads((SCHEMAS / "indicator.schema.json").read_text())
+        schema_enum = set(schema["properties"]["type"]["enum"])
+        # OpenAPI enum (the reference's forward document; still must agree so
+        # the two contracts can't quietly drift apart again)
+        try:
+            import yaml as _yaml
+            oa = _yaml.safe_load((PKG / "api" / "openapi.yaml").read_text())
+            oa_enum = set(oa["components"]["schemas"]["Indicator"]
+                            ["properties"]["type"]["enum"])
+        except ImportError:
+            oa_enum = set()
+        # runtime loader canonical vocabulary
+        runtime = set(_INDICATOR_TYPES)
+
+        self.assertEqual(schema_enum, runtime,
+                         "indicator.schema.json type enum drifts from the "
+                         "runtime loader's loadable set (P1-29)")
+        if oa_enum:
+            self.assertEqual(oa_enum, runtime,
+                             "OpenAPI Indicator type enum drifts from the "
+                             "runtime loader's loadable set (P1-29)")
+
+    def test_receipt_status_enum_agrees_across_contracts(self):
+        """audit P1-30: the receipt lifecycle vocabulary must be one model —
+        action_receipt.schema.json and the OpenAPI previously disagreed on
+        'revoked' vs 'reverted'. The runtime-enforced schema is canonical;
+        a receipt status is REVOKED (a rule is revoked), not reverted (which
+        is the L1 budget auto-demotion concept)."""
+        schema_status = json.loads(
+            (SCHEMAS / "action_receipt.schema.json").read_text()
+        )["properties"]["status"]["enum"]
+        try:
+            import yaml as _yaml
+            oa = _yaml.safe_load((PKG / "api" / "openapi.yaml").read_text())
+            oa_status = oa["components"]["schemas"]["Receipt"] \
+                ["properties"]["status"]["enum"]
+        except ImportError:
+            self.skipTest("PyYAML not installed to check OpenAPI")
+            return
+        self.assertEqual(oa_status, schema_status,
+                         "OpenAPI Receipt status enum drifts from "
+                         "action_receipt.schema.json (P1-30)")

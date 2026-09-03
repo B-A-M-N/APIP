@@ -12,7 +12,15 @@ so cross-language replay cannot diverge on float rounding.
 import hashlib
 
 class ApipRng:
-    """Deterministic CSPRNG-style DRBG: SHA-256 in counter mode."""
+    """Deterministic SHA-256 counter-mode DRBG (docs/29, audit P1-11).
+
+    Drawn values are REPRODUCIBLE deterministic parameter diversity, NOT
+    cryptographic unpredictability: every seed input (indicator identity,
+    policy version, scores, scope, bounds version, epoch) is recorded in the
+    decision, so an observer holding a past decision can reconstruct the seed
+    and predict draws that share it. For observer-unpredictable windows the
+    operator must add a per-window secret at the edge (see docs/29 "Security
+    model"); this class never claims secret-key CSPRNG strength."""
 
     def __init__(self, seed_material: str):
         self._key = hashlib.sha256(("apip-drbg-v1|" + seed_material).encode()).digest()

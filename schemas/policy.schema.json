@@ -110,24 +110,11 @@
           "type": "integer",
           "minimum": 1
         },
-        "max_actions_per_bundle": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "max_auto_actions_per_tenant_window": {
-          "type": "integer",
-          "minimum": 1
-        },
         "max_challenged_transaction_fraction_per_hour": {
           "type": "number",
           "exclusiveMinimum": 0,
           "maximum": 1,
-          "description": "L1 client-impact budget (docs/25)."
-        },
-        "max_segment_denied_volume_alarm_per_hour": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Allow-first segment denial alarm threshold (docs/26)."
+          "description": "docs/25 L1 client-impact budget: at most this fraction of the tenant's interactive transactions may be challenged per hour; the overflow alarms and auto-reverts to L0 (client_impact_budget_exceeded / challenge_auto_reverted_to_L0). Backed by measurement.interactive_transactions_per_hour."
         },
         "nominal_rate_ceiling_per_min": {
           "type": "integer",
@@ -144,12 +131,6 @@
           "type": "integer",
           "minimum": 1,
           "description": "docs/04 §8 blast-radius budget: maximum AUTO_ENFORCE/SHADOW actions one batch may propose; overflow demotes to OBSERVE with blast_radius_budget_exceeded."
-        },
-        "max_challenged_transaction_fraction_per_hour": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "maximum": 1,
-          "description": "docs/25 L1 client-impact budget: at most this fraction of the tenant's interactive transactions may be challenged per hour; the overflow alarms and auto-reverts to L0 (client_impact_budget_exceeded / challenge_auto_reverted_to_L0). Backed by measurement.interactive_transactions_per_hour."
         }
       }
     },
@@ -170,7 +151,7 @@
       "properties": {
         "authorized_prefixes": {
           "type": "array",
-          "description": "docs/04: authorized target space; targets outside are hard-rejected (out_of_authorized_scope). Production deployments MUST enumerate; empty/absent means unrestricted reference behavior.",
+          "description": "docs/04: authorized IP/CIDR target space; targets outside are hard-rejected (out_of_authorized_scope). v2.3 (audit P1-2): each entry is parsed and canonicalized at load; a malformed CIDR makes the policy un-loadable.",
           "items": {
             "type": "string",
             "description": "CIDR prefix; load-time validation is authoritative",
@@ -178,6 +159,51 @@
             "maxLength": 64
           },
           "maxItems": 1024,
+          "uniqueItems": true
+        },
+        "authorized_domains": {
+          "type": "array",
+          "description": "v2.3 (audit P1-1): explicit resolver/domain scope. A non-IP target is authorized iff it equals or is a subdomain of one of these suffixes. Empty means domain targets follow the reference default (authorized only while reference_unrestricted is true).",
+          "items": {
+            "type": "string",
+            "description": "Domain suffix (e.g. 'example.com'); load-time validation is authoritative",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "maxItems": 1024,
+          "uniqueItems": true
+        },
+        "reference_unrestricted": {
+          "type": "boolean",
+          "description": "v2.3 (audit P1-1): explicit opt-in to unrestricted reference authorization. PROHIBITED in ENFORCE/EMERGENCY — a control plane must never authorize by default. When true (reference modes only), no boundary is required."
+        }
+      }
+    },
+    "governed": {
+      "type": "object",
+      "description": "v2.3 (audit P0-3): governed infrastructure registry. `dedicated_use` and `verified_rollback` are CONTROL-PLANE safety facts a feed may never assert; they are server-derived ONLY for the values listed here. Absent/empty registry = the conservative default where a feed can never self-grant a control-plane fact.",
+      "additionalProperties": false,
+      "properties": {
+        "dedicated_use": {
+          "type": "array",
+          "description": "Targets the operator certifies as dedicated-use infrastructure; only these may carry a server-derived dedicated_use fact that enables L5.",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "maxItems": 4096,
+          "uniqueItems": true
+        },
+        "verified_rollback": {
+          "type": "array",
+          "description": "Targets the operator certifies as rollback-verified infrastructure; only these may carry a server-derived verified_rollback fact.",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "maxItems": 4096,
           "uniqueItems": true
         }
       }
@@ -201,9 +227,6 @@
           "type": "boolean"
         },
         "allowlist_precedence": {
-          "type": "boolean"
-        },
-        "require_expiry": {
           "type": "boolean"
         },
         "no_ai_components": {
@@ -263,13 +286,6 @@
         }
       }
     },
-    "segments": {
-      "type": "object",
-      "description": "Allow-first segment policies (docs/26), keyed by segment id.",
-      "additionalProperties": {
-        "$ref": "#/$defs/segmentPolicy"
-      }
-    },
     "randomization": {
       "type": "object",
       "description": "Seeded randomization bounds (docs/29). Bounds are policy; draws are recorded per decision.",
@@ -282,26 +298,27 @@
           "type": "string",
           "minLength": 1
         },
+        "epoch": {
+          "type": "string",
+          "description": "P1-8 (audit): explicit randomization epoch. If set (non-'0'), used verbatim; a schema-valid policy can therefore pin the moving-target rotation. Mutually independent of rotation_interval_seconds."
+        },
+        "rotation_interval_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "P1-8 (audit): versioned rotation interval (seconds) over the policy clock (reference_now when pinned, wall clock otherwise). When > 0, the effective epoch is DERIVED as floor(clock_seconds / interval), so moving-target rotation advances with time without a per-epoch redeploy."
+        },
         "mechanisms": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "challenge_sampling": {
-              "$ref": "#/$defs/randBounds"
-            },
             "rate_ceiling": {
               "$ref": "#/$defs/randBounds"
             },
             "ttl_jitter": {
               "$ref": "#/$defs/randBounds"
-            },
-            "shadow_review_sampling": {
-              "$ref": "#/$defs/randBounds"
-            },
-            "threshold_dither": {
-              "$ref": "#/$defs/randBounds"
             }
-          }
+          },
+          "description": "Only mechanisms the engine actually wires may be declared. A declared-but-unimplemented mechanism (challenge_sampling, shadow_review_sampling, threshold_dither) would be a silently inert knob (audit P1-7..11) and is rejected by validation; it is therefore not a legal schema member."
         }
       }
     },
@@ -355,50 +372,6 @@
           "type": "number"
         },
         "units": {
-          "type": "string"
-        }
-      }
-    },
-    "segmentPolicy": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "mode",
-        "onboarding_stage"
-      ],
-      "properties": {
-        "mode": {
-          "enum": [
-            "ALLOW_FIRST",
-            "STANDARD"
-          ]
-        },
-        "onboarding_stage": {
-          "enum": [
-            "ENUMERATE",
-            "SIMULATE",
-            "SHADOW",
-            "CANARY",
-            "ENFORCE",
-            "REVIEW"
-          ]
-        },
-        "owner": {
-          "type": "string"
-        },
-        "review_cadence_days": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "allowlist_ttl_days": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "max_denied_volume_alarm_per_hour": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "break_glass_profile": {
           "type": "string"
         }
       }

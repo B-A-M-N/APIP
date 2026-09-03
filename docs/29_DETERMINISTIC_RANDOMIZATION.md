@@ -8,7 +8,7 @@ The counter is **algorithmic randomization of defensive parameters within policy
 
 Two properties hold simultaneously:
 
-- **To the attacker:** the defense's observable behavior at time T provides no reliable prediction of its behavior at T+1.
+- **To the attacker:** the defense's observable behavior at time T is a *drawn* value within policy bounds, not a stable constant the attacker can tune a single probe against and then stay under indefinitely. Because the draw changes per epoch/window (docs/29 P1-8), an attacker who adapted to the last observed value must re-probe and re-adapt, and each re-probe generates more evidence. This is **deterministic parameter diversity** intended to complicate simplistic adaptation — it is NOT cryptographic unpredictability (see "Security model — what this is and is not").
 - **To the operator/auditor:** given the evidence snapshot, policy version, clock bucket, and recorded seed, the exact same decision is reproduced. NFR-003 is preserved.
 
 ## Scope — what may be randomized
@@ -41,7 +41,7 @@ What is **never** randomized:
 policy (versioned bounds)
         +
 evidence snapshot hash
-        +        CSPRNG (e.g., HKDF/ChaCha20-class)
+        +        SHA-256 counter-mode DRBG
 clock bucket  -------------> seed (recorded in decision)
         +                        |
         v                        v
@@ -52,8 +52,8 @@ recorded in decision: seed_id, draw context, bounds version, resulting values
 
 Requirements:
 
-1. **CSPRNG only.** No statistical-quality shortcuts; draws must be unpredictable to an outside observer even with a large sample of past outputs.
-2. **Seed is recorded, never secret.** Reproducibility is the point: the seed is part of the decision record, so replay reproduces the exact draw. (Predictability to the *operator* is harmless — the attacker cannot see the ledger. Where an operator judges otherwise, per-window seeds may be generated at the edge from local entropy and recorded in receipts instead.)
+1. **Deterministic DRBG, not a secret-key CSPRNG.** All draws go through one SHA-256 counter-mode DRBG (`ApipRng`); no language `random` calls scattered in logic. The seed is recorded in the decision, so an outside observer who holds a past decision can reconstruct the seed and predict every draw that shares that seed material. Draws are therefore **deterministic parameter diversity**, not cryptographic unpredictability — see the security-model note below. Statistical quality (uniformity, cross-mechanism independence, no short cycle) is still required and tested.
+2. **Seed is recorded, never secret.** Reproducibility is the point: the seed is part of the decision record, so replay reproduces the exact draw. Where the threat model genuinely requires that an outside observer cannot predict future windows, the operator MUST add real edge entropy per window (deployment secret or edge-generated random seed mixed into the clock bucket), as described below; the base engine ships the deterministic-diversity mode by default.
 3. **Draw context is recorded.** What was drawn, from what bounds, for which mechanism — fully explicit in the decision/receipt.
 4. **Bounds are policy versioning.** Changing a bound is a policy change, with replay/diff/gates, exactly like thresholds.
 5. **Independence across mechanisms.** Correlated draws would let one observed parameter predict others; each mechanism draws from an independent stream.
@@ -72,6 +72,19 @@ Quantified intuition: against a fixed ceiling C, the attacker converges to "just
 
 This is asymmetric-cost deterrence implementable in a few hundred lines of deterministic code — the point of combining it with the rest of the platform rather than relying on it alone.
 
+## Security model — what this is and is not (audit P1-11)
+
+APIP's randomization is **not** a cryptographically unpredictable CSPRNG deployment. `ApipRng` is a deterministic SHA-256 counter-mode DRBG seeded *entirely* from recorded decision context — indicator identity, policy version, scores, scope, bounds version, and the epoch bucket. Every one of those inputs is published in the decision record (that is what makes replay exact). Therefore:
+
+- **An outside observer who sees one past decision can reconstruct its seed and predict every future draw that shares the same seed material** (same indicator, policy, and epoch bucket). Within an epoch, the defense does not hide its draw from a patient observer.
+- The value supplied by these drawn parameters is that the *specific* value is not a fixed constant the attacker can probe once, converge to, and then stay under indefinitely — each epoch yields a freshly *drawn* value, so the attacker must keep probing/re-adapting and keeps generating evidence while doing so. This is **deterministic parameter diversity intended to complicate simplistic adaptation**, not secrecy of the draw.
+
+The design deliberately trades "unpredictable to an outside observer" for "exactly replayable by the operator." Where the threat model actually requires that no outside observer can predict future windows, that is a deployment-time enhancement, not something the seed-only engine can claim:
+
+> **Optional edge-entropy mode.** Mix a high-entropy per-window secret into the seed material: a deployment secret or an edge-generated random seed drawn once per epoch (e.g. `seed = H(deployment_secret ‖ window ‖ context)` via the same DRBG). Record the actual replay seed in the protected audit ledger *after* use, so the operator can still reproduce the draw while an outside observer without the secret cannot predict future windows. This is the honest way to reach docs/29's "unpredictable to an outside observer" claim, and it is opt-in because it moves the platform from "dependency-free deterministic replay" to "secrets must be guarded."
+
+Deterministic hash generation and unpredictable CSPRNG deployment are different properties; this document claims the former by default and describes the latter only as an operator-sourced enhancement.
+
 ## Interaction with safety machinery
 
 - **Budgets:** randomized parameters still consume action/safety budgets at their nominal (pre-draw) values; conservative accounting.
@@ -87,7 +100,7 @@ Randomization here perturbs parameters of controls that are already justified on
 
 ## Conformance requirements
 
-1. All draws through the platform CSPRNG abstraction; no language `random` calls scattered in logic.
+1. All draws through the platform deterministic DRBG abstraction (`ApipRng`, SHA-256 counter mode); no language `random` calls scattered in logic. (Not a secret-key CSPRNG — see "Security model — what this is and is not".)
 2. Every randomized decision records: mechanism, bounds version, seed, draw context, resulting value.
 3. Replay with recorded seed reproduces exact outputs (CI test).
 4. No randomized mechanism can produce a value outside its policy bounds (property test).

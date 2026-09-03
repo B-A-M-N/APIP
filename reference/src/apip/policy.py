@@ -1,11 +1,13 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+from datetime import timedelta
 import hashlib
 from typing import Any, Callable
 from .models import Indicator, Decision, ActionSelector
 from .scoring import (score_parts, EvidenceTable, DEFAULT_WEIGHTS,
                       SHARED_INFRA_KINDS as SHARED_INFRA_EVIDENCE,
-                      NON_AUTHORITATIVE_CLASSES, _dedup_evidence)
+                      NON_AUTHORITATIVE_CLASSES, ZERO_WEIGHT_CLASSES,
+                      MALICIOUSNESS_ASSERTION_KINDS, _dedup_evidence)
 from .registry import SourceRegistry, DEFAULT_REGISTRY
 from .randomize import ApipRng, draw_ttl_jitter, draw_scaled_integer
 from .sanitize import validate_client, UnsafeIdentifier
@@ -18,6 +20,11 @@ BEHAVIORAL_PREFIX = "behavioral_"
 
 # Protocols on which L1 challenge is prohibited (docs/25: interactive only)
 NON_INTERACTIVE_PROTOCOLS = frozenset({"smtp", "dns", "ics", "ssh", "other"})
+
+# v2.3 (audit P1-3): the explicit clock-skew allowance for evidence recency.
+# Freshness is asymmetric (a future observation is not evidence, only a small
+# skew is tolerated) — see `_make_recency_classifier` / config default.
+_CLOCK_SKEW = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -111,8 +118,24 @@ class Policy:
     auto_prefix_deny: bool
     auto_routing: bool
     auto_wildcard_domain: bool
-    # authorized target space: targets outside are hard-rejected (docs/04)
+    # authorized target space: targets outside are hard-rejected (docs/04).
+    # An EMPTY boundary is the reference-scaffold default (unrestricted), but
+    # an ENFORCE/EMERGENCY policy is REJECTED at load unless it declares an
+    # explicit boundary (P1-1) — a control plane must never be enforce-without-a-
+    # boundary. `reference_unrestricted` is the visible, named opt-in for the
+    # scaffold; it is prohibited in enforcement-capable modes (P1-1).
     authorized_prefixes: tuple[str, ...] = ()
+    # v2.3 (audit P1-1): explicit DOMAIN scope model. Non-IP targets match
+    # against these suffixes (equal-to or subdomain-of); empty means domain
+    # targets follow the reference default (authorized) until the operator
+    # constrains them. ENFORCE requires domains or prefixes to be populated.
+    authorized_domains: tuple[str, ...] = ()
+    # v2.3 (audit P1-1): the reference scaffold IS, by documented design,
+    # unrestricted (named `reference_unrestricted`) until the operator declares
+    # a boundary. The loader switches it to False when any boundary is present,
+    # and REJECTS `reference_unrestricted=true` in ENFORCE/EMERGENCY profiles —
+    # a control plane is never authorize-by-default.
+    reference_unrestricted: bool = True
     allowlist: tuple[AllowlistEntry, ...] = ()
     allowlist_precedence: bool = True
     # v2 (docs/25): per-rung floors
@@ -123,6 +146,11 @@ class Policy:
     behavioral_deny_requires_external: bool = True
     max_behavioral_m_contribution: int = 60
     corroborated_max_behavioral_m_contribution: int = 92
+    # v2.3 (audit P1-20): the [behavioral] enabled_families the operator asked
+    # for. Defaults to the implemented families so a policy without the block
+    # still detects; only families BOTH requested AND implemented produce
+    # evidence (behavioral.py enforces this at runtime).
+    enabled_behavioral_families: tuple[str, ...] = ()
     # v2.1: scoring authority
     evidence_table: EvidenceTable = field(default_factory=lambda: EvidenceTable(DEFAULT_WEIGHTS))
     source_registry: SourceRegistry = field(default_factory=lambda: DEFAULT_REGISTRY)
@@ -131,6 +159,10 @@ class Policy:
     randomization_enabled: bool = False
     randomization_bounds_version: str = ""
     randomization_epoch: str = "0"      # wall-clock epoch bucket; see docs/29
+    # P1-8 (audit): versioned rotation interval (seconds) + policy clock ->
+    # derived epoch, so a schema-valid policy can make moving-target rotation
+    # real without a per-epoch redeploy. 0 = explicit epoch (or default "0").
+    randomization_rotation_interval_seconds: int = 0
     ttl_jitter: RandomizationMechanism = RandomizationMechanism(False, 0.8, 1.0)
     # v2.1.1: L2 rate ceiling (docs/25 client-impact budget) + its jitter
     # bounds (docs/29 rate_ceiling mechanism). A rate_limit without a
@@ -163,6 +195,17 @@ class Policy:
     # scaffold never guesses transaction volume.
     max_challenged_transaction_fraction_per_hour: float | None = None
     measured_interactive_transactions_per_hour: int | None = None
+    # audit P0-3 (derived control-plane facts): a GOVERNED infrastructure
+    # registry. `dedicated_use` / `verified_rollback` cannot be granted by a
+    # feed — they are identity-safety facts that only the control plane can
+    # certify, for values the operator has explicitly reviewed as dedicated
+    # infrastructure or verified-rollback-capable. Default empty: a feed
+    # asserting these kinds contributes zero (see scoring.CONTROL_PLANE_KINDS
+    # and score's `server_derived_kinds`). The offline demo supplies these to
+    # exercise the enforcement ladder honestly; production MUST populate from
+    # adapter/controller + infrastructure teams, never from threat feeds.
+    governed_dedicated_use: tuple[str, ...] = ()
+    governed_verified_rollback: tuple[str, ...] = ()
 
 
 def _decision_id(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip: int,
@@ -174,26 +217,75 @@ def _decision_id(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip:
     return "decision--" + hashlib.sha256(payload.encode()).hexdigest()[:24]
 
 
+def _content_hash(*parts: object) -> str:
+    """P1-10 (audit): content hash over the exact parameterized action output.
+
+    The logical `_decision_id` persists across epochs (a finding is the same
+    finding), but every distinct ACTION INSTANCE — embodied in its disposition,
+    rung, selector, TTL, and recorded draws — must have a unique identity so
+    receipts/reconciliation/revocation reference the exact emitted rule. This
+    hash covers every field that parameterizes the action.
+    """
+    payload = "\x1f".join(_serialize(p) for p in parts)
+    return "hash--" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+
+
+def _serialize(v: object) -> str:
+    """Deterministic, separator-safe serialization for content hashing."""
+    if isinstance(v, (list, tuple)):
+        return _list_str(v)
+    if isinstance(v, dict):
+        return _list_str(sorted((repr(k), _serialize(v[k])) for k in v))
+    return repr(v)
+
+
+def _list_str(items) -> str:
+    return "[" + ",".join(_serialize(i) for i in items) + "]"
+
+
 def _in_scope(value: str, itype: str, policy: Policy) -> bool:
     """Authorization boundary check (docs/04: target outside authorized
-    scope prohibited). Empty authorized_prefixes means unrestricted in this
-    reference scaffold; production MUST always enumerate."""
-    if not policy.authorized_prefixes:
+    scope prohibited).
+
+    v2.3 (audit P1-1): authorization is FAIL-CLOSED once an operator declares
+    a boundary for a target class. There is no hidden 'IP boundary does not
+    apply, therefore authorized' escape:
+      - IPv4/IPv6/CIDR targets must fall inside an authorized prefix.
+      - Domain targets must equal or be a subdomain of an authorized_domains
+        suffix (the explicit resolver/domain scope model).
+    `reference_unrestricted=true` is the ONLY way to reach the unrestricted
+    reference default, and the loader prohibits it in ENFORCE/EMERGENCY. An
+    empty, non-unrestricted policy is therefore out-of-scope for everything
+    (every target hard-rejects) — a control plane is never authorized by
+    omission.
+    """
+    if policy.reference_unrestricted:
         return True
     import ipaddress
-    if itype not in {"ipv4", "ipv6", "cidr"}:
-        return True  # domain targets are governed by resolver scope, not prefixes
-    try:
-        addr = ipaddress.ip_network(value, strict=False)
-    except ValueError:
+    if itype in {"ipv4", "ipv6", "cidr"}:
+        if not policy.authorized_prefixes:
+            return False  # no IP boundary declared -> fail closed for IP/CIDR
+        try:
+            addr = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            return False
+        for p in policy.authorized_prefixes:
+            net = ipaddress.ip_network(p, strict=False)
+            if (isinstance(addr, ipaddress.IPv4Network) and isinstance(net, ipaddress.IPv4Network)
+                    and addr.subnet_of(net)):
+                return True
+            if (isinstance(addr, ipaddress.IPv6Network) and isinstance(net, ipaddress.IPv6Network)
+                    and addr.subnet_of(net)):
+                return True
         return False
-    for p in policy.authorized_prefixes:
-        net = ipaddress.ip_network(p, strict=False)
-        if (isinstance(addr, ipaddress.IPv4Network) and isinstance(net, ipaddress.IPv4Network)
-                and addr.subnet_of(net)):
-            return True
-        if (isinstance(addr, ipaddress.IPv6Network) and isinstance(net, ipaddress.IPv6Network)
-                and addr.subnet_of(net)):
+    # non-IP target: explicit resolver/domain scope model (P1-1). A target is
+    # authorized iff it equals or is a subdomain of a governed domain.
+    if not policy.authorized_domains:
+        return False  # no domain boundary declared -> fail closed for domains
+    v = value.lower().rstrip(".")
+    for d in policy.authorized_domains:
+        d = d.lower().rstrip(".")
+        if v == d or v.endswith("." + d):
             return True
     return False
 
@@ -218,9 +310,17 @@ def _allowlisted(value: str, policy: Policy) -> tuple[bool, str]:
             continue
         if entry.expires_at is None:
             return True, f"allowlist_hit:{value}"
+        # audit P1-35 defense-in-depth: an expiry that does not parse to a
+        # genuine instant is a governance FAILURE (fail closed) — it must
+        # never read as "not expired" and allow forever. load_policy already
+        # rejects such entries at the boundary; this guards any other path
+        # that constructs an AllowlistEntry directly.
         expiry = _parse_instant(entry.expires_at)
         now = _parse_instant(now_key) if now_key else _wall_now()
-        if now is not None and expiry is not None and now > expiry:
+        if expiry is None:
+            # unparsable expiry == governance failure: do not allow
+            return False, f"allowlist_unparsable_expiry:{value}"
+        if now is not None and now > expiry:
             # expired: enforcement proceeds; governance failure recorded
             continue
         return True, f"allowlist_hit:{value}"
@@ -245,6 +345,37 @@ def _wall_now():
     return datetime.now(timezone.utc)
 
 
+def _current_epoch(policy) -> str:
+    """Effective randomization epoch (audit P1-8).
+
+    Docs/29 needs the moving-target rotation to actually move. Three modes,
+    in order:
+      1. explicit `randomization.epoch` set by the operator -> honored
+         as-is (a schema-valid policy can now configure it);
+      2. `randomization.rotation_interval_seconds > 0` -> epoch DERIVED on
+         the policy clock (reference_now when pinned, wall clock otherwise):
+         bucket = clock_seconds // interval, so the epoch advances with time
+         and does not require a per-epoch policy redeploy;
+      3. default -> "0" (rotation disabled; only within-epoch diversity).
+
+    The pinned-clock path keeps replay exact: the same reference_now yields
+    the same derived epoch, hence the same draws.
+    """
+    if policy.randomization_epoch and policy.randomization_epoch != "0":
+        return policy.randomization_epoch
+    interval = getattr(policy, "randomization_rotation_interval_seconds", 0) or 0
+    if interval > 0:
+        from datetime import timezone as _tz
+        if policy.reference_now:
+            now = _parse_instant(policy.reference_now) or _wall_now()
+        else:
+            now = _wall_now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=_tz.utc)
+        return str(int(now.timestamp()) // interval)
+    return "0"
+
+
 def _behavioral_families(indicator: Indicator, registry: SourceRegistry) -> set[str]:
     """Distinct behavioral families, counting only evidence from sources the
     registry classifies as local (provenance-gated server-side, docs/23)."""
@@ -255,17 +386,26 @@ def _behavioral_families(indicator: Indicator, registry: SourceRegistry) -> set[
     return fams
 
 
-def _external_corroboration(indicator: Indicator, registry: SourceRegistry) -> tuple[bool, int]:
-    """Qualified external corroboration (v2.1.1): counted over DISTINCT
-    upstream provenance identities, not feed names — three resellers of one
-    upstream corroborate once (docs/04: independence is provenance, not feed
-    count). Auto-enforcement-allowed, non-local, non-annotation sources only."""
+def _external_corroboration(indicator: Indicator, registry: SourceRegistry,
+                            classify_recency=lambda _ts: "fresh") -> tuple[bool, int]:
+    """Qualified external corroboration (v2.1.1 + audit P1-5): counted over
+    DISTINCT upstream provenance identities, not feed names — three resellers
+    of one upstream corroborate once (docs/04: independence is provenance, not
+    feed count). Auto-enforcement-allowed, non-local, non-annotation sources
+    only, AND only when they report a FRESH MALICIOUSNESS ASSERTION
+    (`MALICIOUSNESS_ASSERTION_KINDS`). A source that merely observed the
+    target structurally (`recent`, `exact_*`, `exactness`) is not corroborating
+    a maliciousness claim, and a stale report corroborates nothing."""
     identities: set[str] = set()
     for ev in indicator.evidence:
         prof = registry.profile(ev.source_id)
         if prof.source_class in {"local", "annotation", "unregistered"}:
             continue
         if not (prof.independent and prof.auto_enforcement_allowed):
+            continue
+        if ev.kind not in MALICIOUSNESS_ASSERTION_KINDS:
+            continue
+        if classify_recency(ev.observed_at) == "stale":
             continue
         identities.add(registry.independence_identity(ev.source_id))
     return (len(identities) > 0, len(identities))
@@ -422,24 +562,25 @@ def select_rung(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip: 
                     # auditor holding the decision can reproduce the draw
                     # exactly. Same auditability stance as ttl_jitter: bounds
                     # enforcement carries the security, not seed secrecy.
+                    _epoch = _current_epoch(policy)   # P1-8: derived/explicit
                     rng = ApipRng("|".join([
                         "rate-ceiling", indicator.id, indicator.type,
                         indicator.value, policy.version, str(m), str(s_ctx),
                         policy.scope, policy.randomization_bounds_version,
-                        policy.randomization_epoch]))
+                        _epoch]))
                     ceiling, frac_micros = draw_scaled_integer(
                         rng, policy.nominal_rate_ceiling_per_min,
                         policy.rate_ceiling_jitter.lo, policy.rate_ceiling_jitter.hi)
                     rand_records.append({
                         "mechanism": "rate_ceiling",
                         "bounds_version": policy.randomization_bounds_version,
-                        "epoch": policy.randomization_epoch,
+                        "epoch": _epoch,
                         "seed_id": "seed--rate-ceiling--"
                                    + hashlib.sha256("|".join([
                                        indicator.id, indicator.type, indicator.value,
                                        policy.version, str(m), str(s_ctx), policy.scope,
                                        policy.randomization_bounds_version,
-                                       policy.randomization_epoch]).encode()).hexdigest()[:12],
+                                       _epoch]).encode()).hexdigest()[:12],
                         "draw": {"ceiling_fraction_micros": int(frac_micros),
                                  "ceiling_per_min": ceiling},
                     })
@@ -450,6 +591,38 @@ def select_rung(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip: 
             break
 
     return rung, action, reasons, selector, rand_records
+
+
+def _decision_bearing_evidence(indicator: Indicator, registry: SourceRegistry) -> Indicator:
+    """P0-4 (audit): separate the COMPLETE evidence collection from the
+    DECISION-BEARING view, BEFORE dedup/cap/scoring.
+
+    Non-authoritative evidence records (annotation, attribution, and now
+    unregistered — ZERO_WEIGHT_CLASSES) are removed from the decision-bearing
+    view entirely. Their quantity, ordering, duplication, size, and cap
+    interaction must have ZERO impact on the decision computation: before
+    this fix, annotations were retained through dedup and then counted
+    against the docs/23 evidence envelope, so a flood of annotation records
+    could (a) truncate genuine evidence via `evidence_envelope_truncated`
+    and (b) round-trip through the cap to perturb reason codes.
+
+    The returned indicator is re-bound ONLY to decision-bearing records. The
+    caller keeps the original complete collection wherever the full set is
+    still meaningful (e.g. the collector/log), but the decision path never
+    sees it. The docs/23 cap is applied AFTER this strip (in
+    `_bounded_evidence`), so only decision-bearing records ever count against
+    the envelope — a hostile feed cannot use annotation volume to displace
+    weighted evidence.
+    """
+    kept = [
+        ev for ev in indicator.evidence
+        if registry.class_of(ev.source_id) not in ZERO_WEIGHT_CLASSES
+    ]
+    if len(kept) == len(indicator.evidence):
+        return indicator
+    return Indicator(
+        id=indicator.id, type=indicator.type, value=indicator.value,
+        sources=indicator.sources, evidence=tuple(kept), tags=indicator.tags)
 
 
 def _bounded_evidence(indicator: Indicator, policy: Policy) -> tuple[Indicator, int]:
@@ -469,7 +642,7 @@ def _bounded_evidence(indicator: Indicator, policy: Policy) -> tuple[Indicator, 
     return bounded, len(indicator.evidence) - cap
 
 
-def challenge_allowance(policy: Policy) -> int:
+def challenge_allowance(policy: Policy) -> int | None:
     """docs/25 L1 client-impact budget: the number of interactive
     transactions that may be CHALLENGED in the trailing hour.
 
@@ -479,9 +652,15 @@ def challenge_allowance(policy: Policy) -> int:
     (measured_interactive_transactions_per_hour) — never guessed. Fail
     closed:
 
-      - knob unset                    -> unlimited (budget not configured)
+      - knob unset                    -> None (budget not configured)
       - knob set, no measurement      -> 0 (auto-revert every challenge)
       - knob set, measurement present -> floor(fraction * measured)
+
+    v2.3 (audit P0-6): this returns `None` for unconfigured, never a negative
+    sentinel. The old `-1` sentinel collided with a legitimate negative
+    measurement, silently DISABLING the budget; now the states are distinct
+    types (`None` = unconfigured, `>= 0` = configured allowance). The caller
+    distinguishes them, and the CLI rejects negative measurements outright.
 
     Integer fixed-point arithmetic: fraction is scaled by 10^6 and the
     allowance is computed on integers, so the same (fraction, measurement)
@@ -490,7 +669,7 @@ def challenge_allowance(policy: Policy) -> int:
     """
     frac = policy.max_challenged_transaction_fraction_per_hour
     if frac is None:
-        return -1          # sentinel: budget not configured
+        return None        # budget not configured
     measured = policy.measured_interactive_transactions_per_hour
     if measured is None:
         return 0           # fail closed: configured but unmeasured
@@ -511,9 +690,11 @@ def apply_client_impact_budget(pairs: list[tuple[Indicator, Decision]],
     batch content, never of input order. Returns (possibly rewritten pairs,
     alarmed).
 
-    Unconfigured budget (allowance sentinel -1): pairs pass through
-    untouched, no alarm. challenges present with a zero allowance (fail-
-    closed unmeasured) reverts ALL of them.
+    Unconfigured budget (allowance None): pairs pass through untouched, no
+    alarm. challenges present with a zero allowance (fail-closed unmeasured)
+    reverts ALL of them. A configured but negative measurement is impossible
+    here (rejected at policy load and at the CLI), so a negative allowance
+    is no longer used as an implicit "disabled" state.
 
     Batch-scope note: docs/25 states the budget per hour; a live
     deployment would carry the allowance across batches within the hour.
@@ -522,7 +703,7 @@ def apply_client_impact_budget(pairs: list[tuple[Indicator, Decision]],
     allowance — the honest subset a stateless pipeline can guarantee.
     """
     allowance = challenge_allowance(policy)
-    if allowance < 0:
+    if allowance is None:
         return pairs, False
     challenged = [d for _, d in pairs if d.action == "proxy_challenge"]
     overflow = len(challenged) - allowance
@@ -591,15 +772,81 @@ def _make_recency_classifier(policy: Policy):
             t = t.replace(tzinfo=timezone.utc)
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
-        return "fresh" if abs(now - t) <= max_age else "stale"
+        # v2.3 (audit P1-3): freshness is ASYMMETRIC. `abs(now - t)` treated a
+        # heavily future-dated observation as fresh. Now: the observation must
+        # not be older than max_age, and may only lie slightly in the future
+        # (a small explicit clock-skew allowance) — a record stamped hours
+        # ahead is stale, not evidence of the present.
+        future_skew = t - now
+        age = now - t
+        if future_skew > _CLOCK_SKEW:
+            return "stale"
+        return "fresh" if age <= max_age else "stale"
 
     return classify
+
+
+def _server_derived_kinds(indicator: Indicator, policy: Policy,
+                          classifier) -> frozenset[str]:
+    """audit P0-3: derive which control-plane safety facts genuinely hold for
+    this indicator, from APIP's OWN state rather than from any feed assertion.
+
+    Returns the subset of scoring.CONTROL_PLANE_KINDS the server certifies:
+
+      - `recent`            — the recency channel: at least one decision-
+                              bearing evidence record is fresh under the
+                              policy clock.
+      - `bounded_scope`     — the authorization boundary: the target lies
+                              inside the configured authorized prefixes.
+      - `exactness`         — canonical ingest: every value that passed
+                              io._canonicalize is an exact literal, so the
+                              server certifies exactness for any indicator
+                              whose value is a canonical IP/FQDN/CIDR.
+      - `dedicated_use` /
+        `dedicated_use_provenance`
+        /`verified_rollback`— the governed infrastructure registry: the
+                              target value is explicitly listed by the
+                              operator as dedicated infrastructure / rollback-
+                              verified. Empties by default, so these can never
+                              be self-granted by a feed.
+
+    `recent` is derived only from CANONICAL `observed_at` fields the ingest
+    boundary accepted; a future-timestamped record is not fresh (see P1-3,
+    which this shares a clock with). Any control-plane fact NOT derived here
+    is stripped by the scorer (zero contribution + reason code).
+    """
+    derived: set[str] = set()
+    if any(classifier(ev.observed_at) == "fresh" for ev in indicator.evidence):
+        derived.add("recent")
+    if _in_scope(indicator.value, indicator.type, policy):
+        derived.add("bounded_scope")
+    # exactness: canonical ingest boundary — a value is exact when it is a
+    # canonical IP/FQDN/CIDR literal (the io loader guarantees this); a
+    # non-canonical/hostile value was already rejected at ingest. Direct
+    # construction always represents a concrete value, so server-certify it.
+    if indicator.value:
+        derived.add("exactness")
+    value = indicator.value
+    if value in policy.governed_dedicated_use:
+        derived.add("dedicated_use")
+        derived.add("dedicated_use_provenance")
+    if value in policy.governed_verified_rollback:
+        derived.add("verified_rollback")
+    return frozenset(derived)
 
 
 def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | None = None) -> Decision:
     context = context or {}
     client = context.get("client")
     protocol_class = context.get("protocol_class")
+
+    # v2.3 (audit P0-4): separate the DECISION-BEARING view from the complete
+    # collection BEFORE any dedup/cap/score. Non-authoritative records
+    # (annotation/attribution/unregistered) are removed entirely — their
+    # quantity, order, duplication, and size cannot touch the decision or the
+    # evidence envelope. This restores the documented annotation-invariance
+    # invariant that the enum-accounting interaction had broken.
+    indicator = _decision_bearing_evidence(indicator, policy.source_registry)
 
     # v2.2 integrity: collapse duplicate observations BEFORE the envelope
     # cap. Order matters — dedup-then-cap means a flood of duplicated
@@ -614,14 +861,28 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
 
     # docs/23 evidence envelope: bound the records scored per indicator,
     # bounding reason-cardinality and scorer work upstream of any stage.
+    # (Front-cap already applied in _decision_bearing_evidence; this is kept
+    # as a belt-and-suspenders for the standalone `score` path.)
     indicator, ev_dropped = _bounded_evidence(indicator, policy)
 
     # Policy-owned scoring: evidence carries facts, the weight table and
     # source registry carry authority (docs/04 v2.1). Recency runs on the
     # policy clock — pinned to reference_now when set (exact replay).
+    #
+    # audit P0-3: control-plane safety facts are derived server-side, never
+    # trusted from a feed. `recent` and `bounded_scope` come from the recency
+    # channel and the authorization boundary; `exactness` from canonical
+    # ingest (every value loaded through io._canonicalize is canonical);
+    # `dedicated_use` / `verified_rollback` from the governed registry the
+    # operator maintains. A feed asserting any of these for an indicator the
+    # server did NOT derive contributes zero (scoring gates it) — so a
+    # compromised feed cannot raise S toward an auto-deny with fabricated
+    # control-plane facts.
+    classifier = _make_recency_classifier(policy)
+    server_derived_kinds = _server_derived_kinds(indicator, policy, classifier)
     m_total, bm, s_ctx, s_ip, has_dedicated, has_unqualified, reasons = score_parts(
-        indicator, policy.evidence_table, _make_recency_classifier(policy),
-        policy.source_registry)
+        indicator, policy.evidence_table, classifier,
+        policy.source_registry, server_derived_kinds)
     if ev_dropped:
         reasons_base.add(f"evidence_envelope_truncated:{ev_dropped}")
     if reasons_base:
@@ -664,7 +925,7 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
     ttl = 0
     rand_records: list[dict] = []
     selector: ActionSelector | None = None
-    external_qualified, _ = _external_corroboration(indicator, policy.source_registry)
+    external_qualified, _ = _external_corroboration(indicator, policy.source_registry, classifier)
 
     # infrastructure tri-state (docs/25 v2.1): unknown ≠ dedicated. Classification
     # evidence counts only from authoritative (non-annotation) sources — an
@@ -682,6 +943,34 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
         disposition = "OBSERVE"
         rung = "L0"
         action = "observe"
+    elif policy.mode == "EMERGENCY":
+        # P1-7 (audit): EMERGENCY is an operator-invoked profile (README,
+        # docs/01/14/25/26) — it must be an EXPLICIT mode, never a fall-through
+        # that silently degrades to SHADOW. Semantics: every actionable finding
+        # (m >= observe_m) is escalated for explicit human approval — never
+        # auto-enforced, never emulated as shadow — so approval-gated actions
+        # like CONTENT_BLOCK/L5 deny from a tighter posture still need a human.
+        # select_rung yields the concrete action/rung; disposition is forced to
+        # PROPOSE_OPERATOR_APPROVAL and the decision is tagged for the
+        # emergency workqueue so it is prominently distinguishable from normal
+        # automation (docs/20: emergency actions time-limited & distinguishable).
+        if indicator.type == "fqdn" and "*" in indicator.value and not policy.auto_wildcard_domain:
+            action = "dns_nxdomain"
+            rung = "L4"
+            reasons = tuple(sorted(set(reasons) | {"wildcard_requires_approval"}))
+        else:
+            rung, action, ladder_reasons, selector, rand_records = select_rung(
+                indicator, policy, m, s_ctx, s_ip, behavioral_fams,
+                external_qualified, infra_state, has_dedicated,
+                protocol_class=protocol_class, client=client)
+            reasons = tuple(sorted(set(reasons) | set(ladder_reasons)))
+        # A finding too weak for any rung is still OBSERVE; anything else is an
+        # explicit approval-gated emergency action.
+        if rung == "L0":
+            disposition = "OBSERVE"
+        else:
+            disposition = "PROPOSE_OPERATOR_APPROVAL"
+            reasons = tuple(sorted(set(reasons) | {"emergency_mode"}))
     else:
         if indicator.type == "fqdn" and "*" in indicator.value and not policy.auto_wildcard_domain:
             action = "dns_nxdomain"
@@ -724,23 +1013,20 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
         # + policy draws differently across epochs; replay within an epoch is
         # exact. Fixed-point arithmetic on integer microseconds of the draw.
         #
-        # Adversarial-audit note (docs/29 TM-020 reconciliation): the seed is
-        # derived from the decision id + bounds version + epoch, all of which
-        # appear in the decision record — so ANYONE holding one decision can
-        # reproduce its draw. This is deliberate: replay/audit requires it,
-        # and docs/29's security claim never rested on seed secrecy. It rests
-        # on (a) draws confined to policy bounds — knowing the seed yields no
-        # out-of-bounds value, and (b) the epoch component, which makes
-        # prediction of the NEXT epoch's draws require predicting operator
-        # epoch rotation. Do not "harden" this by hiding the seed; that would
-        # break auditability without adding security.
-        rng = ApipRng(f"{did}|{policy.randomization_bounds_version}|{policy.randomization_epoch}")
+        # P1-10 (audit): use the EFFECTIVE epoch (derived/explicit) AND a
+        # mechanism discriminator, and compute seed_id from the ACTUAL seed
+        # material — previously seed_id was derived only from the decision id
+        # tail, so it was identical across epochs even though the draw changed,
+        # breaking receipts/reconciliation of exact action instances.
+        _epoch = _current_epoch(policy)
+        _ttl_seed = "|".join(["ttl-jitter", did, policy.randomization_bounds_version, _epoch])
+        rng = ApipRng(_ttl_seed)
         ttl, frac_micros = draw_ttl_jitter(rng, ttl, policy.ttl_jitter.lo, policy.ttl_jitter.hi)
         rand_records.append({
             "mechanism": "ttl_jitter",
             "bounds_version": policy.randomization_bounds_version,
-            "epoch": policy.randomization_epoch,
-            "seed_id": f"seed--{did.split('--')[-1]}",
+            "epoch": _epoch,
+            "seed_id": "seed--" + hashlib.sha256(_ttl_seed.encode()).hexdigest()[:16],
             "draw": {"ttl_fraction_micros": int(frac_micros), "ttl_seconds": ttl},
         })
         explanation += f" ttl_jitter={frac_micros / 1_000_000:.3f}."
@@ -751,6 +1037,18 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
     randomization_record = rand_records[0] if len(rand_records) == 1 else (rand_records or None)
     if isinstance(randomization_record, list):
         randomization_record = list(randomization_record)
+
+    # P1-10 (audit): the action-instance content hash over the exact
+    # parameterized output. Distinct logical decisions (different M/S/rung)
+    # hash differently; the SAME logical decision across epochs hashes
+    # differently when its drawn TTL/ceiling differs — so receipts never
+    # conflate two emitted action instances.
+    content_hash = _content_hash(
+        disposition, action, rung, ttl,
+        selector.to_dict() if selector is not None else None,
+        randomization_record,
+        policy.version,
+    ) if disposition in {"AUTO_ENFORCE", "SHADOW_ACTION", "PROPOSE_OPERATOR_APPROVAL", "OBSERVE"} else ""
 
     return Decision(
         id=did,
@@ -768,4 +1066,5 @@ def evaluate(indicator: Indicator, policy: Policy, context: dict[str, Any] | Non
         selector=selector,
         nominal_ttl_seconds=nominal_ttl,
         randomization=randomization_record,
+        content_hash=content_hash,
     )

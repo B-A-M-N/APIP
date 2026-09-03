@@ -68,6 +68,12 @@ POL = Policy(
                  "L4": RungFloor(95, 90), "L5": RungFloor(98, 95)},
     source_registry=REG,
     classify_recency=_pinned_classifier(),
+    # audit P0-3: control-plane facts are server-certified. Fixtures here
+    # carry verified_rollback on test targets declared governed infra.
+    governed_dedicated_use=("198.51.100.44",),
+    governed_verified_rollback=tuple(
+        ["198.51.100.44"] + [f"c{k}.invalid" for k in range(8)]
+    ),
 )
 
 CTX = {"client": "h1", "protocol_class": "interactive_http"}
@@ -164,18 +170,32 @@ class Finding2SelfAssertedCorroborationTests(unittest.TestCase):
                             for r in d.reason_codes))
 
     def test_verified_corroboration_retains_weight(self):
-        # two genuinely distinct upstreams reporting -> claim verifies
+        # two genuinely distinct upstreams reporting the target MALICIOUS ->
+        # the two_curated_sources claim verifies (audit P1-5: corroboration
+        # rests on fresh MALICIOUSNESS ASSERTIONS, not structural metadata —
+        # so both upstreams must actually assert malice).
         e = (ev("two_curated_sources", "curated-a"),
+             ev("curated_source", "curated-a"),
              ev("curated_source", "curated-b"),
              ev("dedicated_use", "curated-a"),
-             ev("exact_ip", "curated-a"),
-             ev("recent", "curated-a"),
-             ev("verified_rollback", "curated-a"),
-             ev("bounded_scope", "curated-a"))
+             ev("exact_ip", "curated-a"))
         d = evaluate(Indicator("duo", "ipv4", "198.51.100.44",
                                ("curated-a", "curated-b"), e), POL, CTX)
         self.assertFalse(any(r.startswith("corroboration_claim_unverified")
                              for r in d.reason_codes))
+
+    def test_structural_metadata_does_not_corroborate(self):
+        # audit P1-5: a second source that merely OBSERVES the target
+        # (recent / exact_* / exactness) is NOT corroborating a maliciousness
+        # claim. Only curated-a asserts malice; curated-b adds only metadata.
+        e = (ev("two_curated_sources", "curated-a"),
+             ev("curated_source", "curated-a"),
+             ev("recent", "curated-b"),
+             ev("exact_ip", "curated-b"))
+        d = evaluate(Indicator("partial", "ipv4", "198.51.100.44",
+                               ("curated-a", "curated-b"), e), POL, CTX)
+        self.assertTrue(any(r.startswith("corroboration_claim_unverified")
+                            for r in d.reason_codes))
 
     def test_reseller_chain_counts_once_for_claims(self):
         # three resellers of one upstream cannot jointly verify a claim
@@ -249,13 +269,14 @@ class Finding4SchemaConformanceTests(unittest.TestCase):
     """Shipped decisions failed their own schema (6/6 INVALID)."""
 
     def test_generated_decisions_conform(self):
-        # re-asserted through the dependency-free conformance validator
-        from tests.test_schema_conformance import validate, _SchemaError
+        # re-asserted through the dependency-free conformance validator.
+        # audit P1-39: generate the fixtures ourselves (TemporaryDirectory),
+        # never read the gitignored examples/generated — so a clean checkout
+        # still passes without any pre-existing local artifacts.
+        from tests.test_schema_conformance import validate, generate_artifacts
         schema = json.loads((Path(__file__).resolve().parent.parent.parent
                              / "schemas" / "decision.schema.json").read_text())
-        decisions = json.loads((Path(__file__).resolve().parent.parent.parent
-                                / "examples" / "generated" /
-                                "decisions.json").read_text())
+        decisions = json.loads(generate_artifacts()["decisions.json"])
         for d in decisions:
             validate(d, schema, schema)   # raises on drift
 
@@ -527,9 +548,10 @@ class ClientImpactBudgetTests(unittest.TestCase):
         # unmeasured but configured -> fail CLOSED to zero
         self.assertEqual(
             challenge_allowance(self._policy(measured_interactive_transactions_per_hour=None)), 0)
-        # unconfigured -> sentinel -1 (budget not in force)
-        self.assertEqual(
-            challenge_allowance(self._policy(max_challenged_transaction_fraction_per_hour=None)), -1)
+        # unconfigured -> None (P0-6: no negative sentinel; a negative value
+        # used to overload -1 and silently disable the budget)
+        self.assertIsNone(
+            challenge_allowance(self._policy(max_challenged_transaction_fraction_per_hour=None)))
 
     def test_within_allowance_no_reversion(self):
         from apip.policy import apply_client_impact_budget
@@ -600,7 +622,15 @@ class ClientImpactBudgetTests(unittest.TestCase):
 
     def test_non_challenge_actions_never_counted(self):
         from apip.policy import apply_client_impact_budget
-        pol = self._policy(measured_interactive_transactions_per_hour=1)  # allowance 0
+        # v2.3 (audit P0-3): the challenge target and the L4 deny target are
+        # both declared governed infra so their verified_rollback is server-
+        # derived (a feed may not assert it). The shared POL governs the
+        # generic c{k}.invalid challenge space; this test's named targets
+        # are covered here.
+        pol = self._policy(measured_interactive_transactions_per_hour=1,  # allowance 0
+                           governed_verified_rollback=(
+                               *POL.governed_verified_rollback,
+                               "ch.invalid", "l4.invalid"))
         # one challenge + one L4-class stack (dns_nxdomain, not a challenge):
         # M=100, S_ctx=90 clears the L4 floor (95/90) exactly
         l4_stack = (
@@ -626,6 +656,29 @@ class ClientImpactBudgetTests(unittest.TestCase):
         self.assertEqual(final["ch"].action, "observe")
         # ...but the L4 domain block was untouched — it is not a challenge
         self.assertEqual(final["l4"].action, "dns_nxdomain")
+
+    def test_cli_rejects_negative_measurement(self):
+        """P0-6 (audit): `--transactions-per-hour -1` must be REJECTED at the
+        CLI entry point, not silently disable the L1 budget by colliding with
+        the old -1 "unconfigured" sentinel."""
+        import sys as _sys
+        from apip import cli as apip_cli
+        with TemporaryDirectory() as td:
+            inds_path = Path(td) / "i.json"
+            inds_path.write_text("[]")
+            policy_path = (Path(__file__).resolve().parent.parent.parent
+                           / "examples" / "policy.toml")
+            out_dir = Path(td) / "out"
+            argv = ["evaluate", str(inds_path), "--policy", str(policy_path),
+                    "--out", str(out_dir), "--transactions-per-hour", "-1"]
+            saved = _sys.argv
+            try:
+                _sys.argv = ["apip.cli"] + argv
+                code = apip_cli.main()
+            finally:
+                _sys.argv = saved
+            # the CLI catches ValueError -> exit code 2, budget never applied
+            self.assertEqual(code, 2)
 
     def test_cli_end_to_end_flag_overrides_and_reverts(self):
         """End-to-end through cmd_evaluate: a challenge-heavy batch under a
@@ -655,10 +708,40 @@ class ClientImpactBudgetTests(unittest.TestCase):
                       "observed_at": "2026-09-01T20:00:00Z"},
                  ]} for k in range(3)]))
             out_dir = Path(td) / "out"
-            policy_path = (Path(__file__).resolve().parent.parent.parent
-                           / "examples" / "policy.toml")
+            shipped = Path(__file__).resolve().parent.parent.parent \
+                / "examples" / "policy.toml"
+            # v2.3 (audit P0-3): the shipped example governs its OWN demo
+            # infrastructure, not this test's c{k}.invalid challenge targets.
+            # Derive a test policy from it so the values carry server-certified
+            # verified_rollback — a feed may not assert that fact itself. Strip
+            # any prior [governed] table (TOML forbids duplicates), then prepend
+            # a combined one covering the example infra + this test's targets.
+            import re as _re_gov
+            policy_path = Path(td) / "policy.toml"
+            toml = shipped.read_text()
+            # A TOML `[governed]` table must NOT precede the top-level scalars
+            # (every later bare `key = value` would become a governed field).
+            # Strip any existing [governed] section and APPEND a combined one
+            # at the end, so the top-level keys stay top-level.
+            toml, _ = _re_gov.subn(
+                r"(?ms)^\[governed\].*?(?=^\[[A-Za-z_])", "", toml)
+            gov = ("[governed]\n"
+                   "dedicated_use = [\n"
+                   '  "198.51.100.44",\n'
+                   "]\n"
+                   "verified_rollback = [\n"
+                   '  "198.51.100.44",\n'
+                   '  "c2-demo.invalid",\n'
+                   '  "c2-on-cdn-demo.invalid",\n'
+                   '  "c0.invalid",\n'
+                   '  "c1.invalid",\n'
+                   '  "c2.invalid",\n'
+                   "]\n")
+            toml = toml.rstrip("\n") + "\n\n" + gov + "\n"
+            policy_path.write_text(toml)
             argv = ["evaluate", str(inds_path), "--policy", str(policy_path),
-                    "--out", str(out_dir), "--transactions-per-hour", "40"]
+                    "--out", str(out_dir), "--transactions-per-hour", "40",
+                    "--demo-trust-fixture"]
             saved = _sys.argv
             try:
                 _sys.argv = ["apip.cli"] + argv

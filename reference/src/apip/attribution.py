@@ -34,23 +34,55 @@ ATTRIBUTION_SOURCE_CLASS = "attribution"
 _DEV_FALLBACK_KEY = "apip-reference-dev-key-do-not-use-in-production"
 _KEY_ENV = "APIP_DEPLOYMENT_KEY"
 _KEY_FILE_ENV = "APIP_DEPLOYMENT_KEY_FILE"
+# audit P1-16: an explicit deployment key must carry at least 256 bits of
+# key material to be a "real capture" privacy control. Below this the
+# configured key is treated as invalid and the load FAILS CLOSED (it never
+# silently degrades to the public dev fallback).
+_MIN_KEY_BYTES = 32
+
+
+class DeploymentKeyError(RuntimeError):
+    """An explicitly-configured deployment key was empty, unreadable, or
+    below the 256-bit entropy bar. Fail closed: never silently fall back to
+    the public development key when a privacy control was requested."""
 
 
 def _load_deployment_key() -> tuple[bytes, str]:
-    """Returns (key_bytes, provenance_tag). Never raises: scaffold degrades
-    to the marked development key rather than crashing an offline pipeline."""
+    """Returns (key_bytes, provenance_tag) with three explicit modes (P1-16):
+
+      1. explicit key < 256 bits / empty / unreadable-file  -> raise
+         `DeploymentKeyError` (fail closed; a configured privacy control
+         must not silently disappear);
+      2. valid explicit key anyway (env or file)            -> ("env"|"file");
+      3. NOTHING configured (scaffold/demo)                 -> public dev key,
+         provenance "dev-fallback" (surfaced in every report so it can never
+         be mistaken for protection).
+    """
     env = os.environ.get(_KEY_ENV)
-    if env:
+    if env is not None:
+        if len(env.encode("utf-8")) < _MIN_KEY_BYTES:
+            raise DeploymentKeyError(
+                "APIP_DEPLOYMENT_KEY is shorter than 256 bits of key material; "
+                "refusing to key the deployment (fail closed)")
         return (env.encode("utf-8"), "env")
     path = os.environ.get(_KEY_FILE_ENV)
     if path:
         try:
             with open(path, "rb") as f:
                 data = f.read().strip()
-            if data:
-                return (data, "file")
-        except OSError:
-            pass
+        except OSError as e:
+            raise DeploymentKeyError(
+                f"APIP_DEPLOYMENT_KEY_FILE configured but unreadable: {e}") from e
+        if not data:
+            raise DeploymentKeyError(
+                "APIP_DEPLOYMENT_KEY_FILE configured but empty; refusing to "
+                "silently fall back to the dev key")
+        if len(data) < _MIN_KEY_BYTES:
+            raise DeploymentKeyError(
+                "APIP_DEPLOYMENT_KEY_FILE holds fewer than 256 bits of key "
+                "material; refusing to key the deployment (fail closed)")
+        return (data, "file")
+    # nothing configured: the offline scaffold/demo context only
     return (_DEV_FALLBACK_KEY.encode("utf-8"), "dev-fallback")
 
 
@@ -155,10 +187,26 @@ _TX_ENUMS = {
 _TX_STRING_FIELDS = {"client_ref", "observed_at", "session_epoch",
                      "accept_language", "accept_encoding", "tls_ja4"}
 _TX_LIST_FIELDS = {"header_order", "challenge_body_key_order"}
+# P1-19 (audit): the runtime validator must be authoritative and at least as
+# restrictive as the schema — type, max bytes, and a sane charset for every
+# string field, not just client_ref/observed_at. `tls_ja4 = 12345` (an int)
+# and a megabyte language string must be REJECTED.
+_TX_STRING_MAXLEN = {
+    "client_ref": 128,
+    "observed_at": 64,
+    "session_epoch": 64,
+    "accept_language": 256,
+    "accept_encoding": 256,
+    "tls_ja4": 128,
+}
 
 # ISO-8601 UTC shape enforced structurally: YYYY-MM-DDTHH:MM:SS(.ffffff)?Z
 import re as _re
 _ISO_UTC = _re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
+# P1-19 charset guard: any non-control Unicode. Excludes NUL (0x00), C0/C1
+# control chars, and advisory separators — raw control spans a hostile
+# shipper could use to smuggle framing into a feature vector.
+_TX_NON_CONTROL = _re.compile(r"^[^\x00-\x1f\x7f-\x9f]*$")
 
 
 class TransactionRejected(ValueError):
@@ -177,9 +225,22 @@ def validate_transaction(tx: dict) -> None:
     if unknown:
         raise TransactionRejected(f"unknown fields: {sorted(unknown)}")
     for f in ("client_ref", "observed_at"):
-        v = tx.get(f)
-        if not isinstance(v, str) or not (1 <= len(v) <= 128):
-            raise TransactionRejected(f"{f} must be a 1..128 char string")
+        if f not in tx:
+            raise TransactionRejected(f"missing required field: {f}")
+
+    # P1-19: validate every present string field — type, max length, and
+    # non-control charset — matching (and keeping pace with) the JSON schema.
+    for f in _TX_STRING_FIELDS:
+        if f not in tx:
+            continue
+        v = tx[f]
+        if not isinstance(v, str):
+            raise TransactionRejected(f"{f} must be a string, got {type(v).__name__}")
+        maxlen = _TX_STRING_MAXLEN.get(f, 64)
+        if not (1 <= len(v) <= maxlen):
+            raise TransactionRejected(f"{f} must be 1..{maxlen} chars")
+        if not _TX_NON_CONTROL.match(v):
+            raise TransactionRejected(f"{f} contains control characters")
     if not _ISO_UTC.match(tx["observed_at"]):
         raise TransactionRejected(
             "observed_at must be ISO-8601 UTC (YYYY-MM-DDTHH:MM:SS[.ffffff]Z); "
@@ -245,12 +306,41 @@ def extract_features(tx: dict) -> dict[str, str]:
     return feats
 
 
+def _parse_instant(iso: str) -> tuple[int, int]:
+    """Deterministic parse of an ISO-8601 UTC instant to (micros, frac-digits).
+
+    Returns a sortable tuple so `max`/ordering across records is robust to
+    out-of-order replay. Unparseable -> (0, 0) (never newer than a real
+    instant; the parser rejects nothing here so the store can still compare).
+    """
+    if not isinstance(iso, str) or not iso:
+        return (0, 0)
+    s = iso[:-1] if iso.endswith("Z") else iso
+    s = s.replace("+00:00", "").replace("-00:00", "").replace("Z", "")
+    base, _, frac = s.partition(".")
+    try:
+        import datetime as _dt
+        dt = _dt.datetime.fromisoformat(base)
+    except ValueError:
+        return (0, 0)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    micros = int((frac or "")[:6].ljust(6, "0")) if frac else 0
+    micros += int(dt.timestamp() * 1_000_000) % 1_000_000
+    ts = int(dt.timestamp())
+    return (ts, micros)
+
+
 @dataclass
 class _RequesterState:
     handle: str
     features: dict[str, str] = field(default_factory=dict)
     transactions: int = 0
     last_seen: str = ""
+    # P1-18 (audit): per-feature revision instant so out-of-order replay cannot
+    # move `last_seen` backwards or let an older record overwrite a newer
+    # observation. key -> canonical observed_at that supplied the current value.
+    _rev: dict[str, str] = field(default_factory=dict)
 
 
 class CorrelationStore:
@@ -277,15 +367,46 @@ class CorrelationStore:
         import threading as _threading
         self._lock = _threading.RLock()
 
+    # -- ingestion (two EXPLICIT identity modes, P1-14) ---------------------
+    # Offline/adapter records carry the RAW boundary identity in `client_ref`
+    # and are keyed by a single HMAC. Live-capture records already carry a
+    # pseudonymous requester_handle; using `observe()` on those would HMAC the
+    # HMAC (the audit finding). The caller MUST choose the mode that matches
+    # what the record holds — never inferred from an `rh--` prefix, which
+    # attacker-controlled input can spoof.
+
     def observe(self, tx: dict) -> dict[str, str] | None:
-        """Fold one observed transaction into the requester's feature vector.
-        Returns the derived fingerprint when the vector is non-empty.
-        Contract-violating records are rejected (never coerced)."""
+        """Fold a record whose `client_ref` is the RAW client identity
+        (offline/adapter ingestion). The handle is derived ONCE via
+        `handle_for`. See also `observe_pseudonymous_handle`."""
         validate_transaction(tx)
+        return self._fold(handle_for(str(tx.get("client_ref", ""))), tx)
+
+    def observe_pseudonymous_handle(self, tx: dict,
+                                    requester_handle: str | None = None
+                                    ) -> dict[str, str] | None:
+        """Fold a record whose identity is ALREADY a pseudonymous requester
+        handle (live capture). `requester_handle` must be supplied, or the
+        record must carry `client_ref` as the already-derived handle. No
+        second HMAC is applied — the audit P1-14 double-hash must not recur.
+        """
+        validate_transaction(tx)
+        handle = requester_handle if requester_handle is not None else tx.get("client_ref")
+        if not isinstance(handle, str) or not handle:
+            return None
+        return self._fold(handle, tx)
+
+    def _fold(self, handle: str, tx: dict) -> dict[str, str] | None:
+        """Deterministic, order-invariant merge (P1-18) of one observation
+        into a requester's feature vector, under the store lock. An older
+        record can never move `last_seen` backwards nor overwrite a feature a
+        newer record supplied; equal-instants keep the first-seen value.
+        """
         feats = extract_features(tx)
         if not feats:
             return None
-        handle = handle_for(str(tx.get("client_ref", "")))
+        inst = _parse_instant(str(tx.get("observed_at", "")))
+        last_seen_iso = tx.get("observed_at", "")
         with self._lock:
             state = self._by_handle.get(handle)
             if state is None:
@@ -295,17 +416,26 @@ class CorrelationStore:
                     return None
                 state = _RequesterState(handle=handle)
                 self._by_handle[handle] = state
-            state.features.update(feats)
             state.transactions += 1
-            state.last_seen = str(tx.get("observed_at", state.last_seen))
+            # last_seen = max(last_seen, incoming) by parsed instant: an older
+            # record arriving late cannot drag expiry backwards.
+            if state.last_seen:
+                if inst > _parse_instant(state.last_seen):
+                    state.last_seen = last_seen_iso
+            else:
+                state.last_seen = last_seen_iso
+            # features: latest-by-parsed-time wins per key; equal instant keeps
+            # the first-seen value (arrival-stable for a single ordered log).
+            for k, v in feats.items():
+                prev_rev = state._rev.get(k)
+                if prev_rev is None:
+                    state._rev[k] = last_seen_iso
+                    state.features[k] = v
+                elif inst > _parse_instant(prev_rev):
+                    state._rev[k] = last_seen_iso
+                    state.features[k] = v
+                # equal or older: keep the existing (first-seen / newer) value
             return fingerprint(state.features)
-
-    def _evict_oldest(self) -> None:
-        if not self._by_handle:
-            return
-        oldest = min(self._by_handle.values(),
-                     key=lambda s: (s.last_seen, s.handle))
-        del self._by_handle[oldest.handle]
 
     def prune_expired(self, now_iso: str, ttl_seconds: int) -> int:
         """TTL eviction, deterministic on (now, last_seen, handle).
@@ -338,6 +468,13 @@ class CorrelationStore:
                 del self._by_handle[h]
         return len(expired)
 
+    def _snapshot(self) -> list[_RequesterState]:
+        """Ordered, stable snapshot of all tracked requesters, taken under the
+        lock (P1-17). Expensive report structures are built from this outside
+        the lock; read paths and `observe()`/`prune` never race on the dict."""
+        with self._lock:
+            return sorted(self._by_handle.values(), key=lambda s: s.handle)
+
     def report(self, min_similarity: int = 3) -> dict:
         """Campaign-correlation report — the analyst worklist (docs/30).
 
@@ -345,13 +482,19 @@ class CorrelationStore:
         feature vectors share >= min_similarity probes (deterministic subset
         count, display-only). This structure IS the file-form of the operator
         UI view; rendering it is presentation, not analysis.
+
+        v2.3 (audit P1-17): reads a stable snapshot under the lock instead of
+        iterating the live dict, so the report can't tear under concurrent
+        handler-thread folds.
         """
+        states = self._snapshot()
         groups: dict[str, list[str]] = {}
-        for s in self._by_handle.values():
-            groups.setdefault(fingerprint(s.features), []).append(s.handle)
-        fps = list(groups)
-        feats_by_fp = {fingerprint(s.features): s.features
-                       for s in self._by_handle.values()}
+        feats_by_fp: dict[str, dict[str, str]] = {}
+        for s in states:
+            fp = fingerprint(s.features)
+            groups.setdefault(fp, []).append(s.handle)
+            feats_by_fp[fp] = s.features
+        fps = sorted(groups)
         links = []
         for i in range(len(fps)):
             for j in range(i + 1, len(fps)):
@@ -373,23 +516,28 @@ class CorrelationStore:
             "schema_version": self.SCHEMA_VERSION,
             "degraded": self.degraded,
             "handle_keying": deployment_key_provenance(),
-            "tracked_requesters": len(self._by_handle),
+            "tracked_requesters": len(states),
             "fingerprint_groups": [
-                {"fingerprint": fp, "requester_handles": sorted(handles),
-                 "probe_count": len(next(s.features for s in self._by_handle.values()
-                                         if fingerprint(s.features) == fp))}
-                for fp, handles in sorted(groups.items())
+                {"fingerprint": fp, "requester_handles": sorted(groups[fp]),
+                 "probe_count": len(feats_by_fp[fp])}
+                for fp in fps
             ],
             "cross_fingerprint_links": sorted(
                 links, key=lambda l: (l["a"], l["b"])),
         }
 
     def attribution_refs_for(self, client_ref: str) -> tuple[str, ...]:
-        """Display-only refs to attach to decisions/indicators (docs/30).
-        These never enter scoring; tests enforce decisions are byte-identical
-        with and without them."""
-        handle = handle_for(client_ref)
-        s = self._by_handle.get(handle)
-        if s is None:
-            return ()
-        return (fingerprint(s.features),)
+        """Display-only refs keyed by RAW client identity (offline) — derives
+        the handle ONCE from `handle_for`. Reads a stable snapshot under the
+        lock (P1-17). These never enter scoring; tests enforce decisions are
+        byte-identical with and without them."""
+        return self.attribution_refs_for_handle(handle_for(client_ref))
+
+    def attribution_refs_for_handle(self, requester_handle: str) -> tuple[str, ...]:
+        """Display-only refs keyed by an ALREADY-derived requester handle
+        (live capture). No second HMAC (P1-14). Reads a stable snapshot under
+        the lock."""
+        for s in self._snapshot():
+            if s.handle == requester_handle:
+                return (fingerprint(s.features),)
+        return ()

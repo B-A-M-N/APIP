@@ -12,7 +12,9 @@ The core value proposition is **one strategically placed deployment protecting m
 
 APIP is not a hack-back system. It does not compromise, disrupt, scan, or manipulate third-party systems. It never assumes that an IP address or domain believed to be malicious is owned by an attacker; compromised third-party infrastructure is common. Enforcement is limited to traffic traversing infrastructure that the deploying organization is authorized to control.
 
-The reference implementation in `reference/` is deliberately **offline and dry-run only**. It evaluates sample indicators and emits candidate RPZ and Suricata artifacts to files. It does not modify host firewall state, DNS servers, BGP sessions, cloud accounts, or third-party systems.
+The reference implementation in `reference/` is deliberately **offline and dry-run** for evaluation and enforcement compilation: it evaluates sample indicators and emits candidate RPZ and Suricata artifacts to files. It does not modify host firewall state, DNS servers, BGP sessions, cloud accounts, or third-party systems, and it never makes an outbound network connection.
+
+The one exception is the attribution lab (`lab/` and `apip.cli capture serve`): an **optional loopback-only HTTP observation socket** (`127.0.0.1`/`::1` bind enforced) harvests behavioral fingerprints from local synthetic HTTP — an inbound test channel, not outbound network and not an actuator.
 
 ## Try the lab
 

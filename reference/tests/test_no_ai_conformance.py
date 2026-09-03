@@ -17,10 +17,39 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "apip"
 # Security-bearing modules: every module that participates in scoring, gating,
 # rung selection, artifact compilation, or attribution derivation must stay
 # dependency-free.
-SECURITY_BEARING = {
-    "models", "registry", "scoring", "policy", "randomize",
-    "config", "io", "exporters", "attribution",
+# The strict dependency-free decision/compile path. Every module here must
+# import nothing outside STDLIB_ALLOWLIST — this is the surface that turns
+# evidence into decisions/rules/receipts and must be a deterministic, closed
+# computation (audit P1-41: behavioral + sanitize were previously omitted).
+STRICT_DEPENDENCY_FREE_PREFIXES = {
+    "models", "registry", "scoring", "policy", "randomize", "config", "io",
+    "sanitize", "behavioral", "exporters", "attribution",
 }
+
+# The loopback LIVE-CAPTURE challenge channel (apip/live/*). This is a test
+# harness that MUST be deterministic and AI-free (covered by the global AI ban,
+# inference-shape, and no-`random` tests) but legitimately uses http.server +
+# sockets on loopback — it is a unit-testable channel, not an API (audit
+# P1-31). It is therefore held to determinism/AI-freedom, not to the strict
+# dependency-free allowlist.
+LIVE_CAPTURE_PREFIXES = ("live", "live.adapters", "live.server")
+
+# audit P1-41: keys on *relative package path* prefix rather than bare filename
+# stems, because cli.py/uireport.py share the tree and several live/exporters
+# modules share stems with top-level ones.
+def _is_strict_dependency_free(rel_module: str) -> bool:
+    return any(rel_module == p or rel_module.startswith(p + ".")
+               for p in STRICT_DEPENDENCY_FREE_PREFIXES)
+
+def _is_live_capture(rel_module: str) -> bool:
+    return any(rel_module == p or rel_module.startswith(p + ".")
+               for p in LIVE_CAPTURE_PREFIXES)
+
+def _is_security_bearing(rel_module: str) -> bool:
+    """Any module that participates in the decision/compile path or the live
+    capture channel. (Both are security-relevant; they differ only in whether
+    they may touch network stdlib.)"""
+    return _is_strict_dependency_free(rel_module) or _is_live_capture(rel_module)
 
 # Deterministic standard-library allowlist for security-bearing modules.
 # Anything outside this set (socket, http, subprocess, ctypes, ...) is a
@@ -60,10 +89,16 @@ def _py_files():
 
 
 def _module_name(path: Path) -> str:
+    """Dotted package path of a module relative to the apip package, e.g.
+    'models', 'exporters.suricata', 'live.server'. `__init__.py` maps to its
+    enclosing package. Matches against SECURITY_BEARING_PREFIXES by prefix."""
     rel = path.relative_to(SRC)
-    if rel.name == "__init__.py":
-        return rel.parent.name
-    return rel.stem
+    parts = list(rel.parts)
+    if parts[-1] == "__init__.py":
+        parts.pop()
+    else:
+        parts[-1] = parts[-1][:-3]   # strip ".py"
+    return ".".join(parts) if parts else ""
 
 
 def _tree(path: Path):
@@ -84,9 +119,11 @@ class DependencyAllowlistTests(unittest.TestCase):
     """WP-27: dependency allowlist review, enforced per module."""
 
     def test_security_bearing_modules_are_dependency_free(self):
+        # Strictly the decision/compile path — NOT live capture, which
+        # legitimately needs http.server for the loopback test channel.
         for path in _py_files():
             mod = _module_name(path)
-            if mod not in SECURITY_BEARING:
+            if not _is_strict_dependency_free(mod):
                 continue
             for imp in _imports(_tree(path)):
                 if imp == "apip":
@@ -95,6 +132,26 @@ class DependencyAllowlistTests(unittest.TestCase):
                     imp, STDLIB_ALLOWLIST,
                     f"{path.relative_to(SRC.parent)} imports '{imp}' — "
                     f"outside the deterministic stdlib allowlist")
+
+    def test_live_capture_is_loopback_only(self):
+        # audit P1-41/P1-31: the live capture channel may use http.server/
+        # sockets ONLY as the bounded loopback challenge origin — it must not
+        # pull in arbitrary networking (urllib, xmlrpc, ftplib, smtplib, ...).
+        bounded_net = {"http", "socketserver", "time"}
+        for path in SRC.rglob("live/*.py"):
+            if path.name == "__init__.py":
+                continue
+            for imp in _imports(_tree(path)):
+                if imp == "apip":
+                    continue
+                if imp in bounded_net:
+                    continue
+                # everything else must be the deterministic allowlist + the
+                # thread/io primitives the capture channel legitimately uses
+                self.assertIn(
+                    imp, STDLIB_ALLOWLIST | {"socket"},
+                    f"{path.relative_to(SRC.parent)} imports '{imp}' — "
+                    f"not a bounded loopback-capture primitive")
 
     def test_no_ai_package_imported_anywhere(self):
         for path in _py_files():
@@ -108,6 +165,47 @@ class DependencyAllowlistTests(unittest.TestCase):
         text = (SRC.parent.parent / "pyproject.toml").read_text(encoding="utf-8")
         self.assertNotIn("dependencies =", text)
         self.assertNotRegex(text, r"^dependencies\s*=", re.MULTILINE)
+
+
+class SecurityBearingCoverageTests(unittest.TestCase):
+    """audit P1-41: the no-AI dependency restriction must APPLY to every
+    security-bearing package path. This test pins the coverage itself, so a
+    future module that participates in scoring/gating/compilation/attribution
+    but was left out of SECURITY_BEARING_PREFIXES fails loudly instead of
+    silently escaping the dependency-free check."""
+
+    def test_named_security_areas_are_in_scope(self):
+        # The modules the audit explicitly called out as previously omitted.
+        for dotted in ("behavioral", "sanitize", "exporters.rpz",
+                       "exporters.suricata", "live", "live.adapters",
+                       "live.server", "models", "scoring", "policy",
+                       "randomize", "config", "io", "attribution", "registry"):
+            self.assertTrue(
+                _is_security_bearing(dotted),
+                f"{dotted} is security-bearing but not matched by "
+                f"SECURITY_BEARING_PREFIXES — the dependency-free invariant "
+                f"would NOT apply to it (audit P1-41)")
+
+    def test_every_existing_py_module_is_declared_in_or_out(self):
+        # Every actual module must be either security-bearing or explicitly an
+        # output/CLI helper (which the global AI ban + call-shape tests still
+        # cover). This prevents an unrecognized path from slipping through.
+        # The package-root __init__.py (empty dotted path) is only the version
+        # marker and carries no decision/compile code, so it is exempt.
+        explicitly_non_bearing = {"cli", "uireport"}
+        for path in _py_files():
+            dotted = _module_name(path)
+            if dotted == "":      # package-root __init__.py (version marker)
+                continue
+            in_scope = _is_security_bearing(dotted)
+            if in_scope:
+                continue
+            self.assertIn(
+                dotted, explicitly_non_bearing,
+                f"{path.relative_to(SRC.parent)} ({dotted!r}) is neither "
+                f"security-bearing nor an explicit output/CLI helper — its "
+                f"dependency freedom is not enforced by any allowlist test "
+                f"(audit P1-41)")
 
 
 class InferenceCallShapeTests(unittest.TestCase):

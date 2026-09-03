@@ -137,7 +137,7 @@ Introduce only when needed:
 - receipt_id
 - bundle/decision IDs
 - adapter/edge ID
-- prepared/applied/verified/reverted/expired status
+- prepared/applied/verified/revoked/expired status
 - target revision
 - artifact hash
 - timestamp

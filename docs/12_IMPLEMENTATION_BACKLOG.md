@@ -247,7 +247,7 @@ Implement `docs/27`:
 
 Implement `docs/29`:
 
-- CSPRNG abstraction (all draws through it; no scattered `random`);
+- deterministic DRBG abstraction (all draws through it; no scattered `random`);
 - seeded draw recording in decisions (mechanism, bounds version, seed, context, values);
 - mechanisms: challenge sampling, ceiling draw, TTL/renewal jitter, shadow sampling, threshold dither, window placement;
 - bounds enforcement downstream of the draw (out-of-bounds impossible to act on);

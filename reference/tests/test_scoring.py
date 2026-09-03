@@ -49,7 +49,27 @@ class ScoringAuthorityTests(unittest.TestCase):
     def test_dedicated_use_detected(self):
         i = ind([ev("dedicated_use")])
         _, _, _, has_ded, _, _ = score(i, EvidenceTable(DEFAULT_WEIGHTS), recency, REG)
-        self.assertTrue(has_ded)
+        self.assertFalse(has_ded)  # audit P0-3: not server-certified -> no dedicated flag
+
+    def test_dedicated_use_requires_server_certification(self):
+        # P0-3: a feed assertion of dedicated_use contributes nothing unless
+        # the server derived it (governed infrastructure registry). With the
+        # kind certified, it contributes and sets has_dedicated.
+        i = ind([ev("dedicated_use"), ev("curated_source")])
+        m0, _, _, _, has0, _, reasons0 = score_parts(
+            i, EvidenceTable(DEFAULT_WEIGHTS), recency, REG)
+        m1, _, _, _, has1, _, reasons1 = score_parts(
+            i, EvidenceTable(DEFAULT_WEIGHTS), recency, REG,
+            server_derived_kinds=frozenset({"dedicated_use"}))
+        # uncertified: zeroed, flagged, no dedicated
+        self.assertEqual(m0, 25)  # only curated_source contributes
+        self.assertFalse(has0)
+        self.assertTrue(any(r.startswith("control_plane_claim_unverified:dedicated_use")
+                            for r in reasons0))
+        # certified: dedicated contributes + sets the flag
+        self.assertEqual(m1, 25 + 0)  # dedicated_use has m=0; S changes
+        self.assertTrue(has1)
+        self.assertFalse(any(r.startswith("control_plane_claim_unverified") for r in reasons1))
 
     def test_provenance_violation(self):
         # local-only kind claimed by a curated feed: rejected

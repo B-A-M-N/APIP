@@ -23,7 +23,114 @@ jobs:
         run: |
           cd reference
           ./verify.sh
+      # audit P1-40: at least one CI lane must treat any unclosed file handle
+      # (or other ResourceWarning) as a hard failure, so writer/handle leaks
+      # in the capture pipeline surface in CI rather than only as GC noise.
+      - name: Fail on any ResourceWarning (unclosed file handles)
+        run: |
+          cd reference
+          PYTHONWARNINGS=error::ResourceWarning \
+            PYTHONPATH=src python -m unittest discover -s tests
       - name: Run attribution lab
         run: |
           cd lab
           ./run.sh
+
+  # audit P1-39: verify.sh must be clean-checkout safe. A fresh GitHub archive
+  # contains NO ignored generated artifacts (examples/generated is gitignored),
+  # and the schema-conformance tests must still pass by generating their own
+  # fixtures. This job starts from `git clean -xffd` — the most hostile state —
+  # and proves the full gate is green before any CI-local artifacts exist.
+  clean-checkout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start from a pristine checkout (discard all untracked+ignored)
+        run: |
+          git clean -xffd
+          test ! -e examples/generated && echo "pristine: no generated artifacts"
+      - name: Run full verification from clean checkout
+        run: |
+          cd reference
+          ./verify.sh
+
+  # audit Package check: the wheel must build, the console entry point must be
+  # installed on PATH, and the installed `apip` must complete a real smoke
+  # evaluation with no PYTHONPATH and no source checkout in site-packages. This
+  # proves the metadata (license), the [project.scripts] table, and the
+  # dependency-free wheel all end up installed and runnable as shipped.
+  package-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build the wheel
+        run: python -m pip wheel ./reference --no-deps --no-build-isolation -w dist
+      - name: Install wheel into a clean venv and verify the console script
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/apip-venv
+          /tmp/apip-venv/bin/pip install --no-deps dist/*.whl
+          test -x /tmp/apip-venv/bin/apip
+          /tmp/apip-venv/bin/apip --help | grep -q evaluate
+      - name: Smoke evaluation through the installed script
+        run: |
+          ## No PYTHONPATH, no source import: the venv must find `apip` and the
+          ## example fixtures from the repository as the (only) input surface.
+          /tmp/apip-venv/bin/apip evaluate examples/indicators.json \
+            --policy examples/policy.toml --out /tmp/apip-smoke \
+            --demo-trust-fixture
+          test -s /tmp/apip-smoke/decisions.json
+          test -s /tmp/apip-smoke/receipts.json
+
+  # audit P1-28: the raw Suricata/RPZ files must be parser-tested with the
+  # REAL engines, not just string tests. This runs in an isolated container so
+  # the Python package's zero-runtime-dependency property is preserved —
+  # the reference scaffold never requires suricata/named-checkzone at runtime;
+  # these integration gates exist only here.
+  parser-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Install the real parser engines. named-checkzone comes from the BIND9
+      # utilities package; suricata is the IDS engine that will actually load
+      # the generated rules. Neither touches the Python dependency surface.
+      - name: Install parser engines (isolated container)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends suricata bind9-utils
+          suricata --version
+          named-checkzone -v
+      - name: Generate the audit corpus
+        run: |
+          cd reference
+          rm -rf ../examples/generated
+          PYTHONPATH=src python -m apip.cli evaluate ../examples/indicators.json \
+            --policy ../examples/policy.toml --out ../examples/generated \
+            --demo-trust-fixture
+      - name: Parser-test Suricata rules with the real engine
+        run: |
+          # suricata -T loads the rule file with the shipped config; ANY rule
+          # the emitter produced must be syntactically loadable or the job
+          # fails loudly (no silent || fallback masking a real parse error).
+          # default-rule-path is overridden to the generated-tree directory so
+          # suricata's rule loader resolves the relative -S path itself.
+          cd examples/generated
+          suricata -T -c /etc/suricata/suricata.yaml \
+            --set default-rule-path="$PWD" \
+            -S "$PWD/suricata.rules"
+      - name: Parser-test RPZ zone with named-checkzone
+        run: |
+          cd examples/generated
+          named-checkzone apip.invalid rpz.zone

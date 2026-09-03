@@ -19,6 +19,11 @@ def _pol(epoch="0", rz=True):
         randomization_bounds_version="rv-test.1",
         randomization_epoch=epoch,
         ttl_jitter=RandomizationMechanism(enabled=True, lo=0.8, hi=1.0),
+        # audit P0-3: `_ind()` asserts verified_rollback/dedicated_use on the
+        # test target; the policy must declare it governed to reach the rung
+        # (the TTL jitter these tests exercise is an L4 action).
+        governed_dedicated_use=("bad.invalid",),
+        governed_verified_rollback=("bad.invalid",),
     )
 
 def _ind():
@@ -68,6 +73,58 @@ class RngTests(unittest.TestCase):
             self.assertLessEqual(frac, 1_000_000)
             self.assertGreaterEqual(ttl, 1)
             self.assertLessEqual(ttl, 3600)
+
+class StatisticalPropertyTests(unittest.TestCase):
+    """docs/29 CR6: over a large sample, draws are uniform within bounds,
+    cross-mechanism streams are independent (correlated draws would let one
+    observed parameter predict another), and the integer counter mode shows
+    no short cycle within the operational horizon."""
+
+    N = 20_000
+
+    def test_uniformity_within_bounds(self):
+        from apip.randomize import ApipRng
+        rng = ApipRng("uniformity")
+        lo, hi = 0, 999
+        draws = [rng.next_uniform_micros(lo, hi) for _ in range(self.N)]
+        in_bounds = all(lo <= v <= hi for v in draws)
+        self.assertTrue(in_bounds)
+        mean = sum(draws) / len(draws)
+        # uniform over [0,999] -> expected mean 499.5; allow a wide band.
+        self.assertTrue(470 <= mean <= 530, f"mean {mean:.1f} off-uniform")
+        # no quarter is empty or starved (crude uniformity cell check)
+        for quarter in range(4):
+            cell = sum(1 for v in draws if v // 250 == quarter)
+            self.assertGreater(cell, self.N // 8)
+
+    def test_independent_streams(self):
+        # two mechanisms draw from their OWN streams (seed + mechanism tag);
+        # a large interleaved sample must not show pairwise predictability
+        # (Pearson |r| far below a correlated-echo signature).
+        from apip.randomize import ApipRng
+        a = ApipRng("mech-a|s")
+        b = ApipRng("mech-b|s")
+        xa = [a.next_uniform_micros(0, 99) for _ in range(10_000)]
+        xb = [b.next_uniform_micros(0, 99) for _ in range(10_000)]
+        ma, mb = sum(xa) / len(xa), sum(xb) / len(xb)
+        cov = sum((xa[i] - ma) * (xb[i] - mb) for i in range(len(xa)))
+        va = sum((v - ma) ** 2 for v in xa)
+        vb = sum((v - mb) ** 2 for v in xb)
+        r = cov / (va * vb) ** 0.5 if va and vb else 0.0
+        self.assertLess(abs(r), 0.05, f"cross-mechanism correlation r={r:.3f}")
+
+    def test_no_short_cycle(self):
+        from apip.randomize import ApipRng
+        rng = ApipRng("cycle")
+        seen = set()
+        # 50k draws from the counter-mode word stream must be collision-free
+        # in the low word (a 64-bit counter feed would repeat at 2^64, far
+        # beyond the operational horizon) — a short cycle would replay.
+        for _ in range(50_000):
+            w = rng.next_uniform_micros(0, 2**32 - 1)
+            self.assertNotIn(w, seen)
+            seen.add(w)
+
 
 class EpochMovingTargetTests(unittest.TestCase):
     def test_same_indicator_differs_across_epochs(self):

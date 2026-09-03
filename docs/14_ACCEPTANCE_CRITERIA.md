@@ -85,7 +85,7 @@ All must pass:
 
 ## Gate V2-D — Randomization and no-AI conformance
 
-- all draws through the CSPRNG abstraction with recorded seeds;
+- all draws through the deterministic DRBG abstraction (SHA-256 counter mode) with recorded seeds — documented as parameter diversity, not a secret-key CSPRNG;
 - replay-with-seed reproduces exact outputs (CI);
 - draws provably within bounds; floors never violated (property tests);
 - adaptive-attacker simulation shows measurable suppression vs. fixed parameters;

@@ -1,14 +1,14 @@
 from __future__ import annotations
-import argparse, json, hashlib
+import argparse, json
 from pathlib import Path
 from datetime import datetime, timezone
 from .config import load_policy
-from .io import load_indicators
+from .io import load_indicators, _DEMO_TRUSTED_SOURCES
 from .policy import (evaluate, apply_client_impact_budget, Policy)
-from .exporters.rpz import compile_rpz
-from .exporters.suricata import compile_rules
+from .exporters.rpz import compile_rpz, compile_rpz_structured
+from .exporters.suricata import compile_rules, compile_rules_structured
 from .attribution import CorrelationStore
-from .models import Indicator, Evidence
+from .models import Indicator, Evidence, CompiledArtifact
 from .sanitize import UnsafeIdentifier, validate_client
 
 # v2.2: the demo client selector is a fixed, validated literal — NOT derived
@@ -20,16 +20,30 @@ from .sanitize import UnsafeIdentifier, validate_client
 DEMO_CLIENT = "demo-interactive-client"
 
 
-def _receipt(decision_id: str, adapter: str, artifact: str) -> dict:
-    h = hashlib.sha256(artifact.encode()).hexdigest()
+def _receipt(art: CompiledArtifact) -> dict:
+    """Build a receipt for ONE successfully compiled artifact (audit P1-26).
+
+    Receipts are generated EXCLUSIVELY from structured compilation results —
+    never by inspecting `Decision.action`. A decision that produced no
+    CompiledArtifact gets no receipt, because there is no artifact to attest.
+
+    audit P1-27: the receipt carries BOTH the decision-specific fragment
+    identity (rule id + fragment hash) and the whole-bundle identity (bundle
+    id + bundle hash), so later verify/revoke/reconcile can target exactly
+    this rule without disturbing the rest of the bundle.
+    """
     return {
-        "id": f"receipt--{decision_id.split('--')[-1]}-{adapter}",
-        "decision_id": decision_id,
-        "adapter": adapter,
-        "status": "dry_run",
+        "id": f"receipt--{art.decision_id.split('--')[-1]}-{art.adapter}",
+        "decision_id": art.decision_id,
+        "adapter": art.adapter,
+        "rule_id": art.rule_id,
+        "status": art.status,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "device_revision": None,
-        "artifact_hash": h,
+        "bundle_id": art.bundle_id,
+        "bundle_hash": art.bundle_hash,
+        "fragment_hash": art.fragment_hash,
+        "monitoring_only": art.monitoring_only,
         "message": "Dry-run artifact only; no live enforcement performed."
     }
 
@@ -39,10 +53,30 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     # docs/25 L1 client-impact budget: CLI-supplied measurement wins over
     # the policy's [measurement] block (it is the fresher operator input).
     if getattr(args, "transactions_per_hour", None) is not None:
+        # v2.3 (audit P0-6): the CLI override bypasses load_policy's config
+        # validation — a negative value used to overload the -1 "unconfigured"
+        # sentinel and silently DISABLE the budget. Reject it here exactly as
+        # the config loader does (non-negative integer measurement). Sketchy
+        # values fail the batch loudly, never grant a budget bypass.
+        tph = int(args.transactions_per_hour)
+        if tph < 0:
+            raise ValueError(
+                "--transactions-per-hour must be a non-negative integer "
+                "(a negative value previously disabled the L1 client-impact budget)")
         policy = Policy(**{**policy.__dict__,
-                           "measured_interactive_transactions_per_hour":
-                               int(args.transactions_per_hour)})
-    indicators = list(load_indicators(args.indicators))
+                           "measured_interactive_transactions_per_hour": tph})
+    # v2.3 (audit P0-2): source identity is bound to the ingest channel.
+    # The normal path is FAIL-CLOSED — no payload source_id is granted
+    # authority. `--demo-trust-fixture` certifies the reference scaffold's
+    # synthetic feeds so the offline demo can run; `--trusted-source` lets an
+    # operator certify their own channel's provenance set. Without either,
+    # every evidence record resolves to unregistered (zero authority).
+    trusted = None
+    if getattr(args, "demo_trust_fixture", False):
+        trusted = frozenset(_DEMO_TRUSTED_SOURCES)
+    elif getattr(args, "trusted_source", None):
+        trusted = frozenset(args.trusted_source)
+    indicators = list(load_indicators(args.indicators, trusted_sources=trusted))
     # docs/30 collection channel (offline form): fold any observed-transaction
     # log into the correlation store so decisions can carry display-only
     # attribution refs. Absent log -> no refs, decisions unchanged.
@@ -63,14 +97,29 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                     raise SystemExit(
                         f"transaction record rejected at {args.transactions}:{lineno}: {e}")
 
-    # v2.2: optional behavioral detector pass (docs/23 BD-1). A JSONL of
-    # contact events (src, dst, ts_iso, epoch_s) feeds the bounded
-    # beacon-periodicity detector; emitted detections are folded into the
-    # matching indicators as local behavioral evidence BEFORE evaluation —
-    # through the same weight table and caps as any other evidence.
+    # v2.2: optional behavioral detector pass (docs/23). A JSONL of contact
+    # events (src, dst, ts_iso, epoch_s) feeds the bounded behavioral
+    # detectors gated by the policy's [behavioral] enabled_families; emitted
+    # detections are folded into the matching indicators as local behavioral
+    # evidence BEFORE evaluation — through the same weight table and caps as
+    # any other evidence. audit P1-20: only families actually IMPLEMENTED
+    # detect; requested-but-pending families are reported honestly, never
+    # implied present.
     if getattr(args, "events", None):
-        from .behavioral import BeaconDetector
-        detector = BeaconDetector()
+        from .behavioral import (BeaconDetector, FirstSeenNoveltyDetector,
+                                 IMPLEMENTED_FAMILIES)
+        fams = policy.enabled_behavioral_families or tuple(sorted(IMPLEMENTED_FAMILIES))
+        beacons = BeaconDetector(enabled_families=fams)
+        novelty = FirstSeenNoveltyDetector()
+        detectors = []
+        if beacons.beacon_enabled:
+            detectors.append(("beacon", beacons))
+        if "first_seen_novelty" in beacons.enabled_families:
+            detectors.append(("novelty", novelty))
+        pending = list(beacons.pending_families)
+        if pending:
+            print("behavioral pass: requested families NOT implemented "
+                  f"(pending, no detection): {', '.join(pending)}")
         detections = []
         with open(args.events, "r", encoding="utf-8") as f:
             for lineno, line in enumerate(f, 1):
@@ -79,18 +128,22 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                     continue
                 obj = json.loads(line)
                 try:
-                    det = detector.observe(str(obj["src"]), str(obj["dst"]),
-                                           str(obj["ts_iso"]), int(obj["epoch_s"]))
+                    src, dst, ts_iso, epoch_s = (str(obj["src"]), str(obj["dst"]),
+                                                 str(obj["ts_iso"]), int(obj["epoch_s"]))
+                    for _name, detector in detectors:
+                        det = detector.observe(src, dst, ts_iso, epoch_s)
+                        if det is not None:
+                            detections.append(det)
                 except (KeyError, TypeError, ValueError) as e:
                     raise SystemExit(f"event record malformed at {args.events}:{lineno}: {e}")
-                if det is not None:
-                    detections.append(det)
         folded_count = 0
         if detections:
             indicators, folded_count = _fold_detections(indicators, detections)
-        print(f"behavioral pass: detections={len(detections)} "
-              f"folded={folded_count} degraded={detector.degraded} "
-              f"suppressed_windows={detector.suppressed_new_windows}")
+        print(f"behavioral pass: detectors={[n for n, _ in detectors]} "
+              f"detections={len(detections)} folded={folded_count} "
+              f"beacon_degraded={beacons.degraded} "
+              f"novelty_degraded={novelty.degraded} "
+              f"novelty_seen={novelty.tracked_destinations}")
 
     # docs/04 v2.2: blast-radius budget enforcement. The policy knob
     # (max_new_auto_actions_per_batch) caps how many actions one batch may
@@ -103,11 +156,23 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     challenged_budget_exceeded = False
 
     pairs = []
+    from .sanitize import validate_client
     for i in indicators:
-        # Typed context for context-acting rungs (docs/25 v2.1): a validated
-        # demo client constant; without a client, L1/L2 are unreachable by
-        # design (no destination-global forms).
-        context = {"client": DEMO_CLIENT, "protocol_class": "interactive_http"}
+        # Typed context for context-acting rungs (docs/25 v2.1): without a
+        # validated client selector, L1/L2 are unreachable by design (no
+        # destination-global forms).
+        #
+        # audit P1-24: behavioral detections carry the ACTUAL subject (the
+        # host that made contact) as evidence context. When an indicator is
+        # firmed entirely by one client's detection(s), that real client is
+        # the decision context — a "host-A -> destination-X" detection must
+        # NOT be relabelled as "demo-interactive-client -> destination-X".
+        # DEMO_CLIENT remains the operator-supplied context only when no
+        # genuine subject exists.
+        subject = _detection_subject(i)
+        client_for_run = (
+            validate_client(subject) if subject is not None else DEMO_CLIENT)
+        context = {"client": client_for_run, "protocol_class": "interactive_http"}
         d = evaluate(i, policy, context=context)
         if d.to_dict() != evaluate(i, policy, context=context).to_dict():
             raise RuntimeError("nondeterministic decision")  # replay guard
@@ -131,10 +196,15 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "decisions.json").write_text(json.dumps([d.to_dict() for _, d in pairs], indent=2) + "\n")
-    rpz = compile_rpz(pairs)
-    suri = compile_rules(pairs)
-    (out / "rpz.zone").write_text(rpz)
-    (out / "suricata.rules").write_text(suri)
+    # v2.3 (audit P1-26/P1-27): compilation produces STRUCTURED artifacts —
+    # one CompiledArtifact per decision that actually rendered a rule/zone
+    # line. The string outputs below are thin concatenations of those
+    # artifacts; receipts are generated from the SAME structured results so a
+    # decision that produced no artifact also produces no receipt.
+    rpz_arts = compile_rpz_structured(pairs)
+    suri_arts = compile_rules_structured(pairs)
+    (out / "rpz.zone").write_text(compile_rpz(pairs))
+    (out / "suricata.rules").write_text(compile_rules(pairs))
     if budget_exceeded:
         print(f"WARNING: blast-radius budget reached ({budget} actions/batch); "
               f"overflow demoted to OBSERVE with reason blast_radius_budget_exceeded")
@@ -150,14 +220,12 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
               f"{frac} of {denom} interactive transactions/hour; "
               f"challenge overflow auto-reverted to L0 "
               f"(reason client_impact_budget_exceeded / challenge_auto_reverted_to_L0)")
-    receipts = []
-    for _, d in pairs:
-        if d.action == "dns_nxdomain":
-            receipts.append(_receipt(d.id, "rpz-file-exporter", rpz))
-        elif d.action in {"firewall_deny", "rate_limit"}:
-            receipts.append(_receipt(d.id, "suricata-file-exporter", suri))
-        elif d.action == "proxy_challenge":
-            receipts.append(_receipt(d.id, "proxy-file-exporter", f"challenge:{d.indicator_id}"))
+    # audit P1-26: receipts exist ONLY for decisions that actually compiled an
+    # artifact. Walking the structured artifacts (not Decision.action) means
+    # an action with no adapter representation — e.g. proxy_challenge, which
+    # no exporter implements as a dry-run artifact — yields NO receipt,
+    # rather than a fabricated attestation of a nonexistent control.
+    receipts = [_receipt(a) for a in (rpz_arts + suri_arts)]
     (out / "receipts.json").write_text(json.dumps(receipts, indent=2) + "\n")
     # docs/30: campaign-correlation report (the analyst view, file form).
     # Display-only: feeding it back into anything enforcement-side is
@@ -169,6 +237,29 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         render_correlation_report(report), encoding="utf-8")
     print(f"evaluated={len(pairs)} mode={policy.mode} output={out}")
     return 0
+
+
+def _detection_subject(indicator) -> str | None:
+    """audit P1-24: the genuine subject behind behavioral evidence.
+
+    Returns the distinct client/host the indicator's behavioral detections
+    are actually ABOUT, when every behavioral evidence record names ONE and
+    the same subject — and None otherwise (no behavioral subject, or several
+    different clients whose detections would conflate). A single unambiguous
+    subject is used as the decision context; mixed subjects fall back to the
+    operator-supplied context because combining them would fabricate a client.
+    """
+    BEH = {"behavioral_beacon_periodicity", "behavioral_first_seen_novelty"}
+    subjects = set()
+    for ev in getattr(indicator, "evidence", ()):
+        if ev.kind not in BEH:
+            continue
+        client = (ev.detail or {}).get("client")
+        if isinstance(client, str) and client:
+            subjects.add(client)
+    if len(subjects) != 1:
+        return None
+    return next(iter(subjects))
 
 
 def _fold_detections(indicators, detections):
@@ -262,6 +353,16 @@ def main() -> int:
     ev.add_argument("indicators")
     ev.add_argument("--policy", required=True)
     ev.add_argument("--out", required=True)
+    ev.add_argument("--demo-trust-fixture", action="store_true",
+                    help="v2.3 (P0-2): certify the reference scaffold's synthetic "
+                         "feed ids (curated-a/b, local-sensor/behavioral) as the "
+                         "ingest channel's trusted sources. Explicit, reviewed "
+                         "opt-in for the offline demo; the normal evaluate path is "
+                         "fail-closed (no payload source_id is granted authority).")
+    ev.add_argument("--trusted-source", action="append", default=None,
+                    help="v2.3 (P0-2): a source id this channel certifies. Repeat "
+                         "to list several. Evidence naming any OTHER source_id is "
+                         "demoted to unregistered (zero authority) at the boundary.")
     ev.add_argument("--transactions", default=None,
                     help="optional JSONL of observed transactions (docs/30 harvest)")
     ev.add_argument("--transactions-per-hour", type=int, default=None,

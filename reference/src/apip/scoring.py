@@ -32,8 +32,37 @@ CORROBORATION_KINDS = frozenset({
     "single_curated_source", "two_curated_sources",
 })
 
+# P1-5 (audit): the ONLY evidence kinds that constitute a positive
+# MALICIOUSNESS ASSERTION — a semantic claim that the target is malicious.
+# Corroboration must rest on these and nothing else. Structural metadata
+# observations (`recent`, `exact_fqdn`, `exact_url`, `exactness`) describe
+# the target but carry no stance about its malice, so a second source
+# reporting `recent` corroborates nothing about a maliciousness claim.
+# Neither do the asserted corroboration kinds (`single_/two_curated_sources`)
+# — those are the claim to VERIFY, not evidence FOR it.
+MALICIOUSNESS_ASSERTION_KINDS = frozenset({
+    "curated_source", "direct_local_detection",
+})
+
 def clamp(v: int) -> int:
     return max(0, min(100, int(v)))
+
+
+# P0-3 (audit): control-plane safety facts. These describe APIP's OWN control
+# plane — scope, rollback safety, exactness, infrastructure class, recency —
+# NOT observations about the contested target. A (even registered) feed
+# asserting them grants itself the engine's safety posture, the exact S-
+# inflation vector the audit named (`local-sensor` claiming
+# dedicated_use + verified_rollback + bounded_scope + exactness + recent).
+# These kinds contribute ONLY from SERVER-DERIVED state, so a feed's assertion
+# of one is a claim to verify against that state, never authority in itself.
+# The server boundary (policy.evaluate) computes which of these actually hold
+# and passes them in as `server_derived_kinds`; _score_impl zeroes any
+# control-plane kind the server did not derive.
+CONTROL_PLANE_KINDS = frozenset({
+    "bounded_scope", "verified_rollback", "exactness",
+    "dedicated_use", "dedicated_use_provenance", "recent",
+})
 
 
 # Source classes excluded from the decision path entirely (docs/28, docs/30):
@@ -41,6 +70,28 @@ def clamp(v: int) -> int:
 # records. No contribution, no reason codes — decisions are byte-identical
 # with and without them.
 NON_AUTHORITATIVE_CLASSES = frozenset({"annotation", "attribution"})
+
+# v2.3 (audit P0-1): an UNREGISTERED source is non-authoritative too. The
+# registry's unknown fallback returns class "unregistered" for any source_id
+# the operator has not explicitly bound — so a hostile input naming an
+# arbitrary source_id must not inherit any weight. `unregistered` joins
+# annotation/attribution as a zero class: no contribution, never reaches the
+# "any" fallback, decisions are byte-identical with and without it.
+ZERO_WEIGHT_CLASSES = NON_AUTHORITATIVE_CLASSES | {"unregistered"}
+
+# Classes that MAY take part in scoring. `"any"` (source-agnostic context
+# rows) is meaningful ONLY for classes that are explicitly authoritative and
+# opted into the source-agnostic fallback. `community` must have an explicit
+# (community, kind) row to contribute — it never falls through to "any".
+# This is the authority boundary: no class outside AUTHORITATIVE_SOURCE_CLASSES
+# can ever collect weight, and "any" never means "including an untrusted
+# class". See `contribution`/`is_weighted` below.
+#   curated  -> curls back to explicit OR "any" (source-agnostic context)
+#   local    -> explicit OR "any" (local detection + shared context)
+#   community-> explicit ONLY (explicit permitted matrix)
+AUTHORITATIVE_SOURCE_CLASSES = frozenset({"curated", "local", "community"})
+# Classes allowed to fall through to the "any" (source-agnostic) rows.
+_ANY_FALLBACK_CLASSES = frozenset({"curated", "local"})
 
 
 class EvidenceTable:
@@ -57,16 +108,44 @@ class EvidenceTable:
         self._table = table
 
     def contribution(self, source_class: str, kind: str, recency: str) -> tuple[int, int, int]:
-        # specific (class, kind) weights first, then source-agnostic "any"
-        base = self._table.get((source_class, kind), self._table.get(("any", kind), (0, 0, 0)))
+        # Authority boundary (v2.3 / audit P0-1): only authoritative classes
+        # can collect weight. annotation/attribution/unregistered are zero —
+        # they must never reach the "any" fallback, and an unknown class is
+        # never weighted by default.
+        if source_class not in AUTHORITATIVE_SOURCE_CLASSES:
+            return 0, 0, 0
+        # specific (class, kind) weights first; then source-agnostic "any"
+        # rows — but ONLY for classes explicitly opted into that fallback
+        # (curated/local). community needs an explicit (community, kind) row.
+        base = self._table.get((source_class, kind))
+        if base is None and source_class in _ANY_FALLBACK_CLASSES:
+            base = self._table.get(("any", kind), (0, 0, 0))
+        else:
+            base = base or (0, 0, 0)
         m, s_ctx, s_ip = base
         if recency == "stale":
-            # stale evidence contributes no positive M (docs/04 freshness)
+            # stale evidence contributes NOTHING decision-bearing — neither
+            # positive M (docs/04 freshness) nor action-safety S. A stale
+            # observation is ambiguous at best: it must not keep enabling a
+            # stronger action class or infrastructure rung via its retained
+            # safety weight (audit P1-4: "an expired dedicated_use/rollback/
+            # scope fact may continue enabling stronger action classes").
+            # Negative M (contradictory_benign / prior_false_positive) still
+            # applies from stale records: an old dissenting report remains a
+            # reason for caution, never a reason to escalate.
             m = min(0, m)
+            s_ctx = 0
+            s_ip = 0
         return m, s_ctx, s_ip
 
     def is_weighted(self, source_class: str, kind: str) -> bool:
-        return (source_class, kind) in self._table or ("any", kind) in self._table
+        if source_class not in AUTHORITATIVE_SOURCE_CLASSES:
+            return False
+        if (source_class, kind) in self._table:
+            return True
+        if source_class in _ANY_FALLBACK_CLASSES and ("any", kind) in self._table:
+            return True
+        return False
 
 
 # Reference weight table: (source_class, kind) -> (m, s_ctx, s_ip)
@@ -117,13 +196,19 @@ def _provenance_identity(source_registry, source_id: str) -> str:
     return source_registry.independence_identity(source_id)
 
 
-def corroboration_tier(indicator: Indicator, source_registry) -> tuple[int, int]:
-    """Derived corroboration (v2.2): (distinct_upstream_identities, tier).
+def corroboration_tier(indicator: Indicator, source_registry,
+                       classify_recency=lambda _ts: "fresh") -> tuple[int, int]:
+    """Derived corroboration (v2.2 + audit P1-5):
+    (distinct_upstream_identities, tier).
 
     Counts DISTINCT upstream provenance identities among the indicator's
     qualified external sources (auto-enforcement-allowed, independent,
-    non-local, non-annotation) that report a positive-weight M kind.
-    Tier: 0 = single source, 1 = two or more.
+    non-local, non-annotation) that report a FRESH positive MALICIOUSNESS
+    ASSERTION — a kind in `MALICIOUSNESS_ASSERTION_KINDS` (`curated_source`
+    or `direct_local_detection`). Two sources both merely observing the
+    target (`recent`, `exact_fqdn`, `exact_url`, `exactness`) do NOT
+    corroborate a maliciousness claim (audit P1-5), and a STALE maliciousness
+    report corroborates nothing. Tier: 0 = single source, 1 = two or more.
 
     This is the engine-side verification for the asserted corroboration
     kinds (`single_curated_source`, `two_curated_sources`): the asserted
@@ -132,10 +217,6 @@ def corroboration_tier(indicator: Indicator, source_registry) -> tuple[int, int]
     `two_curated_sources` gets single-source weight — never corroboration
     weight. The claimed-vs-derived mismatch is surfaced as a reason code.
     """
-    m_kinds = {kind for (cls, kind), (m, _, _)
-               in DEFAULT_WEIGHTS.items() if m > 0 and cls == "curated"}
-    m_kinds.update(kind for (cls, kind), (m, _, _)
-                   in DEFAULT_WEIGHTS.items() if m > 0 and cls == "any")
     seen: set[str] = set()
     for ev in indicator.evidence:
         prof = source_registry.profile(ev.source_id)
@@ -143,7 +224,9 @@ def corroboration_tier(indicator: Indicator, source_registry) -> tuple[int, int]
             continue
         if not (prof.independent and prof.auto_enforcement_allowed):
             continue
-        if ev.kind not in m_kinds:
+        if ev.kind not in MALICIOUSNESS_ASSERTION_KINDS:
+            continue
+        if classify_recency(ev.observed_at) == "stale":
             continue
         seen.add(_provenance_identity(source_registry, ev.source_id))
     distinct = len(seen)
@@ -192,7 +275,8 @@ def _dedup_evidence(indicator: Indicator, source_registry):
 
 
 def score(indicator: Indicator, table: EvidenceTable,
-          classify_recency, source_registry) -> tuple[int, int, int, bool, bool, tuple[str, ...]]:
+          classify_recency, source_registry,
+          server_derived_kinds: frozenset[str] = frozenset()) -> tuple[int, int, int, bool, bool, tuple[str, ...]]:
     """Policy-owned deterministic scoring (docs/04 v2.1).
 
     Returns (M, S_ctx, S_ip, has_dedicated_use, has_unqualified, reasons).
@@ -206,15 +290,24 @@ def score(indicator: Indicator, table: EvidenceTable,
     - Corroboration kinds are VERIFIED against derived provenance (v2.2):
       an asserted claim that the provenance arithmetic does not support
       degrades to plain curated_source weight with a reason code.
-    - has_dedicated_use: positive dedicated-use evidence present (docs/25).
+    - Control-plane kinds (audit P0-3: bounded_scope / verified_rollback /
+      exactness / dedicated_use / dedicated_use_provenance / recent) are
+      VERIFIED against server-derived state (`server_derived_kinds`). A
+      feed-asserted control-plane fact the server does not certify
+      contributes zero with a reason code — a compromised feed can no longer
+      grant itself APIP's safety posture.
+    - has_dedicated_use: positive dedicated-use evidence present AND server-
+      certified (docs/25).
     - has_unqualified: an unqualified/annotation-class record was present.
     """
     return _score_impl(indicator, table, classify_recency, source_registry,
-                       report_behavioral_share=False)
+                       report_behavioral_share=False,
+                       server_derived_kinds=server_derived_kinds)
 
 
 def score_parts(indicator: Indicator, table: EvidenceTable,
-                classify_recency, source_registry) -> tuple[int, int, int, int, bool, bool, tuple[str, ...]]:
+                classify_recency, source_registry,
+                server_derived_kinds: frozenset[str] = frozenset()) -> tuple[int, int, int, int, bool, bool, tuple[str, ...]]:
     """Unclamped variant used by policy for behavioral cap arithmetic.
 
     Returns (m_unclamped, behavioral_m_unclamped, s_ctx, s_ip,
@@ -222,19 +315,29 @@ def score_parts(indicator: Indicator, table: EvidenceTable,
     """
     m, bm, s_ctx, s_ip, has_ded, has_unq, reasons = _score_impl(
         indicator, table, classify_recency, source_registry,
-        report_behavioral_share=True)
+        report_behavioral_share=True,
+        server_derived_kinds=server_derived_kinds)
     return m, bm, s_ctx, s_ip, has_ded, has_unq, reasons
 
 
 def _score_impl(indicator: Indicator, table: EvidenceTable,
-                classify_recency, source_registry, report_behavioral_share: bool):
+                classify_recency, source_registry, report_behavioral_share: bool,
+                server_derived_kinds: frozenset[str] = frozenset()):
     """Shared scoring path. Dedup happens upstream (policy.evaluate applies
     it before the evidence envelope), but this function remains safe
-    standalone by deduplicating defensively as well."""
+    standalone by deduplicating defensively as well.
+
+    `server_derived_kinds` certifies which CONTROL_PLANE_KINDS the server
+    has independently derived for this indicator (audit P0-3). A styled
+    control-plane fact not in the set is an unverified feed claim and
+    contributes zero with a reason code.
+    """
     indicator, _ = _dedup_evidence(indicator, source_registry)
 
-    # derived corroboration for asserted-kind verification (v2.2)
-    distinct_sources, derived_tier = corroboration_tier(indicator, source_registry)
+    # derived corroboration for asserted-kind verification (v2.2).
+    # Freshness is threaded so a stale maliciousness report never wins a
+    # single/two_curated_sources claim (audit P1-5).
+    distinct_sources, _ = corroboration_tier(indicator, source_registry, classify_recency)
 
     m = 0
     bm = 0
@@ -246,14 +349,29 @@ def _score_impl(indicator: Indicator, table: EvidenceTable,
     for ev in indicator.evidence:
         kind = ev.kind
         src_class = source_registry.class_of(ev.source_id)
-        if src_class in NON_AUTHORITATIVE_CLASSES:
-            # annotations (docs/28) and attribution records (docs/30) are
-            # excluded from the decision path entirely: no contribution, no
-            # reason codes — decisions are byte-identical without them
+        if src_class in ZERO_WEIGHT_CLASSES:
+            # annotations (docs/28), attribution records (docs/30), and
+            # unregistered sources (audit P0-1) are excluded from the decision
+            # path entirely: no contribution, no reason codes — decisions are
+            # byte-identical with and without them.
             continue
         recency = classify_recency(ev.observed_at)
         if kind in LOCAL_ONLY_KINDS and src_class != "local":
             reasons.append(f"provenance_violation:{kind}")
+            has_unqualified = True
+            continue
+        # audit P0-3: control-plane safety facts (bounded_scope /
+        # verified_rollback / exactness / dedicated_use / dedicated_use_
+        # provenance / recent) describe APIP's OWN control plane, not the
+        # contested target. A (even registered) feed asserting one grants
+        # itself the engine's safety posture. These contribute ONLY when the
+        # server has independently derived them (`server_derived_kinds`, set
+        # by policy.evaluate from the authorization boundary, the recency
+        # channel, canonical ingest, and a governed infrastructure registry).
+        # An uncertified assertion is a claim to verify, never authority: it
+        # contributes zero, never sets has_dedicated, and is flagged.
+        if kind in CONTROL_PLANE_KINDS and kind not in server_derived_kinds:
+            reasons.append(f"control_plane_claim_unverified:{kind}")
             has_unqualified = True
             continue
         cm, cs_ctx, cs_ip = table.contribution(src_class, kind, recency)
@@ -275,7 +393,12 @@ def _score_impl(indicator: Indicator, table: EvidenceTable,
         # infra penalty routes to identity safety only
         if kind in SHARED_INFRA_KINDS:
             cs_ctx = 0
-        if kind in DEDICATED_USE_KINDS:
+        if kind in DEDICATED_USE_KINDS and recency != "stale":
+            # dedicated-use only enables the privileged rungs while FRESH
+            # (audit P1-4): a stale dedicated_use/scope/rollback record must
+            # not keep upgrading the action class. Even a server-derived
+            # control-plane fact is only as current as its corroborating
+            # record's observation time.
             has_dedicated = True
         if report_behavioral_share and src_class == "local" and kind.startswith("behavioral_"):
             bm += cm

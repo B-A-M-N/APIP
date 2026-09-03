@@ -38,7 +38,11 @@ class LoopbackRefusalTests(unittest.TestCase):
         # the guard logic path only
         from apip.live.server import _is_loopback
         self.assertTrue(_is_loopback("127.0.0.1"))
-        self.assertTrue(_is_loopback("localhost"))
+        # audit P1-15: loopback is IP-literals only; hostnames like
+        # "localhost" (or `127.attacker.example`) are rejected because a
+        # string prefix test can be fooled.
+        self.assertFalse(_is_loopback("localhost"))
+        self.assertTrue(_is_loopback("::1"))
         self.assertFalse(_is_loopback("0.0.0.0"))
 
 
@@ -58,6 +62,8 @@ class HandlerObservationTests(unittest.TestCase):
         for k, v in (headers or {}).items():
             msg[k] = v
         h.headers = msg
+        h.requestline = path
+        h.request_version = "HTTP/1.1"
         h.rfile = None
         h.wfile = type("W", (), {"write": staticmethod(lambda b: None)})()
         return origin, h
@@ -80,12 +86,14 @@ class HandlerObservationTests(unittest.TestCase):
         self.assertNotIn("198.51.100.7", origin._sessions)
 
     def test_emit_drops_contract_violations(self):
+        # audit P1-40: `with` closes the ChallengeOrigin's writer handle
+        # deterministically — never leave an unclosed file for GC to warn on.
         with TemporaryDirectory() as td:
             p = Path(td) / "tx.jsonl"
-            origin = ChallengeOrigin(p)
-            origin.emit({"client_ref": "c", "observed_at": "not-a-date"})
-            origin.emit({"client_ref": "c", "observed_at": "2026-09-01T19:00:00Z",
-                         "header_order": ["host"]})
+            with ChallengeOrigin(p) as origin:
+                origin.emit({"client_ref": "c", "observed_at": "not-a-date"})
+                origin.emit({"client_ref": "c", "observed_at": "2026-09-01T19:00:00Z",
+                             "header_order": ["host"]})
             lines = p.read_text().strip().split("\n")
             self.assertEqual(len(lines), 2)            # rejection marker + good record
             self.assertIn("rejected", json.loads(lines[0]))
@@ -94,10 +102,10 @@ class HandlerObservationTests(unittest.TestCase):
     def test_emit_folds_into_store(self):
         with TemporaryDirectory() as td:
             store = CorrelationStore()
-            origin = ChallengeOrigin(Path(td) / "tx.jsonl", store=store)
-            origin.emit({"client_ref": "c", "observed_at": "2026-09-01T19:00:00Z",
-                         "header_order": ["host", "accept"],
-                         "tls_ja4": "t13d1516h2_8daaf6152771_b186095e22b6"})
+            with ChallengeOrigin(Path(td) / "tx.jsonl", store=store) as origin:
+                origin.emit({"client_ref": "c", "observed_at": "2026-09-01T19:00:00Z",
+                             "header_order": ["host", "accept"],
+                             "tls_ja4": "t13d1516h2_8daaf6152771_b186095e22b6"})
             self.assertEqual(store.report()["tracked_requesters"], 1)
 
 
@@ -180,6 +188,85 @@ class AdapterStreamTests(unittest.TestCase):
                  if g_["probe_count"] == 2 and g_["requester_handles"] == [__import__("apip.attribution", fromlist=["handle_for"]).handle_for("192.0.2.50")]}
         self.assertTrue(fps_c)
         self.assertNotIn(fps_c.pop(), {links[0]["a"], links[0]["b"]})
+
+
+class ChallengeTwoStepTests(unittest.TestCase):
+    """audit P1-12: GET /challenge issues (id+nonce+canonical fields); POST
+    /challenge/{id} validates id+nonce binding against server state."""
+
+    def _issue(self, origin):
+        return origin._issue_challenge()
+
+    def test_issue_returns_canonical_fields_in_randomized_order(self):
+        o = ChallengeOrigin(Path("/tmp/tx-unused.jsonl"))
+        ch = self._issue(o)
+        self.assertTrue(ch["challenge_id"].startswith("ch--"))
+        self.assertEqual(len(ch["nonce"]), 24)
+        # P1-12: keys are the CANONICAL challenge fields, never probe ids
+        self.assertEqual(sorted(ch["fields"]),
+                         sorted(("ts", "nonce", "response", "probe_set")))
+        # state bound to the id
+        self.assertIn(ch["challenge_id"], o._challenges)
+
+    def test_epoch_changes_reorder_fields(self):
+        o = ChallengeOrigin(Path("/tmp/tx-unused.jsonl"))
+        a = self._issue(o)
+        o.epoch = "2"
+        b = self._issue(o)
+        self.assertNotEqual(a["fields"], b["fields"])
+        self.assertEqual(sorted(a["fields"]), sorted(b["fields"]))
+
+    def test_submit_valid_requires_issued_id_and_echoed_nonce(self):
+        o = ChallengeOrigin(Path("/tmp/tx-unused.jsonl"))
+        ch = self._issue(o)
+        # valid: echoes the issued nonce in the body serialization
+        import json as _j
+        body = _j.dumps({"ts": 1, "nonce": ch["nonce"],
+                         "response": "x", "probe_set": ["P2"]}).encode()
+        ok, order = o._validate_challenge_submission(ch["challenge_id"], body)
+        self.assertTrue(ok)
+        self.assertEqual(order, ["ts", "nonce", "response", "probe_set"])
+        # consumed: replaying the same id is now invalid
+        ok, _ = o._validate_challenge_submission(ch["challenge_id"], body)
+        self.assertFalse(ok)
+
+    def test_submit_unknown_or_mismatched_nonce_rejected(self):
+        o = ChallengeOrigin(Path("/tmp/tx-unused.jsonl"))
+        ch = self._issue(o)
+        import json as _j
+        # unknown id
+        ok, _ = o._validate_challenge_submission("ch--deadbeef00000000",
+                                                 _j.dumps({"nonce": ch["nonce"]}).encode())
+        self.assertFalse(ok)
+        # known id but wrong nonce
+        body = _j.dumps({"nonce": "x" * 24}).encode()
+        ok, order = o._validate_challenge_submission(ch["challenge_id"], body)
+        self.assertFalse(ok)
+        self.assertEqual(order, ["nonce"])
+
+
+class RangeStatefulnessTests(unittest.TestCase):
+    """audit P1-13: /asset only reports range_honored when the client's
+    requested slice (bytes=0-1) is exactly what the server served."""
+
+    def _asset_rec(self, range_header):
+        origin, h = HandlerObservationTests._handler_instance(
+            path="/asset", headers={"Range": range_header})
+        rec = h._record_common()
+        h._asset_response(rec)      # drives the parsing + response class
+        return rec
+
+    def test_exact_range_honored(self):
+        rec = self._asset_rec("bytes=0-1")
+        self.assertEqual(rec["range_fallback"], "range_honored")
+
+    def test_non_exact_range_not_honored(self):
+        for bad in ("bytes=0-2", "bytes=1-2", "bytes=0-", "bytes=-2",
+                    "bytes=0-1,5-6", "garbage", "bytes=8-9"):
+            with self.subTest(bad=bad):
+                rec = self._asset_rec(bad)
+                self.assertIn(rec["range_fallback"],
+                              ("range_ignored", "malformed_retry"), bad)
 
 
 class KeyOrderTests(unittest.TestCase):

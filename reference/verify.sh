@@ -10,7 +10,7 @@ PYTHONPATH=src python -m unittest tests.test_no_ai_conformance -v
 
 # 3. Regenerate artifacts and validate them against the shipped schemas.
 rm -rf ../examples/generated
-PYTHONPATH=src python -m apip.cli evaluate ../examples/indicators.json --policy ../examples/policy.toml --out ../examples/generated
+PYTHONPATH=src python -m apip.cli evaluate ../examples/indicators.json --policy ../examples/policy.toml --out ../examples/generated --demo-trust-fixture
 python -m json.tool ../examples/generated/decisions.json >/dev/null
 python -m json.tool ../examples/generated/receipts.json >/dev/null
 # Schema conformance of the ACTUAL emitted artifacts (stdlib validator; the

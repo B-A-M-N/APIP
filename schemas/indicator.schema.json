@@ -6,10 +6,7 @@
   "required": [
     "id",
     "type",
-    "value",
-    "sources",
-    "first_seen",
-    "last_seen"
+    "value"
   ],
   "properties": {
     "id": {
@@ -17,15 +14,13 @@
       "minLength": 1
     },
     "type": {
+      "description": "Indicator type. THIS enum is the reference runtime's loadable decision-input vocabulary (apip.io._INDICATOR_TYPES) — reconciled so schema-valid == loadable. File-hash / certificate-fingerprint / network-fingerprint indicator kinds are NOT implemented by the reference decision engine and are therefore NOT loadable input types here; they belong to the DRAFT-FUTURE control-plane contract, not the reference indicator schema (audit P1-29).",
       "enum": [
         "fqdn",
         "ipv4",
         "ipv6",
         "cidr",
-        "url",
-        "sha256",
-        "certificate_fingerprint",
-        "network_fingerprint"
+        "url"
       ]
     },
     "value": {

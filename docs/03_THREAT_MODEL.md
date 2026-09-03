@@ -222,7 +222,7 @@ Mitigations:
 - full reversibility of everything automation caused.
 
 ### TM-020 Randomization subsystem compromise
-Recorded seeds or the CSPRNG layer are attacked to predict draws or manipulate draws outside bounds.
+Recorded seeds are used to predict draws, or the DRBG layer is attacked to manipulate draws outside bounds. Note: because seeds are recorded in every decision, predicting draws from the seed is *expected and accepted* — the base engine claims deterministic parameter diversity, not observer-unpredictability (see `docs/29` "Security model"). The residual risk is (a) draws pushed outside policy bounds — prevented by downstream clamps — and (b) an attacker exploiting seed *predictability* to time around a known draw, which is the adaptive-adaptation cost the design deliberately imposes rather than eliminates.
 
 Mitigations:
 

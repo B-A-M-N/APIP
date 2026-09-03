@@ -47,6 +47,21 @@
         "null"
       ]
     },
+    "rule_id": {
+      "type": "string"
+    },
+    "bundle_id": {
+      "type": "string"
+    },
+    "bundle_hash": {
+      "type": "string"
+    },
+    "fragment_hash": {
+      "type": "string"
+    },
+    "monitoring_only": {
+      "type": "boolean"
+    },
     "message": {
       "type": "string"
     }

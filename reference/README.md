@@ -16,13 +16,20 @@ It can:
 
 It cannot:
 - fetch the internet;
-- terminate HTTP/TLS or open any socket (attribution harvests already-captured transaction logs, never live traffic);
+- make any outbound network connection;
+- perform actuator mutations (firewall/DNS/router changes, BGP, scanning, third-party modification);
 - connect to TAXII;
-- apply live firewall/DNS/router changes;
-- perform network scanning;
-- control BGP;
-- modify third-party systems;
+- terminate production HTTP/TLS;
 - invoke any model inference (none exists in the codebase).
+
+On the loopback-only exception: `apip.cli capture serve` and the attribution lab
+(`lab/`) open a **loopback-only HTTP observation socket** (`ChallengeOrigin`,
+bind enforced to 127.0.0.1/::1, `docs/30`) to harvest behavioral fingerprints from
+local synthetic HTTP. That is an inbound loopback test channel — not outbound
+network and not an actuator. Evaluation and enforcement compilation are
+**offline/dry-run**: the reference makes no outbound connections and performs no
+actuator mutations. Attribution harvest otherwise works from an already-captured
+JSONL of transaction logs, never live traffic.
 
 ## Run
 

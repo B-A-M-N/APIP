@@ -169,7 +169,6 @@ def parse_nginx(line: str) -> dict | None:
     return rec
 
 
-import calendar as _calendar
 from datetime import datetime as _dt, timezone as _tz
 
 _CLF_MONTHS = {m: i + 1 for i, m in enumerate(

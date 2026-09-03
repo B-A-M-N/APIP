@@ -135,6 +135,11 @@
     },
     "selector": {
       "$ref": "#/$defs/actionSelector"
+    },
+    "content_hash": {
+      "type": "string",
+      "description": "Action-instance identity (docs/25, docs/29, docs/30): a SHA-256 content hash over the FULL parameterized output (disposition, action, rung, selector, ttl_seconds, randomization draw, policy_version). Distinct from `id` (the LOGICAL decision, persistent across epochs). Receipts/reconciliation/revocation reference the exact action INSTANCE via this hash. Empty string for non-actionable decisions that emit no enforcement artifact.",
+      "pattern": "^(|hash--[0-9a-f]{24})$"
     }
   },
   "additionalProperties": false,

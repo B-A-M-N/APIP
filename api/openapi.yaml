@@ -3,9 +3,24 @@ info:
   title: APIP Control Plane API
   version: 0.1.0-draft
   description: >-
-    Draft operator-authorized defensive control-plane API. This contract is for
-    evidence, decisions, approvals, bundles, and receipts; it is not an endpoint
-    for arbitrary network commands.
+    DRAFT FUTURE CONTROL-PLANE CONTRACT — NOT IMPLEMENTED BY REFERENCE PACKAGE.
+
+    (audit P1-31) This OpenAPI describes the target control-plane API surface
+    (indicators, decisions, approvals, bundles, behavioral events, coverage,
+    segments, stage transitions, virtual patches, receipts, revocations,
+    health, global mTLS). There is NO corresponding server implementation in
+    this repository: the reference package is a deterministic, offline, dry-run
+    decision engine whose only network touch is the loopback LIVE-CAPTURE
+    challenge origin (a unit-testable channel, not this API). Do not treat this
+    document as a live contract; treat it as a forward design artifact for the
+    future control plane.
+
+    The ONLY contract the reference package actually enforces end-to-end is
+    the evidence/decision/rule/receipt pipeline defined by the JSON Schemas in
+    /schemas and exercised by reference/verify.sh.
+
+    This contract is for evidence, decisions, approvals, bundles, and receipts;
+    it is not an endpoint for arbitrary network commands.
 servers:
   - url: https://apip.operator.invalid/api/v1
 security:
@@ -227,11 +242,14 @@ components:
   schemas:
     Indicator:
       type: object
-      required: [id, type, value, sources, evidence]
+      required: [id, type, value]
       properties:
         id: {type: string}
         tenant_id: {type: string}
-        type: {type: string, enum: [fqdn, ipv4, ipv6, cidr, url, file_hash, cert_fingerprint, network_fingerprint]}
+        # type vocabulary reconciled to the reference runtime's loadable set
+        # (apip.io._INDICATOR_TYPES, audit P1-29): file_hash / cert_fingerprint /
+        # network_fingerprint are DRAFT-FUTURE, not reference input types.
+        type: {type: string, enum: [fqdn, ipv4, ipv6, cidr, url]}
         value: {type: string}
         sources:
           type: array
@@ -340,7 +358,10 @@ components:
         id: {type: string}
         decision_id: {type: string}
         adapter: {type: string}
-        status: {type: string, enum: [prepared, applied, verified, failed, reverted, expired, dry_run]}
+        # life cycle vocabulary reconciled to action_receipt.schema.json
+        # (audit P1-30): 'revoked' (a receipt/rule is revoked), not 'reverted'
+        # (which is specifically the L1 budget auto-demotion concept).
+        status: {type: string, enum: [prepared, applied, verified, failed, revoked, expired, dry_run]}
         created_at: {type: string, format: date-time}
         device_revision: {type: [string, 'null']}
         artifact_hash: {type: [string, 'null']}

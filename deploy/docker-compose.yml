@@ -1,0 +1,53 @@
+# APIP public-beta deployment: controller + PostgreSQL durable ledger.
+#
+# The DNS resolver itself is intentionally NOT part of this compose — RPZ is
+# applied to a resolver the OPERATOR authorizes and manages (an operator-owned
+# BIND-compatible recursive resolver). SHADOW mode (default) publishes a
+# monitor-only zone file and performs no live resolver change, so the safest
+# posture is usable with no resolver wiring at all.
+#
+# Quick start:
+#   cp .env.example .env   # then fill in generated secrets
+#   docker compose up -d
+#   docker compose exec apip apip migrate
+#   docker compose exec apip apip status
+#
+# Never ship real secrets; the values in .env are yours to generate.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-apip}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-apip}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-apip}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  apip:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APIP_CONFIG: /etc/apip/apip.toml
+      APIP_DB_PASSWORD: ${POSTGRES_PASSWORD:?set a POSTGRES_PASSWORD in .env}
+      APIP_OPERATOR_TOKEN: ${APIP_OPERATOR_TOKEN:?set APIP_OPERATOR_TOKEN in .env}
+      APIP_SECRET_KEY: ${APIP_SECRET_KEY:?set APIP_SECRET_KEY in .env}
+    volumes:
+      - rpz:/var/lib/apip/rpz
+    ports:
+      - "8510:8510"
+    command: ["apip", "serve"]
+
+volumes:
+  pgdata:
+  rpz:

@@ -217,30 +217,10 @@ def _decision_id(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip:
     return "decision--" + hashlib.sha256(payload.encode()).hexdigest()[:24]
 
 
-def _content_hash(*parts: object) -> str:
-    """P1-10 (audit): content hash over the exact parameterized action output.
-
-    The logical `_decision_id` persists across epochs (a finding is the same
-    finding), but every distinct ACTION INSTANCE — embodied in its disposition,
-    rung, selector, TTL, and recorded draws — must have a unique identity so
-    receipts/reconciliation/revocation reference the exact emitted rule. This
-    hash covers every field that parameterizes the action.
-    """
-    payload = "\x1f".join(_serialize(p) for p in parts)
-    return "hash--" + hashlib.sha256(payload.encode()).hexdigest()[:24]
-
-
-def _serialize(v: object) -> str:
-    """Deterministic, separator-safe serialization for content hashing."""
-    if isinstance(v, (list, tuple)):
-        return _list_str(v)
-    if isinstance(v, dict):
-        return _list_str(sorted((repr(k), _serialize(v[k])) for k in v))
-    return repr(v)
-
-
-def _list_str(items) -> str:
-    return "[" + ",".join(_serialize(i) for i in items) + "]"
+# P1-10 content hashing. Canonical definition lives on models.content_hash so
+# `Decision` demotion transitions compute self-consistent instance hashes
+# without an import cycle; policy aliases it (single source of truth).
+from .models import content_hash as _content_hash
 
 
 def _in_scope(value: str, itype: str, policy: Policy) -> bool:
@@ -724,6 +704,18 @@ def with_client_impact_demotion(decision: Decision) -> Decision:
     as met so the audit trail shows the reversion was a budget event, not a
     scoring failure. Mirrors `Decision.with_budget_demotion()`; kept as a
     separate named transition because the two budgets alarm differently."""
+    # v2.3 (adversarial-audit fix, K-class): a demoted OBSERVE carries NO
+    # randomization draw and a SELF-CONSISTENT action-instance content_hash.
+    # The incoming decision is AUTO_ENFORCE/SHADOW carrying a TTL/ceiling draw
+    # recorded against the TTL it was about to enforce; this transition drops
+    # that TTL to 0, so keeping the draw would publish a contradictory audit
+    # record ("ttl_seconds=0" alongside a draw for a positive enforced TTL).
+    # content_hash is recomputed over the DEMOTED fields so it identifies THIS
+    # observe action instance (never the dropped enforce one) — exactly the
+    # P1-10 contract.
+    demoted_hash = _content_hash(
+        "OBSERVE", "observe", "L0", 0, None, None, decision.policy_version,
+    )
     return Decision(
         id=decision.id + "-challenge-budget-reverted",
         indicator_id=decision.indicator_id,
@@ -740,9 +732,10 @@ def with_client_impact_demotion(decision: Decision) -> Decision:
                                      "challenge_auto_reverted_to_L0"})),
         explanation=decision.explanation,
         selector=None,
-        nominal_ttl_seconds=decision.nominal_ttl_seconds,
-        randomization=decision.randomization,
+        nominal_ttl_seconds=0,
+        randomization=None,
         attribution_refs=decision.attribution_refs,
+        content_hash=demoted_hash,
     )
 
 

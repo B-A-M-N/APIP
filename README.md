@@ -1,5 +1,20 @@
 # Attack-Path Interdiction Platform (APIP)
 
+> **APIP 0.1.0 is a public-beta *product*** — a deterministic, AI-free
+> defensive control plane focused on safe **exact-FQDN DNS RPZ**
+> shadow/canary enforcement with a durable ledger and a real operator CLI.
+> **Start with [`PRODUCT.md`](PRODUCT.md)**.
+>
+> This repository also contains the broader APIP **specification** (`docs/`
+> and `FULL_SPEC.md`) and an independent deterministic **reference oracle**
+> (`reference/`). Features described in the specification are **not
+> necessarily implemented in the beta** — see
+> [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the exact
+> `SPECIFIED / REFERENCE IMPLEMENTED / PRODUCT IMPLEMENTED / BETA SUPPORTED /
+> FUTURE` status of every component. Do not assume a spec'd feature ships.
+
+---
+
 **Working specification and safe reference scaffold — v2.1 design, researched through 2026-09-01**
 
 APIP is a defensive network-control platform intended for deployment at a network chokepoint that an operator owns or is explicitly authorized to control. It ingests cyber-threat intelligence and local telemetry, normalizes and corroborates evidence, computes bounded defensive decisions, compiles those decisions into vendor-neutral enforcement intents, and publishes short-lived controls to authorized DNS, firewall/IPS, proxy/WAF, NAC, or routing actuators.
@@ -7,6 +22,15 @@ APIP is a defensive network-control platform intended for deployment at a networ
 The core value proposition is **one strategically placed deployment protecting many downstream systems without endpoint agents**.
 
 **v2.1 upgrade (docs 23–30):** the design now covers the attack surface created by AI-assisted offensive tooling with six additional deterministic layers — behavioral detection of hostile *classes* of behavior, encryption/bypass resistance, a layered interdiction ladder that removes the shared-infrastructure safe harbor, allow-first (deny-by-default) egress for critical fixed-function segments, virtual patching for unpatched CVE windows, seeded randomization of defensive parameters (moving-target defense) that stays fully replayable, and a requester attribution/fingerprinting engine for campaign correlation. **The platform involves no AI components anywhere in its operation** — AI appears only in the threat model (`docs/28`), and attribution output can never authorize enforcement (`docs/30`).
+
+## Operator and maintainer
+
+This product is maintained for and attributed to **B-A-M-N**. Where any
+documentation, log, or toolchain refers to the local OS account or system user
+(`bamn`), that is purely the Linux account the tooling runs under — it is not
+the operator/maintainer identity. The operator-facing surfaces (CLI, API,
+audit trail) name the acting operator explicitly and ratably; attribution to
+**B-A-M-N** is the human identity this product is accountable to.
 
 ## Scope boundary
 

@@ -1,0 +1,36 @@
+{
+  "indicators": [
+    {
+      "id": "indicator--acceptance-c2",
+      "type": "fqdn",
+      "value": "c2-test.invalid",
+      "sources": ["local-sensor"],
+      "first_seen": "2026-09-03T03:00:00Z",
+      "last_seen": "2026-09-03T03:30:00Z",
+      "marking": "TLP:AMBER",
+      "tags": ["c2", "acceptance", "local-detection"],
+      "evidence": [
+        {
+          "kind": "direct_local_detection",
+          "source_id": "local-sensor",
+          "observed_at": "2026-09-03T03:00:00Z"
+        },
+        {
+          "kind": "exact_fqdn",
+          "source_id": "local-sensor",
+          "observed_at": "2026-09-03T03:10:00Z"
+        },
+        {
+          "kind": "recent",
+          "source_id": "local-sensor",
+          "observed_at": "2026-09-03T03:25:00Z"
+        },
+        {
+          "kind": "bounded_scope",
+          "source_id": "local-sensor",
+          "observed_at": "2026-09-03T03:05:00Z"
+        }
+      ]
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import html
 import json
 from .attribution import CorrelationStore
 
@@ -13,6 +14,7 @@ from .attribution import CorrelationStore
 def render_correlation_report(report: dict, title: str = "Requester Attribution — Campaign Correlation") -> str:
     """Deterministic HTML rendering of a correlation report. Same report in,
     same bytes out — the view is reproducible like every other artifact."""
+    title = html.escape(title, quote=True)   # title is caller/operator-influenced
     groups = report.get("fingerprint_groups", [])
     links = report.get("cross_fingerprint_links", [])
     degraded = report.get("degraded", False)
@@ -21,24 +23,35 @@ def render_correlation_report(report: dict, title: str = "Requester Attribution 
     # stable per-group index for link display
     idx = {fp: str(i + 1) for i, fp in enumerate(sorted(by_fp))}
 
+    # v2.3 (adversarial-audit fix): every report-derived value is UNTRUSTED
+    # and is HTML-escaped before interpolation. The prior `f"...{fp}..."` and
+    # `{title}` interpolations dropped report/input bytes straight into the
+    # page — a tainted handle_keying, schema_version, fingerprint, requester
+    # handle, or title could inject markup into an artifact that operations
+    # reads in-browser. Escaping here is the boundary: display-only, lossy for
+    # anything that is not literal text, and always safe to render. Counts stay
+    # numeric (untaintable).
+    def esc(v: object) -> str:
+        return html.escape(str(v or ""), quote=True)
+
     rows = []
     for fp in sorted(by_fp):
         g = by_fp[fp]
         handles = g["requester_handles"]
         rows.append(f"""
       <tr>
-        <td class="fp"><code>{fp}</code><div class="sub">{idx[fp]}</div></td>
+        <td class="fp"><code>{esc(fp)}</code><div class="sub">{idx[fp]}</div></td>
         <td>{g["probe_count"]}</td>
         <td>{len(handles)}</td>
-        <td class="handles">{"<br/>".join(f"<code>{h}</code>" for h in handles)}</td>
+        <td class="handles">{"<br/>".join(f"<code>{esc(h)}</code>" for h in handles)}</td>
       </tr>""")
 
     link_rows = []
     for l in sorted(links, key=lambda x: (-x["shared_probes"], x["a"], x["b"])):
         link_rows.append(f"""
       <tr>
-        <td>Group {idx[l["a"]]} <code class="dim">{l["a"]}</code></td>
-        <td>Group {idx[l["b"]]} <code class="dim">{l["b"]}</code></td>
+        <td>Group {idx[l["a"]]} <code class="dim">{esc(l["a"])}</code></td>
+        <td>Group {idx[l["b"]]} <code class="dim">{esc(l["b"])}</code></td>
         <td>{l["shared_probes"]} shared probes</td>
       </tr>""")
 
@@ -99,7 +112,7 @@ def render_correlation_report(report: dict, title: str = "Requester Attribution 
 <main>
   <h1>{title}</h1>
   <p class="meta">{len(groups)} fingerprint group(s) · {report.get("tracked_requesters", 0)} requester(s) tracked
-     · schema {report.get("schema_version", "?")} · handle keying: {keying} · display-only</p>
+     · schema {esc(report.get("schema_version", "?"))} · handle keying: {esc(keying)} · display-only</p>
   {banner}
   <table>
     <thead><tr><th>Fingerprint</th><th>Probes</th><th>Requesters</th><th>Handles (pseudonymous)</th></tr></thead>

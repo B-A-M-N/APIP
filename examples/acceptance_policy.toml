@@ -1,0 +1,78 @@
+# APIP acceptance-test policy (SHADOW, exact-FQDN beta target).
+# Authorizes `*.invalid` only — the reserved demo TLD. In production an
+# operator would enumerate their real governed domains; this is the
+# operator-owned boundary EXACTLY as the passing negative tests rely on.
+policy_version = "acceptance.1"
+mode = "SHADOW"
+scope = "acceptance-tenant"
+
+[thresholds]
+observe_m = 40
+fqdn_auto_m = 95
+fqdn_auto_s = 90
+ip_rate_m = 90
+ip_rate_s = 85
+ip_deny_m = 98
+ip_deny_s = 95
+
+[thresholds.rungs.L1]
+m = 85
+s = 75
+
+[thresholds.rungs.L2]
+m = 90
+s = 80
+
+[thresholds.rungs.L4]
+m = 95
+s = 90
+
+[thresholds.rungs.L5]
+m = 98
+s = 95
+
+[limits]
+max_auto_ttl_seconds = 600
+max_new_auto_actions_per_batch = 100
+max_evidence_per_indicator = 64
+nominal_rate_ceiling_per_min = 240
+
+# Operator-authorized target boundary (defense in depth layer 1). Only TLDs /
+# suffixes listed here are ever in scope. Out-of-scope => hard reject.
+[authorization]
+authorized_prefixes = []
+authorized_domains = [
+  "invalid",
+]
+
+[safety]
+auto_prefix_deny = false
+auto_routing = false
+auto_wildcard_domain = false
+allowlist_precedence = true
+no_ai_components = true
+
+[behavioral]
+enabled_families = ["beacon_periodicity", "first_seen_novelty"]
+max_behavioral_m_contribution = 60
+
+[behavioral.corroboration]
+distinct_families_for_rate_limit = 2
+distinct_families_for_deny = 3
+deny_also_requires_external = true
+
+[randomization]
+enabled = true
+bounds_version = "rv-acceptance.1"
+
+[randomization.mechanisms.ttl_jitter]
+enabled = true
+min = 0.8
+max = 1.0
+units = "fraction_of_nominal_ttl"
+
+[randomization.mechanisms.rate_ceiling]
+enabled = true
+min = 0.5
+max = 1.0
+units = "fraction_of_nominal_ceiling"

@@ -1,17 +1,22 @@
 """Terminator log adapters (docs/30, WP-30).
 
-Convert production proxy/TLS-terminator access logs into observed-transaction
-records conforming to `schemas/observed_transaction.schema.json`.
+Byte-compatible port of ``reference/src/apip/live/adapters.py`` — the
+collection channel that turns production proxy/TLS-terminator access logs
+into observed-transaction records conforming to the docs/30 contract.
 
 Each adapter is a pure line->record function plus a line-format recognizer.
-They parse only observable-behavior fields; anything not mapped by the
-contract is dropped, and records that would violate the contract are
-rejected (never coerced) via validate_transaction at emit time.
+Only observable-behavior fields are mapped; anything outside the contract is
+dropped, and records that would violate the contract are rejected (never
+coerced) via ``validate_transaction`` at emit time.
 
 Supported formats (operators extend by registering an adapter):
   - envoy      : default Envoy access-log format
   - haproxy    : HAProxy default HTTP log format (format %b)
   - nginx      : NGINX `log_format` with the JSON escape (common fields)
+
+This is OBSERVE-ONLY: parsing a log never triggers or influences any
+enforcement action, and a malformed line never stops a batch (counted,
+not raised).
 """
 from __future__ import annotations
 
@@ -20,7 +25,7 @@ import json
 import re
 from typing import Callable
 
-from ..attribution import TransactionRejected, validate_transaction
+from apip.attribution import TransactionRejected, validate_transaction
 
 Adapter = Callable[[str], dict | None]
 
@@ -36,26 +41,23 @@ def adapter(name: str):
 
 def _safe_client(ref: str) -> str | None:
     """Accept well-formed address refs in ALL common terminator spellings;
-    log injection attempts are rejected rather than sanitized into
-    something plausible.
+    log injection attempts are rejected rather than sanitized into something
+    plausible.
 
     Normalization rules (the handle is derived from the RETURNED string, so
     every spelling of one address must return the same string):
-      - ip:port (IPv4)      -> bare address      (v2.1.1 audit fix)
-      - [v6]:port           -> bare v6 address   (v2.2: previously REJECTED,
-                                                    fragmenting IPv6 clients)
+      - ip:port (IPv4)      -> bare address;
+      - [v6]:port           -> bare v6 address;
       - bare v6             -> canonical RFC 5952 form, so '2001:db8::1' and
-                               '2001:0db8:0000::1' derive ONE handle
+                               '2001:0db8:0000::1' derive ONE handle;
       - zone ids ('%eth0')  -> rejected (link-local scope is not a stable
-                               requester identity)
+                               requester identity).
     Returns the CANONICAL ipaddress rendering, which is what the attribution
-    HMAC hashes — canonicalization here is what makes cross-format
-    correlation exact for IPv6, not just IPv4.
+    HMAC hashes.
     """
     ref = (ref or "").strip()
     if not ref:
         return None
-    # [v6]:port — the only standard form where host and port are unambiguous
     if ref.startswith("[") and "]" in ref:
         host, _, port = ref[1:].partition("]")
         if port.startswith(":"):
@@ -63,8 +65,6 @@ def _safe_client(ref: str) -> str | None:
         else:
             return None
     else:
-        # strip a single trailing :port for IPv4 only; IPv6 colons are
-        # structural, never a port separator
         if ref.count(":") == 1:
             addr = ref.rsplit(":", 1)[0]
         else:
@@ -79,13 +79,6 @@ def _safe_client(ref: str) -> str | None:
 
 @adapter("envoy")
 def parse_envoy(line: str) -> dict | None:
-    """Envoy default format:
-    [start] "REQ" code - "RESP" - 0 0 0 0 0 0 0 - - "-" "-"
-    We accept the common annotated form: [start] client method path ... with
-    headers captured via the %REQ(...)% dynamic form emitted as k=v pairs.
-    Minimal contract: leading [timestamp], then quoted request line, then
-    fields; client ref is the first token after the request line.
-    """
     m = re.match(r'^\[(?P<ts>[^\]]+)\]\s+"(?P<req>[^"]*)"\s+(?P<rest>.*)$', line)
     if not m:
         return None
@@ -93,10 +86,6 @@ def parse_envoy(line: str) -> dict | None:
     if len(req) < 2:
         return None
     rest = (m.group("rest") or "").strip()
-    # v2.3 (adversarial-audit fix): the rest segment is UNTRUSTED, possibly a
-    # lone `"` or empty after trimming. `rest.split('"')[0]` on a leading-quote
-    # string yields "" whose split() raises IndexError — an invalid line must
-    # be rejected as unparsed, never crash the batch.
     first = rest.split('"', 1)[0].split()
     if not first:
         return None
@@ -104,7 +93,6 @@ def parse_envoy(line: str) -> dict | None:
     if client is None:
         return None
     rec: dict = {"client_ref": client, "observed_at": _norm_ts(m.group("ts"))}
-    # dynamic header captures appear as key=value tokens in the rest
     for tok in re.findall(r'(\w[\w.-]*)=([^\s"]+)', m.group("rest")):
         k, v = tok
         lk = k.lower()
@@ -119,12 +107,6 @@ def parse_envoy(line: str) -> dict | None:
 
 @adapter("haproxy")
 def parse_haproxy(line: str) -> dict | None:
-    """HAProxy default HTTP log (%b):
-    Jan  1 00:00:00 host haproxy[pid]: client:port [date] frontend ...
-    We extract client ref + timestamp; header captures require the
-    operator's capture directive (capture.req.header) appended as
-    h=accept-language:... tokens, which we map here.
-    """
     m = re.match(r'^\S+\s+\d+\s+\S+\s+\S+\s+haproxy\[\d+\]:\s+(?P<client>\S+)\s+'
                  r'\[(?P<ts>[^\]]+)\]', line)
     if not m:
@@ -144,11 +126,6 @@ def parse_haproxy(line: str) -> dict | None:
 
 @adapter("nginx")
 def parse_nginx(line: str) -> dict | None:
-    """NGINX JSON access log with the conventional field names:
-    {"time":"...","remote_addr":"...","http_accept_language":"...",
-     "http_accept_encoding":"...","ja4":"...","header_order":"a|b|c"}
-    `header_order` ($http variable order capture, pipe-separated) maps to P1.
-    """
     try:
         obj = json.loads(line)
     except json.JSONDecodeError:
@@ -177,7 +154,7 @@ def parse_nginx(line: str) -> dict | None:
     return rec
 
 
-from datetime import datetime as _dt, timezone as _tz
+from datetime import datetime as _dt, timezone as _tz  # noqa: E402
 
 _CLF_MONTHS = {m: i + 1 for i, m in enumerate(
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -189,7 +166,6 @@ def _norm_ts(ts: str) -> str:
     contract's ISO-8601 UTC form. Unparseable input is passed through and
     will be rejected at the contract boundary (never silently accepted)."""
     ts = ts.strip()
-    # already ISO-8601 (Envoy/NGINX): pass through, forcing Z suffix
     try:
         if ts[4] == "-" and ts[7] == "-" and "T" in ts:
             d = _dt.fromisoformat(ts.replace("Z", "+00:00"))
@@ -198,7 +174,6 @@ def _norm_ts(ts: str) -> str:
             return d.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except (ValueError, IndexError):
         pass
-    # HAProxy clang form: 03/Jan/2026:19:00:00.001 (treated as UTC)
     m = re.match(r"^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$", ts)
     if m:
         day, mon, year, hh, mm, ss, frac = m.groups()
@@ -210,9 +185,6 @@ def _norm_ts(ts: str) -> str:
                         hour=int(hh), minute=int(mm), second=int(ss),
                         microsecond=micro, tzinfo=_tz.utc)
             except ValueError:
-                # impossible calendar value (day=99, hour=25, ...): not a real
-                # instant, pass through so the contract boundary rejects it as
-                # unparseable rather than crashing the batch (adversarial-audit)
                 return ts
             return d.strftime("%Y-%m-%dT%H:%M:%SZ")
     return ts

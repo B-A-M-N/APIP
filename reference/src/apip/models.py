@@ -1,6 +1,35 @@
 from __future__ import annotations
+import hashlib
 from dataclasses import dataclass, asdict, field
 from typing import Any
+
+
+def content_hash(*parts: object) -> str:
+    """P1-10 (audit): content hash over the exact parameterized action output.
+
+    Distinct ACTION INSTANCES — embodied in their disposition, rung, selector,
+    TTL, and recorded draws — must each have a unique identity so
+    receipts/reconciliation/revocation reference the exact emitted rule. This
+    hash covers every field that parameterizes the action. Defined here (not in
+    policy) so `Decision` demotion transitions can compute a self-consistent
+    instance hash without an import cycle. `policy._content_hash` aliases this
+    (see `from .models import content_hash as _content_hash`).
+    """
+    payload = "\x1f".join(_serialize(p) for p in parts)
+    return "hash--" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+
+
+def _serialize(v: object) -> str:
+    """Deterministic, separator-safe serialization for content hashing."""
+    if isinstance(v, (list, tuple)):
+        return _list_str(v)
+    if isinstance(v, dict):
+        return _list_str(sorted((repr(k), _serialize(v[k])) for k in v))
+    return repr(v)
+
+
+def _list_str(items) -> str:
+    return "[" + ",".join(_serialize(i) for i in items) + "]"
 
 @dataclass(frozen=True)
 class Evidence:
@@ -117,6 +146,16 @@ class Decision:
         L0/NONE, TTL zeroed, and the demotion is recorded with a named
         reason. Deterministic: same decision in, same demoted decision out
         (the id is intentionally recomputed from the demoted fields)."""
+        # v2.3 (adversarial-audit fix, K-class): a demoted OBSERVE carries NO
+        # randomization draw and a SELF-CONSISTENT action-instance content_hash.
+        # The incoming decision's TTL/ceiling draw referenced a TTL this OBSERVE
+        # no longer enforces (ttl_seconds=0) — carrying it forward would publish
+        # a contradictory audit record. content_hash is recomputed over the
+        # DEMOTED fields (P1-10), so an observer never conflates this observe
+        # instance with the enforce one that was dropped.
+        demoted_hash = content_hash(
+            "OBSERVE", "observe", "L0", 0, None, None, self.policy_version,
+        )
         return Decision(
             id=self.id + "-demoted",      # traceable to the enforcing decision
             indicator_id=self.indicator_id,
@@ -132,7 +171,8 @@ class Decision:
                                       | {"blast_radius_budget_exceeded"})),
             explanation=self.explanation,
             selector=None,
-            nominal_ttl_seconds=self.nominal_ttl_seconds,
-            randomization=self.randomization,
+            nominal_ttl_seconds=0,   # the enforced TTL was dropped, so its draw is too
+            randomization=None,
             attribution_refs=self.attribution_refs,
+            content_hash=demoted_hash,
         )

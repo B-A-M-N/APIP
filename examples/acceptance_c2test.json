@@ -1,0 +1,41 @@
+{
+  "indicators": [
+    {
+      "id": "indicator--acceptance-c2",
+      "type": "fqdn",
+      "value": "c2-test.invalid",
+      "sources": ["threat-feed-a", "threat-feed-b"],
+      "first_seen": "2026-09-03T03:00:00Z",
+      "last_seen": "2026-09-03T03:30:00Z",
+      "marking": "TLP:CLEAR",
+      "tags": ["c2", "acceptance"],
+      "evidence": [
+        {
+          "kind": "curated_source",
+          "source_id": "threat-feed-a",
+          "observed_at": "2026-09-03T03:00:00Z"
+        },
+        {
+          "kind": "curated_source",
+          "source_id": "threat-feed-b",
+          "observed_at": "2026-09-03T03:05:00Z"
+        },
+        {
+          "kind": "exact_fqdn",
+          "source_id": "threat-feed-a",
+          "observed_at": "2026-09-03T03:10:00Z"
+        },
+        {
+          "kind": "recent",
+          "source_id": "threat-feed-a",
+          "observed_at": "2026-09-03T03:25:00Z"
+        },
+        {
+          "kind": "recent",
+          "source_id": "threat-feed-b",
+          "observed_at": "2026-09-03T03:30:00Z"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+# APIP controller configuration example (beta).
+#
+# Copy to apip.toml and edit. This file holds ORDINARY configuration only.
+# Secrets (database password, operator token, secret key) NEVER go here —
+# they are injected from the environment or *_FILE secret files at launch
+# (see apip.config.service). A policy payload is separate again: see
+# docs/ for the policy TOML schema, and NEVER put credentials in a policy.
+
+[api]
+host = "0.0.0.0"        # bind for the operator HTTP API + CLI
+port = 8510
+
+[database]
+# The controller connects to its durable ledger. Use the TCP host here; in
+# Docker Compose this is the `db` service. Never commit a password to this
+# file — provide it via APIP_DB_PASSWORD or APIP_DB_PASSWORD_FILE.
+host = "127.0.0.1"
+port = 5432
+dbname = "apip"
+user = "apip"
+connect_timeout_s = 5
+
+[controller]
+# Reconciliation cadence (seconds): expiry sweep, pending dispatch, verify.
+reconcile_interval_s = 15
+# Verify active actions at least this often (seconds).
+verify_interval_s = 300
+# Default action TTL when a policy sets none (seconds).
+default_action_ttl_s = 3600
+# Hard ceiling on action TTL the controller will honor (seconds).
+max_action_ttl_s = 86400
+
+[adapter]
+# The RPZ adapter's OWN maximum posture. SHADOW (default) is genuinely
+# useful for beta: it publishes a monitor-only zone APIP verifies against
+# the zone file, with no live resolver behavior change.
+rpz_mode = "SHADOW"
+# Directory the adapter writes zone files into (ignored by the resolver).
+zone_dir = "/var/lib/apip/rpz"
+# Zone name for the generated RPZ zone header.
+zone_name = "apip.shadow.invalid"
+# Optional reload command (e.g. "rndc reload apipzone"). Empty = no reload.
+reload_command = ""
+# Authorized target boundary (defense in depth): ONLY FQDNs equal to or
+# subdomains of these may ever be targeted, independently of policy. This
+# is the operator-owned scope wall — leave empty to forbid ALL targets.
+authorized_domains = ["example.operator.net"]
+# For ENFORCE: a resolver to query for verification. Leave empty in SHADOW.
+verify_query_server = ""
+verify_query_port = 53
+verify_timeout_s = 3.0
+
+# --------------------------------------------------------------------------
+# SECRETS — provided via environment or *_FILE, NOT in this file:
+#   APIP_OPERATOR_TOKEN        operator bearer token for CLI/API
+#   APIP_OPERATOR_TOKEN_FILE   (alternative) path to a file containing it
+#   APIP_DB_PASSWORD           database password
+#   APIP_DB_PASSWORD_FILE      (alternative) path to a file containing it
+#   APIP_SECRET_KEY            high-entropy secret for derived keys
+# ---------------------------------------------------------------------------

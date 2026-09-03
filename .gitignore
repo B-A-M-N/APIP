@@ -4,3 +4,6 @@ examples/generated/
 .pytest_cache/
 *.egg-info/
 output/
+.venv-apip/
+build/
+*.pyright/

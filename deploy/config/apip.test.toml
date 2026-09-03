@@ -1,0 +1,28 @@
+# Local acceptance-test config for APIP (NOT for production).
+# DB password + operator token are provided via env at run time.
+[api]
+host = "127.0.0.1"
+port = 8510
+
+[database]
+host = "127.0.0.1"
+port = 5432
+dbname = "apip"
+user = "apip"
+connect_timeout_s = 5
+
+[controller]
+reconcile_interval_s = 2
+verify_interval_s = 30
+default_action_ttl_s = 60
+max_action_ttl_s = 3600
+
+[adapter]
+rpz_mode = "SHADOW"
+zone_dir = "/tmp/apip/rpz"
+zone_name = "apip.shadow.invalid"
+reload_command = ""
+authorized_domains = ["operator.test", "invalid"]
+verify_query_server = ""
+verify_query_port = 53
+verify_timeout_s = 3.0

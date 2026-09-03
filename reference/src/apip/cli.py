@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json
+import argparse, contextlib, json, os, tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 from .config import load_policy
@@ -18,6 +18,60 @@ from .sanitize import UnsafeIdentifier, validate_client
 # the OPERATOR supplies (or a production pipeline derives from telemetry);
 # a batch of indicators has no meaningful per-indicator client anyway.
 DEMO_CLIENT = "demo-interactive-client"
+
+
+def _safe_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Write an output artifact, REFUSING to write through a symlink
+    (adversarial-audit fix). Path::write_text / open('w') follow symlinks, so a
+    pre-placed symlink at a fixed artifact path (`decisions.json`,
+    `suricata.rules`, ...) pointing anywhere on disk would let one run
+    overwrite an arbitrary file the operator never meant to touch. Fail closed:
+    if `path` is already a symlink we raise before any byte is written, naming
+    the offender. The write itself goes to a `mkstemp` file in the same
+    directory (O_EXCL — cannot follow a pre-placed symlink at a guessable name)
+    then `os.replace` swaps it in, so a concurrent attacker racing the open
+    with their own symlink can never redirect our bytes into a target file.
+    """
+    if path.is_symlink():
+        raise SystemExit(f"refusing to write through symlink: {path}")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+@contextlib.contextmanager
+def _safe_writer(path: Path, *, encoding: str = "utf-8"):
+    """Context manager handing back a text writer whose content lands in an
+    exclusive `mkstemp` file (never through a symlink) and is moved into place
+    only on clean exit (adversarial-audit fix, same class as `_safe_write_text`
+    but for streaming/structured writes like transactions.jsonl). A pre-placed
+    symlink at `path` is refused up front with a named error."""
+    if path.is_symlink():
+        raise SystemExit(f"refusing to write through symlink: {path}")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    commit = False
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as fh:
+            yield fh
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        commit = True
+    finally:
+        if not commit:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
 
 
 def _receipt(art: CompiledArtifact) -> dict:
@@ -89,10 +143,25 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 if not line:
                     continue
                 obj = json.loads(line)
+                # v2.3 (adversarial-audit fix): a `--transactions` line is
+                # UNTRUSTED input. A non-object value (list, string, number,
+                # null) previously crashed the whole batch with an AttributeError
+                # on `.get` — reject it loudly as a malformed line instead.
+                if not isinstance(obj, dict):
+                    raise SystemExit(
+                        f"transaction record malformed at {args.transactions}:{lineno}: "
+                        f"expected a JSON object, got {json.dumps(obj)[:80]!r}")
                 if obj.get("rejected"):
                     continue   # live-capture rejection marker, not a record
                 try:
-                    store.observe(obj)
+                    # v2.3 (adversarial-audit fix, P1-14 lineage): the records
+                    # folded here are LIVE-CAPTURED observed transactions whose
+                    # `client_ref` is ALREADY the pseudonymous requester handle
+                    # (the live boundary HMACs once at capture). Feeding them to
+                    # `observe` would HMAC the handle a SECOND time, so
+                    # `attribution_refs_for(raw)` on real captures would miss —
+                    # live and offline ingestion must derive ONE identity.
+                    store.observe_pseudonymous_handle(obj)
                 except TransactionRejected as e:
                     raise SystemExit(
                         f"transaction record rejected at {args.transactions}:{lineno}: {e}")
@@ -179,6 +248,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         if budget is not None and d.disposition in {"AUTO_ENFORCE", "SHADOW_ACTION"}:
             if proposed >= budget:
                 budget_exceeded = True
+                # `with_budget_demotion` now produces a self-consistent OBSERVE
+                # (no stale TTL draw; content_hash over the demoted fields).
                 d = d.with_budget_demotion()
             else:
                 proposed += 1
@@ -195,7 +266,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     pairs, challenged_budget_exceeded = apply_client_impact_budget(pairs, policy)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "decisions.json").write_text(json.dumps([d.to_dict() for _, d in pairs], indent=2) + "\n")
+    _safe_write_text(out / "decisions.json",
+                     json.dumps([d.to_dict() for _, d in pairs], indent=2) + "\n")
     # v2.3 (audit P1-26/P1-27): compilation produces STRUCTURED artifacts —
     # one CompiledArtifact per decision that actually rendered a rule/zone
     # line. The string outputs below are thin concatenations of those
@@ -203,8 +275,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     # decision that produced no artifact also produces no receipt.
     rpz_arts = compile_rpz_structured(pairs)
     suri_arts = compile_rules_structured(pairs)
-    (out / "rpz.zone").write_text(compile_rpz(pairs))
-    (out / "suricata.rules").write_text(compile_rules(pairs))
+    _safe_write_text(out / "rpz.zone", compile_rpz(pairs))
+    _safe_write_text(out / "suricata.rules", compile_rules(pairs))
     if budget_exceeded:
         print(f"WARNING: blast-radius budget reached ({budget} actions/batch); "
               f"overflow demoted to OBSERVE with reason blast_radius_budget_exceeded")
@@ -226,15 +298,17 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     # no exporter implements as a dry-run artifact — yields NO receipt,
     # rather than a fabricated attestation of a nonexistent control.
     receipts = [_receipt(a) for a in (rpz_arts + suri_arts)]
-    (out / "receipts.json").write_text(json.dumps(receipts, indent=2) + "\n")
+    _safe_write_text(out / "receipts.json",
+                     json.dumps(receipts, indent=2) + "\n")
     # docs/30: campaign-correlation report (the analyst view, file form).
     # Display-only: feeding it back into anything enforcement-side is
     # prohibited and blocked by the attribution source-class gate.
     report = store.report()
-    (out / "attribution_report.json").write_text(json.dumps(report, indent=2) + "\n")
+    _safe_write_text(out / "attribution_report.json",
+                     json.dumps(report, indent=2) + "\n")
     from .uireport import render_correlation_report
-    (out / "attribution_report.html").write_text(
-        render_correlation_report(report), encoding="utf-8")
+    _safe_write_text(out / "attribution_report.html",
+                     render_correlation_report(report), encoding="utf-8")
     print(f"evaluated={len(pairs)} mode={policy.mode} output={out}")
     return 0
 
@@ -315,7 +389,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
             def __init__(self, fh): self.fh = fh
             def write(self, rec): self.fh.write(json.dumps(rec, sort_keys=True) + "\n")
         with open(args.log, "r", encoding="utf-8", errors="replace") as f, \
-                open(tx_path, "w", encoding="utf-8") as o:
+                _safe_writer(tx_path) as o:
             parsed, rejected, unparsed = apply_stream(f, _W(o))
         # fold the captured records into the store
         with open(tx_path, "r", encoding="utf-8") as f:
@@ -337,10 +411,11 @@ def cmd_capture(args: argparse.Namespace) -> int:
             origin.shutdown()
 
     report = store.report()
-    (out / "attribution_report.json").write_text(json.dumps(report, indent=2) + "\n")
+    _safe_write_text(out / "attribution_report.json",
+                     json.dumps(report, indent=2) + "\n")
     from .uireport import render_correlation_report
-    (out / "attribution_report.html").write_text(
-        render_correlation_report(report), encoding="utf-8")
+    _safe_write_text(out / "attribution_report.html",
+                     render_correlation_report(report), encoding="utf-8")
     print(f"tracked={report['tracked_requesters']} degraded={report['degraded']} "
           f"report={out / 'attribution_report.html'}")
     return 0

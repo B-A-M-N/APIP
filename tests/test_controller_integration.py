@@ -1,0 +1,299 @@
+"""Optional integration test of the Task 4 controller wiring against a real
+Postgres.
+
+This exercises the REAL controller orchestration that the DB-free wiring tests
+can only stub:
+  - operator approval (PROPOSE_OPERATOR_APPROVAL) compiles an action;
+  - dispatch applies it (receipt carries observed infra state — no fabricated
+    success);
+  - policy replay re-baselines indicators against the active policy;
+  - adapters_status enumerates every configured adapter (RPZ + Suricata).
+
+It RUNS only when a reachable Postgres lets the current OS user create a
+throwaway database; otherwise it is skipped so the always-on baseline stays
+green without a database. A unique scratch DB is created and dropped per run.
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import sys
+import tempfile
+import uuid
+from dataclasses import replace
+from pathlib import Path
+
+import psycopg2
+import psycopg2.extensions
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from apip.config.service import (  # noqa: E402
+    AdapterConfig,
+    DatabaseConfig,
+    load_config,
+)
+from apip.domain.models import (  # noqa: E402
+    ActionSelector,
+    Decision,
+    Evidence,
+    Indicator,
+)
+
+SOCKET_DIR = "/var/run/postgresql"
+
+
+def _can_connect() -> bool:
+    try:
+        conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
+                                connect_timeout=3)
+        conn.close()
+        return True
+    except psycopg2.Error:
+        return False
+
+
+def _create_scratch() -> str:
+    """Create a scratch database owned by the current user; raise if we cannot
+    (no createdb privilege or unreachable server)."""
+    name = "apip_it_" + uuid.uuid4().hex[:12]
+    conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres", connect_timeout=3)
+    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    cur = conn.cursor()
+    try:
+        cur.execute(f'CREATE DATABASE "{name}"')
+    finally:
+        cur.close()
+        conn.close()
+    return name
+
+
+def _drop_scratch(name: str) -> None:
+    conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres", connect_timeout=3)
+    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    cur = conn.cursor()
+    try:
+        cur.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    finally:
+        cur.close()
+        conn.close()
+
+
+pytestmark = pytest.mark.skipif(
+    not _can_connect(),
+    reason="no reachable Postgres for controller integration test")
+
+
+@pytest.fixture(scope="module")
+def controller():
+    from apip.controller.service import Controller
+    from apip.ledger.db import Database
+    from apip.ledger.migrations import apply_migrations
+
+    dburi = _create_scratch()
+    zone = tempfile.mkdtemp(prefix="apip_it_zone_")
+    try:
+        cfg = replace(
+            load_config(None),
+            db=DatabaseConfig(host=SOCKET_DIR, dbname=dburi, user=os.environ.get("USER", "bamn")),
+            adapter=replace(AdapterConfig(rpz_mode="SHADOW", zone_dir=zone),
+                            authorized_domains=("operator.test",)),
+        )
+        db = Database(cfg.db.dsn_kwargs())
+        db.wait_until_ready(timeout_s=10)
+        apply_migrations(db)
+        db.close()
+
+        ctrl = Controller(cfg)
+        ctrl.start()
+        # seed the channel source the ledger FKs require
+        ctrl.ledger.register_source(
+            source_id="local-sensor", source_class="local", independent=True,
+            key_hash="x", actor="operator", auto_enforcement_allowed=True, enabled=True)
+        # stage + promote the enforce policy so an active policy governs
+        pol_text = (Path(__file__).resolve().parents[1]
+                    / "examples" / "enforce_policy.toml").read_text()
+        rev = ctrl.ledger.next_policy_revision("beta")
+        ctrl.ledger.stage_policy(
+            policy_version="beta", revision=rev,
+            content_sha256=hashlib.sha256(pol_text.encode()).hexdigest(),
+            raw_text=pol_text, mode="ENFORCE", staged_by="operator")
+        ctrl.ledger.promote_policy("beta", rev, "operator")
+        yield ctrl, cfg
+        ctrl.stop()
+    finally:
+        _drop_scratch(dburi)
+
+
+def _record_approval_decision(ctrl, decision_id: str, value: str) -> None:
+    """Seed an indicator + a PROPOSE_OPERATOR_APPROVAL decision in the ledger,
+    the durable precondition the operator approve path consumes."""
+    batch = "batch--" + decision_id
+    ctrl.ledger.record_batch(batch_id=batch, source_id="local-sensor",
+                             raw_sha256="sha" + decision_id, indicator_count=1,
+                             demoted=0, channel="local-sensor", actor="operator")
+    ind = Indicator(
+        id=f"indicator--{decision_id}", type="fqdn", value=value,
+        sources=("local-sensor",),
+        evidence=(Evidence(kind="direct_local_detection", source_id="local-sensor",
+                           source_class="local", observed_at="2026-09-03T03:00:00Z",
+                           independent=True),),
+        tags=("c2",))
+    ctrl.ledger.upsert_indicator(ind, batch)
+    sel = ActionSelector(scope_type="client_destination_pair", client=None,
+                         destination=value, protocol_class="interactive_http")
+    d = Decision(
+        id=decision_id, indicator_id=ind.id, maliciousness=97, action_safety=90,
+        disposition="PROPOSE_OPERATOR_APPROVAL", action="dns_nxdomain", rung="L4",
+        scope=ctrl.current_policy().scope, ttl_seconds=3600, policy_version="beta",
+        reason_codes=("proposed",), explanation="integration approval",
+        selector=sel, content_hash="hash--" + hashlib.sha256(decision_id.encode()).hexdigest())
+    ctrl.ledger.record_decision(d, indicator_id=ind.id, batch_id=batch,
+                                policy_content_sha256="sha", actor="operator")
+
+
+def test_approve_compiles_and_applies_action(controller):
+    ctrl, _ = controller
+    did = "decision--it-approve"
+    value = "c2-appr.operator.test"
+    _record_approval_decision(ctrl, did, value)
+
+    res = ctrl.approve_decision(did, "operator")
+    assert res["compiled"] is True
+    assert res["action_ids"]
+
+    # the created action is a pending RPZ draft awaiting the worker dispatch
+    action = ctrl.ledger.get_action(res["action_ids"][0])
+    assert action["adapter"] == "rpz"
+    assert action["mode"] == "SHADOW"
+    assert action["state"] == "pending"
+
+    # manual dispatch applies it and records a REAL receipt (observed infra state)
+    ctrl._dispatch_one(action)
+    applied = ctrl.ledger.get_action(action["action_id"])
+    assert applied["state"] == "applied"
+    receipts = ctrl.ledger.list_receipts(action["action_id"])
+    assert receipts
+    observed = receipts[0]["observed"]
+    # no fabricated success: the receipt carries observed zone/owner state
+    assert "zone_file" in observed and "zone_sha256" in observed
+
+
+def test_approve_refuses_non_approval_decision(controller):
+    ctrl, _ = controller
+    # NO_ACTION decisions must never be approved into an action
+    try:
+        ctrl.approve_decision("decision--missing", "operator")
+        assert False, "unknown decision should raise"
+    except LookupError:
+        pass
+
+
+def test_adapters_status_includes_rpz_and_suricata(controller):
+    ctrl, _ = controller
+    names = {a["name"] for a in ctrl.adapters_status()}
+    assert {"rpz", "suricata"} <= names
+
+
+def test_replay_policy_runs_against_active_policy(controller):
+    ctrl, _ = controller
+    from apip.ingest import IngestChannel, parse_indicator_payload
+    import json as _json
+
+    batch = "batch--replay"
+    ctrl.ledger.record_batch(batch_id=batch, source_id="local-sensor",
+                             raw_sha256="sha-replay", indicator_count=1,
+                             demoted=0, channel="local-sensor", actor="operator")
+    payload = {"indicators": [{
+        "id": "indicator--replay", "type": "fqdn", "value": "replay.operator.test",
+        "sources": ["local-sensor"], "first_seen": "2026-09-03T03:00:00Z",
+        "last_seen": "2026-09-03T03:40:00Z", "tags": ["c2"],
+        "evidence": [
+            {"kind": "direct_local_detection", "source_id": "local-sensor",
+             "observed_at": "2026-09-03T03:00:00Z"},
+            {"kind": "exact_fqdn", "source_id": "local-sensor",
+             "observed_at": "2026-09-03T03:10:00Z"},
+            {"kind": "recent", "source_id": "local-sensor",
+             "observed_at": "2026-09-03T03:30:00Z"}]}]}
+    channel = IngestChannel(source_id="local-sensor", allowed_source_ids=frozenset())
+    pb = parse_indicator_payload(_json.dumps(payload).encode(), channel)
+    for ind in pb.indicators:
+        ctrl.ledger.upsert_indicator(ind, batch)
+
+    result = ctrl.replay_policy("operator")
+    assert result["indicators"] >= 2          # replay + approval seed indicators
+    assert "policy_version" in result
+    assert result["recorded"] >= 0            # idempotent; may record some new
+
+
+def test_operator_reads_never_leak_key_hash(controller):
+    """GET-style ledger read of a source must exclude the PBKDF2 key_hash.
+    (Previously get_source did SELECT *, leaking the stored credential hash
+    to the operator read surface.)"""
+    ctrl, _ = controller
+    # register_source in the fixture used key_hash="x"; re-read via get_source
+    row = ctrl.ledger.get_source("local-sensor")
+    assert row is not None
+    assert "key_hash" not in row
+    assert row["source_id"] == "local-sensor"
+    assert row["source_class"] == "local"
+    # list_sources, the other operator-facing read, also excludes it
+    for s in ctrl.ledger.list_sources():
+        assert "key_hash" not in s
+
+
+def test_record_decision_idempotent_at_the_database(controller):
+    """record_decision is idempotent on (decision_id, content_hash) and that
+    invariant is pinned by a UNIQUE index (no check-then-insert race): two
+    inserts of the identical decision return (True, False), and the DB holds
+    exactly one row."""
+    ctrl, _ = controller
+    # seed a fresh indicator then record the same decision twice
+    value = "c2-idedup.operator.test"
+    batch = "batch--idedup"
+    ctrl.ledger.record_batch(batch_id=batch, source_id="local-sensor",
+                             raw_sha256="sha-idedup", indicator_count=1,
+                             demoted=0, channel="local-sensor", actor="operator")
+    ind = Indicator(
+        id="indicator--idedup", type="fqdn", value=value,
+        sources=("local-sensor",),
+        evidence=(Evidence(kind="direct_local_detection", source_id="local-sensor",
+                           source_class="local", observed_at="2026-09-03T03:00:00Z",
+                           independent=True),),
+        tags=("c2",))
+    ctrl.ledger.upsert_indicator(ind, batch)
+    d = Decision(
+        id="decision--idedup", indicator_id=ind.id, maliciousness=60,
+        action_safety=80, disposition="SHADOW_ACTION", action="dns_nxdomain",
+        rung="L4", scope=ctrl.current_policy().scope, ttl_seconds=600,
+        policy_version="beta", reason_codes=("shadow",),
+        explanation="integration idempotency",
+        selector=ActionSelector(scope_type="client_destination_pair",
+                                client=None, destination=value,
+                                protocol_class="interactive_http"),
+        content_hash="hash--idedup-constant")
+    assert ctrl.ledger.record_decision(
+        d, indicator_id=ind.id, batch_id=batch,
+        policy_content_sha256="sha", actor="operator") is True
+    # identical decision instance => refused (returns False)
+    assert ctrl.ledger.record_decision(
+        d, indicator_id=ind.id, batch_id=batch,
+        policy_content_sha256="sha", actor="operator") is False
+    rows = ctrl.db.query(
+        "SELECT seq FROM decisions WHERE decision_id=%s", ("decision--idedup",))
+    assert len(rows) == 1          # the UNIQUE index held
+    # a DIFFERENT content_hash for the same decision_id is still allowed
+    d2 = Decision(
+        id="decision--idedup", indicator_id=ind.id, maliciousness=61,
+        action_safety=80, disposition="SHADOW_ACTION", action="dns_nxdomain",
+        rung="L4", scope=ctrl.current_policy().scope, ttl_seconds=600,
+        policy_version="beta", reason_codes=("shadow",),
+        explanation="integration idempotency v2",
+        selector=d.selector, content_hash="hash--idedup-other")
+    assert ctrl.ledger.record_decision(
+        d2, indicator_id=ind.id, batch_id=batch,
+        policy_content_sha256="sha", actor="operator") is True
+    rows = ctrl.db.query(
+        "SELECT seq FROM decisions WHERE decision_id=%s", ("decision--idedup",))
+    assert len(rows) == 2

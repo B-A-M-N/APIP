@@ -10,7 +10,7 @@ deployment.
 
 | Version                 | Status          | Detail                                            |
 | ----------------------- | --------------- | ------------------------------------------------- |
-| Reference `0.1.0`       | beta (reference) | deterministic scaffold; spec revision v2.2       |
+| Reference `0.1.0`       | beta (reference) | deterministic scaffold; spec revision v2.3       |
 | All other versions      | unsupported     | unreleased / pre-beta, subject to change without notice |
 
 Only the current reference version receives security fixes. Earlier `0.x`

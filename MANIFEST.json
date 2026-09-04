@@ -24,7 +24,7 @@
     },
     {
       "path": "AUDIT_INDEPENDENT_2026_09_02.md",
-      "sha256": "86755dd1b87cc45c557ffab6bd71fd823e6c7b67f849f5664463a4519e0ba5b2"
+      "sha256": "b628b5e6ac8ddcf43970f985a07463d1c2af83c7dc9593c4b55f841a3d28dc8f"
     },
     {
       "path": "BUILD_VERIFICATION.txt",
@@ -32,7 +32,7 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "4d5cdc360b8eac73e8dd60619d12b7397542ce1b58886ce854de475e935988e9"
+      "sha256": "f999798e4fee16c637a9ec4b513e1376854c68880c5cd90ff873796c242da532"
     },
     {
       "path": "CONTRIBUTING.md",
@@ -60,11 +60,11 @@
     },
     {
       "path": "RELEASES.md",
-      "sha256": "52e846856c40eeb46b041811860bcda51d075cc4f164be03641c674207958362"
+      "sha256": "6556cfea49f764bda4a52e509f6b85c6a256fb603814fd4be154d0ef773d6b41"
     },
     {
       "path": "SECURITY.md",
-      "sha256": "977912cd965551e048af6ac8deb7d6b40ea91fa228c553d27a349e609ffc5dad"
+      "sha256": "f2b26e750f940aa46ef8e63b166ebb192be0ccc4b30847b44eef2b88ae6faf96"
     },
     {
       "path": "api/openapi.yaml",

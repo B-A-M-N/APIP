@@ -17,12 +17,12 @@ APIP ships several things that have historically been conflated under loose
 
 | Concept                                 | Meaning                                                          | Current value      |
 | --------------------------------------- | ---------------------------------------------------------------- | ------------------ |
-| **APIP specification revision**         | The product/system design documents (`FULL_SPEC.md`, `docs/*`).  | `v2.2`             |
+| **APIP specification revision**         | The product/system design documents (`FULL_SPEC.md`, `docs/*`).  | `v2.3`             |
 | **Reference implementation version**    | The deterministic Python scaffold in `reference/` (`pyproject`). | `0.1.0`            |
 | **Policy schema version**               | The policy format `examples/policy.toml` and `schemas/policy.schema.json`. | `2026-09-01.2` |
 | **API version**                         | The (draft-future, unimplemented) control-plane contract `api/openapi.yaml`. | `0.1.0-draft` |
 
-These are **not** interchangeable. "v2.2" in `BUILD_VERIFICATION.txt` refers to
+These are **not** interchangeable. "v2.3" in `BUILD_VERIFICATION.txt` refers to
 the spec revision in force; the reference package is independently on its own
 `0.1.0` version; the policy file carries a dated policy-schema revision; and the
 API is marked draft because it is a forward design artifact, not a running

@@ -7,6 +7,24 @@ spec revision is tracked separately — see `RELEASES.md` for the version model.
 
 ## [Unreleased]
 
+### Release-verification artifact audit (v2.3, 2026-09-03)
+
+- **MANIFEST.json regenerated against the git tree.** The v2.2 snapshot never
+  covered the product package (`src/apip/`), `deploy/`, or `lab/acceptance.py`,
+  and 43 of its 88 hashed files had drifted from the tree, while
+  `BUILD_VERIFICATION.txt` asserted "all hashes match this tree." The manifest
+  now pins **166 files** — every tracked path except `MANIFEST.json` itself
+  (self-excluded) — with SHA-256 verified to match on all 166.
+- **BUILD_VERIFICATION.txt corrected.** Its `python -m unittest discover -s
+  tests -v: PASS (187 tests)` claim was stale on two axes: the product suite is
+  pytest-run (that unittest invocation discovers 0 tests at the repo root) and
+  stands at 190, while the reference `unittest` suite it describes is 264.
+  Header bumped to v2.3; true reproductions for both suites documented; a
+  copy-paste MANIFEST verifier added.
+- **RELEASES.md version authority aligned to v2.3.** Spec-revision matrix and
+  the `BUILD_VERIFICATION.txt` cross-reference updated; only these
+  verification-record artifacts changed — no production or test code.
+
 ### Audit zero-trust hardening pass (P0–P2 residuals, 2026-09-02)
 
 - **Evidence/source authority boundary rebuilt (P0-1/2/3):** source identity is

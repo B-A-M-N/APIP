@@ -520,7 +520,7 @@
     },
     {
       "path": "src/apip/cli/main.py",
-      "sha256": "b5dace5bdfa18171ece3bea7152483fa4a4efe01714b40ea6e23e828529d0f37"
+      "sha256": "ba073551c198738273df8144c49b557243e7cfe1400e67ddefdd5b0730b8186f"
     },
     {
       "path": "src/apip/config/__init__.py",

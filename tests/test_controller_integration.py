@@ -297,3 +297,60 @@ def test_record_decision_idempotent_at_the_database(controller):
     rows = ctrl.db.query(
         "SELECT seq FROM decisions WHERE decision_id=%s", ("decision--idedup",))
     assert len(rows) == 2
+
+def test_persisted_mode_survives_posture_flip_restart(controller):
+    """Review P0 #1, restart leg: actions created under a SHADOW-posture
+    controller keep their serialized SHADOW mode authoritative when the
+    deployment is restarted with the adapter configured ENFORCE. The
+    re-verified action stays at the shadow artifact (rpz-passthru) — the
+    config flip must not upgrade already-created actions into the live
+    zone."""
+    ctrl, cfg = controller
+    did = "decision--it-posture"
+    value = "c2-posture.operator.test"
+    _record_approval_decision(ctrl, did, value)
+    res = ctrl.approve_decision(did, "operator")
+    action_id = res["action_ids"][0]
+    ctrl._dispatch_one(ctrl.ledger.get_action(action_id))
+    applied = ctrl.ledger.get_action(action_id)
+    assert applied["mode"] == "SHADOW", applied["mode"]
+    shadow_zone = Path(cfg.adapter.zone_dir) / (
+        ctrl.adapter.config.zone_name + ".shadow.zone")
+    assert "rpz-passthru" in shadow_zone.read_text()
+
+    # restart with the adapter configured ENFORCE against the SAME ledger
+    # and zone dir: existing actions must not be upgraded.
+    cfg_enf = replace(
+        cfg,
+        adapter=replace(cfg.adapter, rpz_mode="ENFORCE",
+                        verify_query_server="127.0.0.1",
+                        verify_query_port=5333),
+    )
+    from apip.controller.service import Controller as _C
+    ctrl2 = _C(cfg_enf)
+    ctrl2.start()
+    try:
+        # the stored row still carries the persisted mode
+        row = ctrl2.ledger.get_action(action_id)
+        assert row["mode"] == "SHADOW", row["mode"]
+        # verification (and re-dispatch) at the new posture still honors it:
+        # verify stays on the shadow artifact — no live zone, no DNS probe.
+        v = ctrl2._adapter_for(row).verify(
+            {"rule_id": row["rule_id"], "fragment": row["fragment"],
+             "mode": row["mode"], "selector": row["selector"]})
+        assert v["ok"] is True
+        assert v["observed"]["effective_mode"] == "SHADOW"
+        assert "dns" not in v["observed"]
+        assert not (Path(cfg.adapter.zone_dir) / (
+            ctrl.adapter.config.zone_name + ".zone")).exists()
+        # even a fresh dispatch of the same stored action re-applies at the
+        # shadow tier — the serialized mode is what dispatch consumes.
+        r = ctrl2._adapter_for(row).apply(
+            {"rule_id": row["rule_id"], "fragment": row["fragment"],
+             "mode": row["mode"], "selector": row["selector"]})
+        assert r["ok"] is True
+        assert r["receipt"]["observed"]["effective_mode"] == "SHADOW"
+        assert (Path(cfg.adapter.zone_dir) / (
+            ctrl.adapter.config.zone_name + ".zone")).exists() is False
+    finally:
+        ctrl2.stop()

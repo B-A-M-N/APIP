@@ -16,7 +16,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from apip.adapters.base import AdapterError, EnforcementAdapter
+from apip.adapters.base import AdapterError, EnforcementAdapter, MODE_RANK
 from apip.adapters import build_adapters
 from apip.adapters.rpz import RpzAdapter
 from apip.config.service import ServiceConfig
@@ -312,12 +312,25 @@ class Controller:
         action_ids = []
         for frag in fragments:
             action_id = "action--" + uuid.uuid4().hex[:24]
-            mode = ("ENFORCE" if decision.disposition == "AUTO_ENFORCE"
-                    else "SHADOW")
-            # the compiling adapter's maximum posture caps the requested mode
+            # The PERSISTED action mode (review P0 #1) is what the adapter
+            # will honor at dispatch time — it must reflect the policy that
+            # authorized this decision, not the adapter's current config.
+            # Policy posture is the requested ceiling: an ENFORCE policy may
+            # request ENFORCE, anything weaker requests SHADOW. The compiling
+            # adapter's maximum posture then CAPS it (never strengthens).
+            # An operator-approved PROPOSE decision is the operator directly
+            # authorizing the action, so it rides the policy's posture the
+            # same as AUTO_ENFORCE. SHADOW_ACTION stays SHADOW by definition.
+            enforce_requested = (
+                policy.mode == "ENFORCE"
+                and decision.disposition in ("AUTO_ENFORCE",
+                                             "PROPOSE_OPERATOR_APPROVAL"))
+            mode = "ENFORCE" if enforce_requested else "SHADOW"
             adapter = self._adapters.get(frag["adapter"])
-            if adapter is not None and mode == "ENFORCE" and adapter.max_mode() != "ENFORCE":
-                mode = "SHADOW"
+            if adapter is not None:
+                cap = adapter.max_mode()
+                if (MODE_RANK.get(mode, 0) > MODE_RANK.get(cap, 0)):
+                    mode = "SHADOW" if MODE_RANK.get(cap, 0) >= MODE_RANK["SHADOW"] else "OBSERVE"
             self.ledger.record_action(
                 action_id=action_id, decision=decision,
                 indicator_id=decision.indicator_id, adapter=frag["adapter"],

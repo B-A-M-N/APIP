@@ -381,9 +381,12 @@ VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                 if row["status"] != "staged":
                     raise ValueError(
                         f"policy {policy_version} r{revision} is {row['status']!r}, not staged")
+                # Retire the GLOBALLY active row regardless of version (review
+                # P0 #19): promoting a different version must not leave an
+                # older row active while policy_current points elsewhere —
+                # exactly one active policy row is the invariant.
                 cur.execute(
-                    "UPDATE policy_versions SET status='retired' WHERE policy_version=%s AND status='active'",
-                    (policy_version,))
+                    "UPDATE policy_versions SET status='retired' WHERE status='active'")
                 cur.execute(
                     "UPDATE policy_versions SET status='active', promoted_by=%s, promoted_at=now() "
                     "WHERE policy_version=%s AND revision=%s",

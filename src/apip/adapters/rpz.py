@@ -1,15 +1,37 @@
 """DNS RPZ adapter — the one real enforcement adapter for beta (goal E).
 
+Two postures govern every operation, and the PERSISTED ACTION MODE wins
+(review P0 #1): effective posture = min(action mode, adapter maximum). A
+stored SHADOW action can never become live because APIP was restarted with
+the adapter configured ENFORCE — configuration may only weaken an action.
+
 Postures (adapter.rpz_mode, the adapter's own maximum):
   OFF      compile only, never publishes;
-  OBSERVE  publishes to a monitor-only zone file (clearly marked), no
+  OBSERVE  publishes to a monitor-only shadow artifact, no reload, no
            resolver consumption expected;
-  SHADOW   publishes the candidate zone to disk + optional reload, but the
-           zone is NOT in the resolver's response chain for policy answers —
-           behavior change must be independently impossible;
+  SHADOW   publishes to the shadow artifact only; behavior change must be
+           independently impossible;
   ENFORCE  publishes + reloads a resolver-consumed RPZ; every apply is
            verified by querying the configured resolver and expecting
            NXDOMAIN for the exact FQDN.
+
+SHADOW is technically incapable of enforcement (review P0 #2): shadow rules
+go to a SEPARATE ``{zone}.shadow.zone`` artifact and are rendered as
+``CNAME rpz-passthru.`` — BIND's "continue normal resolution" response-policy
+action. Even an operator who mistakenly attaches the shadow artifact to the
+resolver's response-policy chain gets, by BIND spec, the unchanged baseline
+answer. The shadow artifact never carries the live ``CNAME .`` (NXDOMAIN)
+form, and no reload command is ever executed below effective ENFORCE — so
+there is no path from a SHADOW action to a resolver behavior change.
+
+Zone encoding follows real BIND response-policy semantics (review P0 #3):
+the policy zone has its own ``$ORIGIN`` (the configured zone_name), so the
+owner of a plain QNAME trigger is written RELATIVE (``bad.example``, no
+trailing dot). Writing ``bad.example.`` with a trailing dot inside a zone
+whose origin is ``apip.rpz.invalid`` would make the trigger the absolute
+name ``bad.example.`` — outside the policy zone's authority, which
+named-checkzone rejects ("owner out of zone"). The lab acceptance resolver
+is a harness; only ``named`` is proof of BIND compatibility.
 
 Safety invariants:
   - EXACT FQDN selectors only: no wildcards, no prefix deny, no IP rules.
@@ -20,10 +42,17 @@ Safety invariants:
   - receipts carry OBSERVED state (file bytes hash / DNS answer), never a
     repetition of intent. A file write alone is not enforcement;
   - fragment/comment charset is closed (domain.sanitize at the emit
-    boundary, defense in depth behind ingest canonicalization).
+    boundary, defense in depth behind ingest canonicalization);
+  - the SOA serial changes monotonically on every publish so
+    ``rndc reload``/notify/transfer actually propagate — a constant serial
+    makes BIND ignore the update;
+  - revoke proves durable OWNERSHIP (stored rule_id + exact selector), never
+    the adapter's current scope: narrowing authorized_domains must not
+    prevent APIP removing its own installed rule (review P0 #8).
 """
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
 import ipaddress
 import os
@@ -33,25 +62,70 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from apip.adapters.base import AdapterError
+from apip.adapters.base import AdapterError, MODE_RANK, effective_mode
 from apip.config.service import AdapterConfig
 from apip.domain.sanitize import rpz_comment_safe, validate_fqdn
 
-_MODE_RANK = {"OFF": 0, "OBSERVE": 1, "SHADOW": 2, "ENFORCE": 3}
+_SHADOW_ZONE_SUFFIX = ".shadow.zone"
+_LIVE_ZONE_SUFFIX = ".zone"
 
 
-def _zone_header(zone_name: str, monitor_only: bool) -> list[str]:
-    marker = ("; APIP MONITOR-ONLY RPZ (OBSERVE): not consumed for policy answers"
-              if monitor_only
-              else "; APIP RPZ zone")
+def _soa_serial() -> int:
+    """Monotonic serial: unix epoch seconds mod 2^31 (BIND SOA serials are
+    32-bit; a YYYYMMDDNN serial repeats within its bucket and BIND then
+    IGNORES the reload as 'no serial change' — and rate-limits policy-zone
+    updates that advance 'too soon' anyway). Epoch seconds are strictly
+    increasing for forward-running clocks and fit until 2038, and every
+    publish rewrites the SOA line wholesale (a backwards clock can only
+    produce a lower serial, surfaced rather than hidden by the fresh line).
+    """
+    now = _dt.datetime.now(_dt.timezone.utc)
+    return int(now.timestamp()) % (2**31)
+
+
+def _zone_header(zone_name: str, *, serial: int, live: bool) -> list[str]:
+    marker = ("; APIP ENFORCE RPZ — resolver-consumed policy zone"
+              if live else
+              "; APIP SHADOW RPZ — NOT resolver-consumed; rules are "
+              "rpz-passthru (no-op even if mistakenly attached)")
+    # SOA refresh/retry are deliberately short (5s): BIND rate-limits RPZ
+    # policy-zone updates against these timers ("new zone version came too
+    # soon"), so a long refresh would defer operator-driven reloads.
     return [
         "; DO NOT EDIT — generated by the APIP controller",
         marker,
         f"$ORIGIN {zone_name}.",
         "$TTL 30",
-        "@ IN SOA localhost. hostmaster.localhost. ( 1 30 30 30 60 )",
+        f"@ IN SOA localhost. hostmaster.localhost. ( {serial} 5 5 30 60 )",
         "@ IN NS  localhost.",
     ]
+
+
+def _restamp_soa(lines: list[str]) -> list[str]:
+    """Rewrite the SOA line with a fresh monotonic serial and the short
+    refresh/retry timers (BIND ignores a zone reload whose serial did not
+    advance, and rate-limits policy-zone updates against the SOA timers)."""
+    serial = _soa_serial()
+    out = []
+    for l in lines:
+        if l.lstrip().startswith("@ IN SOA"):
+            out.append(f"@ IN SOA localhost. hostmaster.localhost. "
+                       f"( {serial} 5 5 30 60 )")
+        else:
+            out.append(l)
+    return out
+
+
+def _entry_comment(candidate: dict) -> str:
+    """Carry the persisted fragment's sanitized comment (decision id,
+    disposition, policy) into the rendered line so artifacts stay
+    attributable. Falls back to 'apip' when absent."""
+    frag = candidate.get("fragment") or ""
+    if ";" in frag:
+        comment = frag.split(";", 1)[1].strip()
+        if comment:
+            return comment
+    return "apip"
 
 
 class RpzAdapter:
@@ -60,7 +134,7 @@ class RpzAdapter:
     def __init__(self, config: AdapterConfig):
         self.config = config
         mode = config.rpz_mode.upper()
-        if mode not in _MODE_RANK:
+        if mode not in MODE_RANK:
             raise AdapterError(f"invalid rpz mode {config.rpz_mode!r}")
         self._mode = mode
         self._zone_dir = Path(config.zone_dir)
@@ -76,10 +150,10 @@ class RpzAdapter:
     def max_mode(self) -> str:
         return self._mode
 
-    def _require_mode(self, needed: str, what: str) -> None:
-        if _MODE_RANK[self._mode] < _MODE_RANK[needed]:
-            raise AdapterError(
-                f"{what} requires adapter mode {needed} (configured {self._mode})")
+    def _effective(self, candidate: dict) -> str:
+        """min(persisted action mode, adapter maximum) — the persisted mode is
+        the authority; configuration can only weaken. Missing mode = OFF."""
+        return effective_mode(candidate.get("mode"), self._mode)
 
     # -- scope (defense in depth layer 3) ---------------------------------------
 
@@ -104,7 +178,9 @@ class RpzAdapter:
 
         Beta contract (goal E): fqdn + dns_nxdomain only, dispositions that
         represent an actual bounded action. Anything else compiles to
-        nothing — no action, no receipt.
+        nothing — no action, no receipt. The fragment carries the RELATIVE
+        owner (real BIND policy-zone representation); the physical artifact
+        line is rendered at apply time from the persisted action mode.
         """
         if indicator_type != "fqdn" or decision.action != "dns_nxdomain":
             return []
@@ -121,11 +197,9 @@ class RpzAdapter:
                 f"{sorted(self.config.authorized_domains)}")
         comment = rpz_comment_safe(
             f"{decision.id} {decision.disposition} policy={decision.policy_version}")
-        fragment = f"{owner}. IN CNAME . ; {comment}"
-        owner_key = f"{owner}."
-        bundle_fragments = [fragment]
+        fragment = f"{owner} IN CNAME . ; {comment}"
         bundle_hash = "bundle--" + hashlib.sha256(
-            ("\n".join(bundle_fragments)).encode()).hexdigest()[:24]
+            fragment.encode()).hexdigest()[:24]
         return [{
             "adapter": self.name,
             "rule_id": f"owner:{owner}",
@@ -143,13 +217,19 @@ class RpzAdapter:
 
     # -- validate ----------------------------------------------------------------
 
-    def validate(self, candidate: dict) -> dict:
+    def _validate_shape(self, candidate: dict, *, check_scope: bool) -> dict:
+        """Shared structural validation. ``check_scope=False`` is the REVOCATION
+        path: ownership of the stored rule_id/selector is proven structurally,
+        but the adapter's CURRENT scope never gates removal (review P0 #8) —
+        narrowing authorized_domains after install must not strand the rule."""
         rule_id = candidate.get("rule_id", "")
         fragment = candidate.get("fragment", "")
         selector = candidate.get("selector") or {}
         if not rule_id.startswith("owner:"):
             raise AdapterError(f"invalid rule id {rule_id!r}")
         owner = rule_id.split("owner:", 1)[1].rstrip(".")
+        if not owner:
+            raise AdapterError("empty rule owner")
         # selector-never-broadens: the selector must be an exact single FQDN
         # equal to the rule owner. Anything wider (wildcard, network,
         # missing) is refused.
@@ -157,58 +237,65 @@ class RpzAdapter:
             raise AdapterError("RPZ selector must be destination_global + exact_fqdn")
         if selector["exact_fqdn"].rstrip(".") != owner:
             raise AdapterError("selector does not match rule owner (never broadens)")
-        # P1: the destination field must be the SAME single FQDN as the owner —
-        # never a wider parent, network, or wildcard. This closes the gap where
-        # a selector could carry a broad `destination` while a narrow exact_fqdn
-        # slips through the equal-check above.
         if selector.get("destination"):
             if str(selector["destination"]).rstrip(".") != owner:
                 raise AdapterError("selector destination does not match rule owner (never broadens)")
         if "*" in owner:
             raise AdapterError("wildcard selectors are not permitted in beta")
         # zone-file injection guard: the fragment must be a SINGLE zone line.
-        # A newline (or multi-line paren group) here could inject arbitrary
-        # RRs into the zone file, and `startswith` alone cannot detect it. The
-        # emit boundary sanitizes the comment; this re-refuses any line
-        # structure that survived (defense in depth, selector-never-broadens
-        # for the artifact itself).
         if "\n" in fragment or "\r" in fragment:
             raise AdapterError("fragment may not contain a newline (zone injection)")
         if "(" in fragment or ")" in fragment:
             raise AdapterError("fragment may not contain multi-line parens (zone injection)")
         if fragment.count(";") > 1:
             raise AdapterError("fragment may not contain multiple comment markers")
-        expected = f"{owner}. IN CNAME ."
-        if not fragment.startswith(expected):
+        # accept BOTH owner forms: relative (current contract) and absolute
+        # (legacy rows persisted by earlier versions). The rendered line is
+        # always re-derived from the owner at publish time.
+        for form in (f"{owner} IN CNAME .", f"{owner}. IN CNAME ."):
+            if fragment.startswith(form):
+                break
+        else:
             raise AdapterError(
-                f"fragment does not match the exact-FQDN CNAME . contract: {fragment!r}")
-        if not self._in_adapter_scope(owner):
+                f"fragment does not match the exact-FQDN CNAME contract: {fragment!r}")
+        if check_scope and not self._in_adapter_scope(owner):
             raise AdapterError(f"owner {owner} outside adapter authorized scope")
-        try:
-            self._require_mode("SHADOW", "apply")
-        except AdapterError:
-            # OFF/OBSERVE still allow validate (dry-run), never apply
-            pass
-        return {"ok": True, "owner": owner, "mode": self._mode}
+        return {"owner": owner, "selector": selector, "fragment": fragment}
 
-    # -- apply / verify / revoke ---------------------------------------------------
+    def validate(self, candidate: dict) -> dict:
+        shape = self._validate_shape(candidate, check_scope=True)
+        return {"ok": True, "owner": shape["owner"],
+                "mode": self._effective(candidate)}
 
-    def _zone_path(self) -> Path:
-        return self._zone_dir / f"{self.config.zone_name}.zone"
+    # -- artifact paths ---------------------------------------------------------
 
-    def _read_zone(self) -> str:
-        p = self._zone_path()
+    def _zone_path(self, live: bool) -> Path:
+        suffix = _LIVE_ZONE_SUFFIX if live else _SHADOW_ZONE_SUFFIX
+        return self._zone_dir / f"{self.config.zone_name}{suffix}"
+
+    def _read_zone(self, live: bool) -> str:
+        p = self._zone_path(live)
         if p.is_file():
             return p.read_text(encoding="utf-8")
         return ""
 
-    def _write_zone(self, lines: list[str]) -> str:
+    def _write_zone(self, lines: list[str], live: bool) -> str:
         self._zone_dir.mkdir(parents=True, exist_ok=True)
         content = "\n".join(lines) + "\n"
-        tmp = self._zone_path().with_suffix(".zone.tmp")
+        tmp_suffix = ".zone.tmp" if live else ".shadow.zone.tmp"
+        tmp = self._zone_path(live).with_suffix(tmp_suffix)
         tmp.write_text(content, encoding="utf-8")
-        os.replace(tmp, self._zone_path())
+        os.replace(tmp, self._zone_path(live))
         return content
+
+    def _render_entry(self, owner: str, *, live: bool, comment: str) -> str:
+        """The physical zone line for one owner at one posture. LIVE = the
+        NXDOMAIN policy action (CNAME .); SHADOW = rpz-passthru (a spec-
+        defined continue-normal-resolution action) so even a mistakenly
+        attached shadow zone cannot change any answer."""
+        if live:
+            return f"{owner} IN CNAME . ; {comment}"
+        return f"{owner} IN CNAME rpz-passthru. ; {comment}"
 
     def _reload(self) -> dict:
         cmd = self.config.reload_command
@@ -221,22 +308,32 @@ class RpzAdapter:
                 f"{proc.stderr.decode(errors='replace')[:200]}")
         return {"reloaded": True}
 
+    # -- apply / verify / revoke ---------------------------------------------------
+
     def apply(self, candidate: dict) -> dict:
-        checked = self.validate(candidate)
-        owner = checked["owner"]
-        self._require_mode("SHADOW", "apply")
-        zone = self._read_zone()
-        lines = zone.splitlines() if zone else _zone_header(
-            self.config.zone_name, monitor_only=(self._mode != "ENFORCE"))
-        entry = candidate["fragment"]
-        # idempotency: re-applying the same owner replaces the prior line
+        shape = self._validate_shape(candidate, check_scope=True)
+        owner = shape["owner"]
+        eff = self._effective(candidate)
+        if MODE_RANK[eff] < MODE_RANK["SHADOW"]:
+            raise AdapterError(
+                f"effective posture {eff} below SHADOW: refusing to publish")
+        live = eff == "ENFORCE"
+        zone = self._read_zone(live)
+        if zone:
+            lines = zone.splitlines()
+        else:
+            lines = _zone_header(self.config.zone_name, serial=_soa_serial(),
+                                 live=live)
+        entry = self._render_entry(owner, live=live,
+                                   comment=_entry_comment(candidate))
         entry_key = entry.split(";")[0].strip()
         lines = [l for l in lines if l.split(";")[0].strip() != entry_key]
         lines.append(entry)
-        content = self._write_zone(lines)
-        reload_info = {"reloaded": False, "reason": "not attempted"}
+        lines = _restamp_soa(lines)   # reload only propagates on serial bump
+        content = self._write_zone(lines, live)
+        reload_info: dict[str, Any] = {"reloaded": False, "reason": "not attempted"}
         reload_error = None
-        if self.config.reload_command:
+        if live and self.config.reload_command:
             try:
                 reload_info = self._reload()
             except AdapterError as e:
@@ -252,9 +349,10 @@ class RpzAdapter:
                 ).hexdigest()[:24],
                 "status": "applied",
                 "observed": {
-                    "zone_file": str(self._zone_path()),
+                    "zone_file": str(self._zone_path(live)),
                     "zone_sha256": content_hash,
                     "owner": owner,
+                    "effective_mode": eff,
                     "reload": reload_info,
                 },
             },
@@ -295,28 +393,42 @@ class RpzAdapter:
                 "questions": qdcount}
 
     def verify(self, candidate: dict) -> dict:
-        """INDEPENDENT verification. SHADOW (no resolver consumed): verify =
-        the zone file actually contains the exact rule (byte-observed). ENFORCE
-        (resolver consumed): additionally query the resolver and require
-        NXDOMAIN for the exact FQDN. Never fabricates."""
-        owner = candidate.get("selector", {}).get("exact_fqdn", "")
-        if not owner:
-            owner = candidate.get("rule_id", "").split("owner:", 1)[-1]
-        owner = owner.rstrip(".")
-        zone = self._read_zone()
+        """INDEPENDENT verification at the EFFECTIVE posture. Below ENFORCE:
+        the shadow artifact contains the rpz-passthru rule (byte-observed) —
+        and nothing more (a shadow action never claims DNS behavior).
+        ENFORCE: additionally query the resolver and require NXDOMAIN. Never
+        fabricates."""
+        shape = self._validate_shape(candidate, check_scope=True)
+        owner = shape["owner"]
+        eff = self._effective(candidate)
+        live = eff == "ENFORCE"
+        zone = self._read_zone(live)
         if not zone:
-            return {"ok": False, "error": "zone file missing"}
-        wanted = f"{owner}. IN CNAME ."
-        present = any(l.split(";")[0].strip() == wanted
+            return {"ok": False, "error": "zone file missing",
+                    "observed": {"effective_mode": eff}}
+        entry_key = self._render_entry(owner, live=live,
+                                       comment=_entry_comment(candidate)
+                                       ).split(";")[0].strip()
+        present = any(l.split(";")[0].strip() == entry_key
                       for l in zone.splitlines())
         if not present:
-            return {"ok": False, "error": f"rule for {owner} not present in zone"}
+            return {"ok": False,
+                    "error": f"rule for {owner} not present in "
+                             f"{'live' if live else 'shadow'} zone",
+                    "observed": {"effective_mode": eff}}
         observed: dict[str, Any] = {
+            "zone_file": str(self._zone_path(live)),
             "zone_sha256": hashlib.sha256(zone.encode()).hexdigest(),
             "owner": owner,
+            "effective_mode": eff,
             "rule_present": True,
         }
-        if self._mode == "ENFORCE":
+        if live:
+            if MODE_RANK[self._mode] < MODE_RANK["ENFORCE"]:
+                return {"ok": False,
+                        "error": "action is ENFORCE but adapter is configured "
+                                 f"{self._mode}; cannot live-verify",
+                        "observed": observed}
             if not self.config.verify_query_server:
                 # ENFORCE's contract is resolver-confirmed suppression; without
                 # a resolver to ask, "verified" would be a fabricated success
@@ -331,43 +443,70 @@ class RpzAdapter:
                 return {"ok": False, "error": "dns verify query failed",
                         "observed": observed}
             if dns.get("rcode") != 3:   # NXDOMAIN
-                return {"ok": False, "error": f"resolver did not answer NXDOMAIN",
+                return {"ok": False, "error": "resolver did not answer NXDOMAIN",
                         "observed": observed}
         return {"ok": True, "observed": observed}
 
     def revoke(self, candidate: dict) -> dict:
-        """Remove EXACTLY this owner line; verify the zone no longer holds
-        it. A missing zone counts as removed (idempotent)."""
-        checked = self.validate(candidate)
-        owner = checked["owner"]
-        zone = self._read_zone()
-        if not zone:
-            return {"ok": True, "observed": {"removed": owner, "zone_absent": True}}
-        wanted = f"{owner}. IN CNAME ."
-        lines = [l for l in zone.splitlines() if l.split(";")[0].strip() != wanted]
-        if len(lines) == len(zone.splitlines()):
-            return {"ok": True, "observed": {"removed": owner, "was_absent": True}}
-        content = self._write_zone(lines)
-        reload_info = {"reloaded": False, "reason": "not attempted"}
-        if self.config.reload_command:
+        """Remove EXACTLY this owner line from BOTH artifacts; verify the
+        zone(s) no longer hold it. A missing zone counts as removed
+        (idempotent). Ownership is structural (stored rule_id + exact
+        selector match); the adapter's CURRENT scope never gates removal —
+        scope narrowing must not prevent cleanup (review P0 #8)."""
+        shape = self._validate_shape(candidate, check_scope=False)
+        owner = shape["owner"]
+        results: list[dict] = []
+        reload_needed = False
+        for live in (True, False):
+            zone = self._read_zone(live)
+            if not zone:
+                results.append({"artifact": "live" if live else "shadow",
+                                "zone_absent": True})
+                continue
+            prefix = f"{owner} "
+            lines = zone.splitlines()
+            kept = [l for l in lines
+                    if not l.split(";")[0].strip().startswith(prefix)]
+            if len(kept) == len(lines):
+                results.append({"artifact": "live" if live else "shadow",
+                                "was_absent": True})
+                continue
+            content = self._write_zone(kept, live)
+            if live:
+                reload_needed = True
+            results.append({"artifact": "live" if live else "shadow",
+                            "removed": True,
+                            "zone_sha256": hashlib.sha256(
+                                content.encode()).hexdigest()})
+        reload_info: dict[str, Any] = {"reloaded": False, "reason": "not attempted"}
+        if reload_needed and self.config.reload_command:
             reload_info = self._reload()
-        # independent post-check
-        after = self._read_zone()
-        still = any(l.split(";")[0].strip() == wanted for l in after.splitlines())
-        if still:
-            return {"ok": False, "error": "rule still present after revoke"}
+        # independent post-check: the owner must be gone from both artifacts
+        for live in (True, False):
+            zone = self._read_zone(live)
+            if zone and any(l.split(";")[0].strip().startswith(f"{owner} ")
+                            for l in zone.splitlines()):
+                return {"ok": False, "error": "rule still present after revoke",
+                        "observed": {"removed": owner, "zones": results}}
         return {"ok": True, "observed": {
-            "removed": owner,
-            "zone_sha256": hashlib.sha256(after.encode()).hexdigest(),
-            "reload": reload_info}}
+            "removed": owner, "zones": results, "reload": reload_info}}
 
     def get_state(self, selector: dict) -> dict:
         owner = (selector.get("exact_fqdn") or "").rstrip(".")
-        zone = self._read_zone()
-        wanted = f"{owner}. IN CNAME ."
-        present = bool(owner) and any(
-            l.split(";")[0].strip() == wanted for l in zone.splitlines())
-        return {"owner": owner, "present": present, "mode": self._mode}
+        prefix = f"{owner} " if owner else None
+
+        def _present(zone: str) -> bool:
+            return bool(prefix) and any(
+                l.split(";")[0].strip().startswith(prefix)
+                for l in zone.splitlines())
+
+        live_zone = self._read_zone(True)
+        shadow_zone = self._read_zone(False)
+        live_present = _present(live_zone)
+        shadow_present = _present(shadow_zone)
+        return {"owner": owner, "present": live_present or shadow_present,
+                "live_present": live_present,
+                "shadow_present": shadow_present, "mode": self._mode}
 
     def health(self) -> dict:
         base = {
@@ -381,10 +520,12 @@ class RpzAdapter:
             base["status"] = "ok"
             base["note"] = "adapter OFF: compiles only"
             return base
-        zone_path = self._zone_path()
-        if zone_path.is_file():
+        live_path = self._zone_path(True)
+        shadow_path = self._zone_path(False)
+        base["live_zone_file"] = str(live_path)
+        base["shadow_zone_file"] = str(shadow_path)
+        if live_path.is_file() or shadow_path.is_file():
             base["status"] = "ok"
-            base["zone_file"] = str(zone_path)
         else:
             base["status"] = "degraded" if self._mode == "ENFORCE" else "ok"
             base["note"] = "zone file not yet created (no applies yet)"

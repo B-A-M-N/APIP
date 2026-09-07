@@ -8,6 +8,28 @@ class AdapterError(RuntimeError):
     """An adapter operation failed. Never silently converted to success."""
 
 
+MODE_RANK = {"OFF": 0, "OBSERVE": 1, "SHADOW": 2, "ENFORCE": 3}
+
+
+def effective_mode(action_mode: str | None, adapter_max: str) -> str:
+    """The posture an adapter may actually operate at for one action:
+    ``min(persisted action mode, adapter maximum posture)``.
+
+    The PERSISTED action mode is the authority (review P0 #1): a stored
+    SHADOW action must never become live because APIP was restarted with an
+    adapter configured ENFORCE — configuration can only ever weaken an
+    action, never strengthen it. A missing/unreadable action mode fails
+    closed to OFF (no publish, no reload).
+    """
+    rank = MODE_RANK.get((action_mode or "").upper(), MODE_RANK["OFF"])
+    cap = MODE_RANK.get(adapter_max.upper(), MODE_RANK["OFF"])
+    eff = min(rank, cap)
+    for name, r in MODE_RANK.items():
+        if r == eff:
+            return name
+    return "OFF"
+
+
 class EnforcementAdapter(Protocol):
     name: str
 

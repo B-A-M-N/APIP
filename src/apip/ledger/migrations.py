@@ -236,7 +236,21 @@ CREATE INDEX IF NOT EXISTS idx_indicators_tenant ON indicators(tenant_id);
 -- constraint that lacked this state.
 ALTER TABLE actions DROP CONSTRAINT IF EXISTS actions_state_check;
 ALTER TABLE actions ADD CONSTRAINT actions_state_check CHECK (state IN
-    ('pending','dispatching','applied','verified','failed','expired','revoked','drifted'));
+    ('pending','dispatching','applied','verified','failed','expired','revoked','drifted',
+     'cancelled_policy_changed'));
+"""),
+    (6, "single active policy invariant", """
+-- Exactly one active policy row is a database invariant, not an operator
+-- convention (review P0 #19): promote_policy retires the globally active row
+-- regardless of version before activating the new one, and this partial
+-- unique index makes any second 'active' row impossible even under a race.
+-- First, retire any duplicate actives an earlier version-conditional retire
+-- may have left behind, keeping the row policy_current points at.
+UPDATE policy_versions SET status='retired'
+WHERE status='active'
+  AND policy_version <> (SELECT policy_version FROM policy_current WHERE singleton);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_policy_versions_one_active
+    ON policy_versions ((1)) WHERE status='active';
 """),
 ]
 

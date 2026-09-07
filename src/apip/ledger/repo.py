@@ -300,7 +300,8 @@ RETURNING seq
     def record_action(self, *, action_id: str, decision: Decision,
                       indicator_id: str, adapter: str, mode: str,
                       fragment: dict, expires_at: datetime | None,
-                      requested_by: str, decision_seq: int) -> bool:
+                      requested_by: str, decision_seq: int,
+                      monitoring_only: bool = False) -> bool:
         """Persist an action citing the EXACT decision instance that
         authorized it (decision_id, decision_seq — review P0 #17). Idempotent
         per (decision instance, adapter, rule): a re-evaluated identical
@@ -315,7 +316,8 @@ INSERT INTO actions (action_id, decision_id, decision_seq, indicator_id, adapter
 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')
 """, (action_id, decision.id, decision_seq, indicator_id, adapter,
       decision.action, mode,
-      psycopg2.extras.Json(fragment.get("selector", {})),
+      psycopg2.extras.Json({**fragment.get("selector", {}),
+                            "monitoring_only": monitoring_only}),
       fragment["rule_id"], fragment["fragment"], fragment["fragment_hash"],
       fragment["bundle_id"], fragment["bundle_hash"], requested_by, expires_at))
         except psycopg2.errors.UniqueViolation:
@@ -326,6 +328,7 @@ VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')
         self.audit(requested_by, "action.created", action_id,
                    {"decision_id": decision.id, "decision_seq": decision_seq,
                     "adapter": adapter, "mode": mode,
+                    "monitoring_only": monitoring_only,
                     "rule_id": fragment["rule_id"],
                     "expires_at": expires_at.isoformat() if expires_at else None})
         return True
@@ -448,8 +451,13 @@ ORDER BY created_at
 """, (older_than,))
 
     def actions_needing_verification(self, older_than: datetime, limit: int = 100) -> list[dict]:
+        """Periodic verification set: applied/verified actions on cadence,
+        PLUS drifted actions — a drifted control stays eligible for bounded
+        reconciliation retry, and a successful later verification returns it
+        to 'verified' (review P1 #26: drifted was previously terminal for
+        the sweep, so a transient drift never recovered)."""
         return self.db.query("""
-SELECT * FROM actions WHERE state IN ('applied','verified')
+SELECT * FROM actions WHERE state IN ('applied','verified','drifted')
   AND (verified_at IS NULL OR verified_at <= %s)
 ORDER BY created_at LIMIT %s
 """, (older_than, limit))
@@ -755,6 +763,14 @@ ON CONFLICT (tenant_id) DO UPDATE SET
         return self.db.query_one(
             "SELECT tenant_id, overlay_sha256, raw_text, created_by, created_at, "
             "problems FROM tenant_overlays WHERE tenant_id=%s", (tenant_id,))
+
+    def delete_tenant_overlay(self, tenant_id: str) -> bool:
+        row = self.db.query_one(
+            "DELETE FROM tenant_overlays WHERE tenant_id=%s RETURNING tenant_id",
+            (tenant_id,))
+        if row:
+            self.audit("operator", "policy.overlay.deleted", tenant_id, {})
+        return bool(row)
 
     def list_tenant_overlays(self) -> list[dict]:
         return self.db.query(

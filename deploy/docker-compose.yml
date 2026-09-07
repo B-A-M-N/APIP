@@ -44,9 +44,14 @@ services:
       APIP_SECRET_KEY: ${APIP_SECRET_KEY:?set APIP_SECRET_KEY in .env}
     volumes:
       - rpz:/var/lib/apip/rpz
+    # P1 #38: loopback-only publish by default. Remote operator access goes
+    # through a TLS-terminating reverse proxy the operator runs — the API
+    # itself is bearer-token over plain HTTP and must not cross a network
+    # in the clear.
     ports:
-      - "8510:8510"
-    command: ["apip", "serve"]
+      - "127.0.0.1:8510:8510"
+    # ENTRYPOINT is `apip`; the compose command is only the subcommand.
+    command: ["serve", "--config", "/etc/apip/apip.toml"]
 
 volumes:
   pgdata:

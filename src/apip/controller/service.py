@@ -109,6 +109,16 @@ class ControllerState:
                 degraded.append("database_" + db_health.get("status", "unknown"))
             if not pipeline_ok:
                 degraded.append("no_active_policy")
+            # P1 #26: drift and failed applies ARE degraded states — an
+            # unverified or failed control is exactly what health must surface.
+            drifted = counts.get("drifted", 0)
+            if drifted:
+                degraded.append(f"actions_drifted:{drifted}")
+            if failed:
+                degraded.append(f"actions_failed:{failed}")
+            # a failed/stale reconciliation pass degrades readiness
+            if self.last_reconcile_at is not None and not self.last_reconcile_ok:
+                degraded.append("reconciliation_failed")
             # every configured adapter is surfaced; ANY unhealthy adapter degrades
             # the overall status (defense in depth: no silent single-adapter gap)
             for ah in (adapters_health or [adapter_health]):
@@ -144,6 +154,8 @@ class ControllerState:
                 "actions": {
                     "pending": pending,
                     "active": active,
+                    # drifted is EXPLICIT, not folded into "active" (P1 #26)
+                    "drifted": drifted,
                     "failed": failed,
                     "expired": expired,
                     "revoked": revoked,
@@ -284,10 +296,12 @@ class Controller:
 
     def create_action_from_decision(self, decision: Decision, indicator_value: str,
                                     indicator_type: str, actor: str,
-                                    decision_seq: int | None = None) -> str | None:
-        """Compile a decision into an action through the adapter, with the
-        controller-layer scope check (defense in depth layer 2; the decision
-        engine checked layer 1, the adapter re-checks layer 3).
+                                    decision_seq: int | None = None) -> list[str]:
+        """Compile a decision into actions through EVERY adapter that renders
+        a fragment, with the controller-layer scope check (defense in depth
+        layer 2; the decision engine checked layer 1, the adapter re-checks
+        layer 3). Returns ALL created action ids (review P1 #32 — a
+        multi-adapter decision previously reported only its first action).
 
         ``decision_seq`` is the exact immutable decision instance that
         authorizes these actions (review P0 #17); when omitted the latest
@@ -305,19 +319,22 @@ class Controller:
             raise RuntimeError("no active policy; refusing to create actions")
         if decision.disposition not in ("SHADOW_ACTION", "AUTO_ENFORCE",
                                         "PROPOSE_OPERATOR_APPROVAL"):
-            return None
+            return []
         if not in_scope(indicator_value, indicator_type, policy):
             self.ledger.audit(actor, "action.rejected_scope", decision.id,
                               {"value": indicator_value, "type": indicator_type})
-            return None
+            return []
 
         fragments: list[dict] = []
         for adapter in self._adapters.values():
             fragments.extend(adapter.compile(decision, indicator_value, indicator_type))
         if not fragments:
-            return None
-        expires_at = datetime.now(timezone.utc) + timedelta(
-            seconds=decision.ttl_seconds or self.config.controller.default_action_ttl_s)
+            return []
+        # P1 #27: the controller's max_action_ttl_s is a HARD ceiling —
+        # expiry is min(requested/default TTL, ceiling), never the raw ask.
+        ttl = decision.ttl_seconds or self.config.controller.default_action_ttl_s
+        ttl = min(ttl, self.config.controller.max_action_ttl_s)
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
         expires_at = expires_at.replace(microsecond=0)
         action_ids = []
         for frag in fragments:
@@ -349,15 +366,16 @@ class Controller:
                     # recorded — refuse to create an unprovenanced action
                     self.ledger.audit(actor, "action.rejected_no_decision",
                                       decision.id, {"adapter": frag["adapter"]})
-                    return None
+                    return []
             if not self.ledger.record_action(
                     action_id=action_id, decision=decision,
                     indicator_id=decision.indicator_id, adapter=frag["adapter"],
                     mode=mode, fragment=frag, expires_at=expires_at,
-                    requested_by=actor, decision_seq=decision_seq):
+                    requested_by=actor, decision_seq=decision_seq,
+                    monitoring_only=bool(frag.get("monitoring_only", False))):
                 continue        # duplicate logical action (P0 #12): skip
             action_ids.append(action_id)
-        return action_ids[0] if action_ids else None
+        return action_ids
 
     def process_batch(self, *, batch: "IngestBatch", actor: str,
                       tenant_id: str | None = None) -> dict:
@@ -439,11 +457,11 @@ class Controller:
                         actor=actor)
                     results["demoted"] += 1
                     continue
-                action_id = self.create_action_from_decision(
+                created = self.create_action_from_decision(
                     decision, ind.value, ind.type, actor=actor)
-                if action_id:
+                if created:
                     granted += 1
-                    results["actions"] += 1
+                    results["actions"] += len(created)
             self.ledger.complete_batch(batch.batch_id)
             self.ledger.touch_source_success(batch.source_id)
         except Exception as e:
@@ -495,12 +513,12 @@ class Controller:
             raise ValueError(
                 f"decision {decision_id} seq {seq} was just approved or "
                 "rejected by another operator; approvals are one-shot")
-        action_ids: list[str] = []
-        # a decision may render fragments for multiple adapters
-        result = self.create_action_from_decision(
+        # a decision may render fragments for MULTIPLE adapters: every
+        # created action id is propagated into the approval row and the API
+        # response (review P1 #32)
+        action_ids: list[str] = self.create_action_from_decision(
             decision, ind["value"], ind["itype"], actor=actor, decision_seq=seq)
-        if result:
-            action_ids.append(result)
+        if action_ids:
             self.ledger.set_approval_actions(
                 approval_id, tuple(action_ids))
         return {"decision_id": decision_id, "approval_id": approval_id,

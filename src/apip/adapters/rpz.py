@@ -132,10 +132,17 @@ class RpzAdapter:
     name = "rpz"
 
     def __init__(self, config: AdapterConfig):
+        from apip.adapters.base import validate_adapter_config
         self.config = config
         mode = config.rpz_mode.upper()
         if mode not in MODE_RANK:
             raise AdapterError(f"invalid rpz mode {config.rpz_mode!r}")
+        # P1 #37: the config is an artifact boundary — path traversal in the
+        # zone dir, an unsafe zone name, or an out-of-range port is refused
+        # at construction, not discovered at apply time.
+        problems = validate_adapter_config(config)
+        if problems:
+            raise AdapterError("; ".join(problems))
         self._mode = mode
         self._zone_dir = Path(config.zone_dir)
         # ENFORCE requires an explicit authorized-domain scope — never
@@ -298,10 +305,35 @@ class RpzAdapter:
         return f"{owner} IN CNAME rpz-passthru. ; {comment}"
 
     def _reload(self) -> dict:
+        """Run the configured reload command (P1 #37).
+
+        Two accepted forms, chosen by shape — never by guessing:
+
+        * a JSON array string is an ARGV form and is executed WITHOUT a
+          shell (preferred; no injection surface);
+        * any other string is executed via the shell and is therefore
+          documented TRUSTED OPERATOR CODE — the same trust level as the
+          operator's own shell rc. It is never fed any policy- or
+          evidence-derived data (the command is static configuration).
+        """
+        import json as _json
         cmd = self.config.reload_command
         if not cmd:
             return {"reloaded": False, "reason": "no reload_command configured"}
-        proc = subprocess.run(cmd, shell=True, capture_output=True, timeout=15)
+        stripped = cmd.strip()
+        if stripped.startswith("["):
+            try:
+                argv = _json.loads(stripped)
+                if (not isinstance(argv, list) or not argv
+                        or not all(isinstance(a, str) for a in argv)):
+                    raise ValueError("not an argv")
+            except ValueError as e:
+                raise AdapterError(f"reload_command argv form is invalid: {e}")
+            proc = subprocess.run(argv, capture_output=True, timeout=15,
+                                  shell=False)
+        else:
+            proc = subprocess.run(cmd, shell=True, capture_output=True,
+                                  timeout=15)
         if proc.returncode != 0:
             raise AdapterError(
                 f"reload command failed rc={proc.returncode}: "

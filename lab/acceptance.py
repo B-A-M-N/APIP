@@ -517,13 +517,25 @@ def main() -> int:
                     help="Postgres unix-socket dir (default %(default)s)")
     ap.add_argument("--no-db-check", action="store_true",
                     help="run even if no Postgres is reachable (will fail fast)")
+    ap.add_argument("--require-postgres", action="store_true",
+                    help="RELEASE mode (review P1 #40): no skip. When no "
+                         "Postgres is reachable, exit non-zero instead of "
+                         "printing SKIP. CI and the release checklist always "
+                         "invoke this mode — acceptance evidence may never be "
+                         "an empty set of skipped steps.")
     args = ap.parse_args()
     socket_dir = args.socket_dir
 
-    if not can_connect(socket_dir) and not args.no_db_check:
-        print(f"SKIP: no reachable Postgres on socket dir {socket_dir!r}; "
-              "the always-on baseline stays green without a database.", flush=True)
-        return 0
+    if not can_connect(socket_dir):
+        if args.require_postgres:
+            print(f"FAIL: --require-postgres set but no reachable Postgres on "
+                  f"socket dir {socket_dir!r}; release acceptance may not "
+                  f"skip.", flush=True)
+            return 2
+        if not args.no_db_check:
+            print(f"SKIP: no reachable Postgres on socket dir {socket_dir!r}; "
+                  "the always-on baseline stays green without a database.", flush=True)
+            return 0
 
     from apip.controller.service import Controller  # noqa: PLC0415
     from apip.ledger.db import Database  # noqa: PLC0415

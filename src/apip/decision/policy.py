@@ -278,7 +278,7 @@ def _current_epoch(policy: Policy) -> str:
 def _behavioral_families(indicator: Indicator, registry) -> set[str]:
     fams: set[str] = set()
     for ev in indicator.evidence:
-        if ev.kind.startswith(BEHAVIORAL_PREFIX) and registry.class_of(ev.source_id) == "local":
+        if ev.kind.startswith(BEHAVIORAL_PREFIX) and registry.effective_class(ev.source_id) == "local":
             fams.add(ev.kind)
     return fams
 
@@ -445,7 +445,7 @@ def _decision_bearing_evidence(indicator: Indicator, registry) -> Indicator:
     so their quantity/order/size can never touch the decision."""
     kept = [
         ev for ev in indicator.evidence
-        if registry.class_of(ev.source_id) not in ZERO_WEIGHT_CLASSES
+        if registry.effective_class(ev.source_id) not in ZERO_WEIGHT_CLASSES
     ]
     if len(kept) == len(indicator.evidence):
         return indicator
@@ -577,7 +577,7 @@ def evaluate(indicator: Indicator, policy: Policy,
     external_qualified, _ = _external_corroboration(indicator, registry, classifier)
 
     shared = any(ev.kind in SHARED_INFRA_KINDS
-                 and registry.class_of(ev.source_id) not in NON_AUTHORITATIVE_CLASSES
+                 and registry.effective_class(ev.source_id) not in NON_AUTHORITATIVE_CLASSES
                  for ev in indicator.evidence)
     infra_state = "shared" if shared else ("dedicated" if has_dedicated else "unknown")
 

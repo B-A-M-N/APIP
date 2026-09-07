@@ -87,11 +87,14 @@ def cli(ctx: click.Context, base: str | None, token: str | None) -> None:
 @cli.command()
 @click.pass_context
 def status(ctx: click.Context) -> None:
-    """Overall controller + subsystem health."""
+    """Overall controller + subsystem health (authenticated rich snapshot).
+
+    Reads GET /status (operator token required); the unauthenticated
+    /health is a bare liveness word with no component detail by design."""
     api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
-    h = api.get("/health")
+    h = api.get("/status")
     if not isinstance(h.get("components"), dict):
-        click.echo(click.style("unknown health shape: " + str(h), fg="yellow"))
+        click.echo(click.style("unknown status shape: " + str(h), fg="yellow"))
         return
     components = h["components"]
     click.echo(f"APIP {h.get('api_version','?')}")
@@ -199,6 +202,18 @@ def source_register(ctx: click.Context, source_id: str, source_class: str,
     click.echo(f"  {r.get('note','')}")
 
 
+@source.command("rotate")
+@click.argument("source_id")
+@click.pass_context
+def source_rotate(ctx: click.Context, source_id: str) -> None:
+    """Rotate a source's credential (prints the new one-time secret key)."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    r = api.post(f"/sources/{source_id}/rotate")
+    click.echo(f"rotated credential for {r['source_id']}")
+    click.echo(f"  source_key (store securely): {r['source_key']}")
+    click.echo(f"  {r.get('note','')}")
+
+
 # -- ingest -------------------------------------------------------------
 
 @cli.command("ingest")
@@ -246,7 +261,7 @@ def indicator_list(ctx: click.Context, limit: int) -> None:
     """List indicators."""
     api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
     rows = api.get("/indicators", params={"limit": limit}).get("indicators", [])
-    _table(rows, ["indicator_id", "type", "value", "sources", "created_at"])
+    _table(rows, ["indicator_id", "itype", "value", "first_seen", "last_seen"])
 
 
 @indicator.command("show")
@@ -284,7 +299,8 @@ def decision_list(ctx: click.Context, limit: int, disposition: str | None) -> No
     if disposition:
         params["disposition"] = disposition
     rows = api.get("/decisions", params=params).get("decisions", [])
-    _table(rows, ["decision_id", "disposition", "score_m", "action", "indicator_id", "created_at"])
+    _table(rows, ["decision_id", "disposition", "maliciousness", "action",
+                  "indicator_id", "created_at"])
 
 
 @decision.command("show")
@@ -298,10 +314,12 @@ def decision_show(ctx: click.Context, decision_id: str) -> None:
     click.echo(f"decision {d.get('decision_id')}")
     click.echo(f"  indicator: {d.get('indicator_id')}")
     click.echo(f"  disposition: {d.get('disposition')}")
-    click.echo(f"  score_m: {d.get('score_m')}  action: {d.get('action')}")
+    click.echo(f"  maliciousness: {d.get('maliciousness')}  "
+               f"action_safety: {d.get('action_safety')}  action: {d.get('action')}")
     click.echo(f"  reason_codes: {d.get('reason_codes')}")
-    click.echo(f"  policy: {d.get('policy_version')}@{d.get('policy_revision')} "
-               f"content_sha256={d.get('content_sha256')}")
+    click.echo(f"  seq: {d.get('seq')}  content_hash: {d.get('content_hash')}")
+    click.echo(f"  policy: {d.get('policy_version')} "
+               f"content_sha256={d.get('policy_content_sha256')}")
     click.echo("evidence:")
     for ev in data.get("evidence", []):
         click.echo(f"  - {ev.get('kind')} source={ev.get('source_id')} obs={ev.get('observed_at')}")
@@ -316,11 +334,12 @@ def decision_explain(ctx: click.Context, decision_id: str) -> None:
     data = api.get(f"/decisions/{decision_id}")
     d = data.get("decision", {})
     click.echo(f"Why APIP reaches {d.get('disposition')} for {d.get('indicator_id')}:")
-    click.echo(f"  composite score m={d.get('score_m')}")
+    click.echo(f"  composite maliciousness m={d.get('maliciousness')} "
+               f"action_safety s={d.get('action_safety')}")
     click.echo(f"  reason codes: {', '.join(d.get('reason_codes') or [])}")
     click.echo(f"  action: {d.get('action')} (ttl_seconds={d.get('ttl_seconds')})")
-    click.echo(f"  authorized by policy {d.get('policy_version')}@{d.get('policy_revision')} "
-               f"({d.get('content_sha256')})")
+    click.echo(f"  authorized by policy {d.get('policy_version')} "
+               f"({d.get('policy_content_sha256')})")
     click.echo("evidence contributing:")
     for ev in data.get("evidence", []):
         kind, sid = ev.get("kind"), ev.get("source_id")
@@ -573,7 +592,7 @@ def audit(ctx: click.Context, limit: int) -> None:
     """Show the append-only audit trail."""
     api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
     rows = api.get("/audit", params={"limit": limit}).get("audit", [])
-    _table(rows, ["seq", "created_at", "actor", "event_type", "subject", "detail"])
+    _table(rows, ["event_id", "at", "actor", "event_type", "subject", "detail"])
 
 
 # -- lifecycle ---------------------------------------------------------------

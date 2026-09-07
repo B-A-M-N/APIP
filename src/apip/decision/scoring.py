@@ -219,7 +219,7 @@ def _score_impl(indicator: Indicator, table: EvidenceTable,
     reasons: list[str] = []
     for ev in indicator.evidence:
         kind = ev.kind
-        src_class = source_registry.class_of(ev.source_id)
+        src_class = source_registry.effective_class(ev.source_id)
         if src_class in ZERO_WEIGHT_CLASSES:
             continue
         recency = classify_recency(ev.observed_at)

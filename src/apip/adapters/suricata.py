@@ -71,10 +71,18 @@ class SuricataAdapter:
     name = "suricata"
 
     def __init__(self, config: AdapterConfig):
+        from apip.adapters.base import validate_adapter_config
         self.config = config
         mode = config.suricata_mode.upper()
         if mode not in MODE_RANK:
             raise AdapterError(f"invalid suricata mode {config.suricata_mode!r}")
+        # P1 #37: same artifact boundary as RPZ — rules dir traversal and a
+        # rules filename that is not a bare filename are refused here.
+        problems = [p for p in validate_adapter_config(config)
+                    if "zone_name" not in p and "verify_query" not in p
+                    and "zone_dir" not in p]
+        if problems:
+            raise AdapterError("; ".join(problems))
         # Truthfulness (review P0 #4): ENFORCE is not offered on this adapter
         # in beta — no engine reload, no parser validation, no independent
         # engine-loaded confirmation exists. Refuse rather than fabricate.

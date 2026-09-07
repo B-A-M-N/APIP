@@ -134,17 +134,44 @@ to `unregistered`, malformed evidence → batch rejected, insufficient evidence 
 NO_ACTION, adapter-unavailable → action fails without a fabricated success) all
 fail safely.
 
-**Re-runnable acceptance driver (`lab/acceptance.py`):** the 20-step loop is
-now a one-command executable a reviewer can (re)run from a fresh clone. It
-drives the REAL product wiring — `controller.pipeline.decide_indicator`,
-`Controller.approve_decision`, `_dispatch_one`, `_verify_action`,
-`_remove_action` — against a scratch Postgres, and proves every enforcement
-step with a **real UDP DNS query** against `lab/resolver.py` (a stdlib-only
-loopback resolver that re-reads the APIP RPZ zone on every query). It exits 0
-ONLY when all 20 steps pass and **skips cleanly (exit 0) when no Postgres is
-reachable** (`--socket-dir` overrides the unix-socket path); the always-on
-baseline stays green without a database.
+**Re-runnable acceptance driver (`lab/acceptance.py`) — LEVEL 1 evidence
+(review P1 #41):** the 20-step loop is a one-command executable a reviewer can
+(re)run from a fresh clone. It drives the REAL product wiring —
+`controller.pipeline.decide_indicator`, `Controller.approve_decision`,
+`_dispatch_one`, `_verify_action`, `_remove_action` — against a scratch
+Postgres, and proves every enforcement step with a **real UDP DNS query**
+against `lab/resolver.py` (a stdlib-only loopback resolver that re-reads the
+APIP RPZ zone on every query). It exits 0 ONLY when all 20 steps pass and
+skips cleanly (exit 0) when no Postgres is reachable (`--socket-dir` overrides
+the unix-socket path). **Honest scope: `lab/resolver.py` is an APIP-owned
+harness, not BIND.** Level 1 proves the controller lifecycle and the
+artifact's self-consistency — it does NOT prove BIND `response-policy`
+compatibility.
 `PYTHONPATH="lab:." .venv-apip/bin/python lab/acceptance.py`
+
+**Release mode:** `--require-postgres` (review P1 #40) disables the skip for
+release/CI runs — with no reachable Postgres it exits 2 instead of printing
+SKIP, so release acceptance evidence can never be an empty set of skipped
+steps. CI and the release checklist always invoke this mode.
+
+**LEVEL 2 evidence — real BIND (`lab/bind_gate.py`):** the BIND gate is the
+artifact's actual compatibility proof: real `named` (docker `ubuntu/bind9`)
+consumes BOTH APIP artifacts through a real `response-policy` chain;
+`named-checkzone` validates each publish; the SHADOW artifact is proven to
+change no answer even while attached; the ENFORCE artifact is proven to a real
+`NXDOMAIN` over UDP; revoke restores the baseline; SOA serial advances on
+every publish so the reload actually propagates; APIP restart re-proves the
+same. Exit codes: 0 pass, 1 gate FAILED, 2 prerequisites missing (docker /
+Postgres) — in release CI a missing prerequisite is a FAILURE, not a skip.
+**A beta claim of "real DNS RPZ enforcement" requires a passing Level 2 gate.**
+`PYTHONPATH="lab:." .venv-apip/bin/python lab/bind_gate.py`
+
+**Evidence hierarchy (do not upgrade a claim past its level):**
+
+| Level | Driver | Proves | Does NOT prove |
+|---|---|---|---|
+| 1 | `lab/acceptance.py` | controller lifecycle, decisions, approvals, artifact self-consistency, restart survival (against the lab resolver) | BIND `response-policy` compatibility |
+| 2 | `lab/bind_gate.py` | real BIND loads the artifact, real NXDOMAIN, real baseline restore | Suricata engine behavior (no live Suricata gate in beta; the Suricata adapter is an IDS/export surface) |
 
 Verified end-to-end on 2026-09-03 by **B-A-M-N**: SHADOW-leg proves the
 monitor-only zone is NOT consumed (real DNS keeps the baseline 10.99.0.9);

@@ -7,14 +7,19 @@
 # docs/ for the policy TOML schema, and NEVER put credentials in a policy.
 
 [api]
-host = "0.0.0.0"        # bind for the operator HTTP API + CLI
+# P1 #38: bind the container/private network only. Publishing to a host
+# interface is the compose file's job (loopback by default); remote access
+# is via a TLS-terminating reverse proxy. Bare metal: use 127.0.0.1.
+host = "0.0.0.0"        # container bind (compose publishes 127.0.0.1:8510)
 port = 8510
 
 [database]
 # The controller connects to its durable ledger. Use the TCP host here; in
 # Docker Compose this is the `db` service. Never commit a password to this
 # file — provide it via APIP_DB_PASSWORD or APIP_DB_PASSWORD_FILE.
-host = "127.0.0.1"
+# P1 #22: inside Docker Compose the ledger is the `db` service.
+# (A bare-metal install points this at 127.0.0.1 or the DB host.)
+host = "db"
 port = 5432
 dbname = "apip"
 user = "apip"

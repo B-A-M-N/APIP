@@ -491,10 +491,13 @@ def test_api_promote_bad_revision_is_400(api_harness):
 
 
 def test_api_policy_stage_invalid_mode_is_400(api_harness):
+    """P1 #34: the closed mode set is enforced by the strict request model —
+    an invalid mode (or empty text) is a 422/400 validation refusal, never a
+    stored row."""
     tc, _ = api_harness
     h = {"Authorization": "Bearer test-token"}
     r = tc.post("/policy/stage", json={"text": "", "mode": "BOGUS"}, headers=h)
-    assert r.status_code == 400
+    assert r.status_code in (400, 422)
 
 
 def test_api_health_does_not_disclose_topology(api_harness):

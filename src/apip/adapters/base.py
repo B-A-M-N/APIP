@@ -1,6 +1,7 @@
 """Adapter protocol."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Protocol
 
 
@@ -9,6 +10,42 @@ class AdapterError(RuntimeError):
 
 
 MODE_RANK = {"OFF": 0, "OBSERVE": 1, "SHADOW": 2, "ENFORCE": 3}
+
+
+def validate_adapter_config(config: "object") -> list[str]:
+    """Artifact-boundary validation (review P1 #37): refuse adapter configs
+    that could turn configuration into code injection or path traversal.
+    Returns a list of problems (empty = valid)."""
+    import re
+    problems: list[str] = []
+    zone_dir = getattr(config, "zone_dir", "")
+    rules_dir = getattr(config, "suricata_rules_dir", "")
+    for label, d in (("zone_dir", zone_dir), ("suricata_rules_dir", rules_dir)):
+        if ".." in Path(d).parts:
+            problems.append(f"adapter.{label} contains path traversal: {d!r}")
+    zone_name = str(getattr(config, "zone_name", ""))
+    # a safe canonical DNS name: letters/digits/hyphen labels, no dots-only
+    # tricks, overall <= 253 chars
+    if zone_name:
+        if len(zone_name) > 253:
+            problems.append("adapter.zone_name exceeds 253 characters")
+        if not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+                            r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*"
+                            r"\.?", zone_name):
+            problems.append(f"adapter.zone_name is not a safe DNS name: "
+                            f"{zone_name!r}")
+    rules_file = str(getattr(config, "suricata_rules_file", ""))
+    # basename only — never a path
+    if rules_file and (Path(rules_file).name != rules_file or ".." in rules_file):
+        problems.append(f"adapter.suricata_rules_file must be a bare "
+                        f"filename: {rules_file!r}")
+    port = getattr(config, "verify_query_port", 53)
+    if not (1 <= int(port) <= 65535):
+        problems.append(f"adapter.verify_query_port out of range: {port}")
+    timeout = getattr(config, "verify_timeout_s", 3.0)
+    if float(timeout) <= 0:
+        problems.append(f"adapter.verify_timeout_s must be positive: {timeout}")
+    return problems
 
 
 def effective_mode(action_mode: str | None, adapter_max: str) -> str:

@@ -14,6 +14,22 @@ Components:
 
 Default mode: OBSERVE/SHADOW.
 
+### Transport security (beta reality — read before exposing the API)
+
+The beta API is **bearer-token over plain HTTP** (`docs/09`'s "mTLS
+everywhere" describes the target hardened profile, not what ships today):
+
+- default bind is loopback (`127.0.0.1`); the Compose profile publishes
+  loopback only (`127.0.0.1:8510`);
+- **remote operator access REQUIRES a TLS-terminating reverse proxy the
+  operator runs** (nginx/Caddy/traefik or an existing ingress) in front of
+  the API — never publish the plain-HTTP port to a shared network;
+- the operator token is a bearer credential: anyone who can reach the
+  unproxied port can use it, which is exactly why the default publish is
+  loopback-only;
+- mTLS between APIP and actuators is NOT implemented in beta; adapter
+  control is local file/reload-command based (see `docs/06`).
+
 ## Profile B — Enterprise or utility perimeter
 
 Topology:

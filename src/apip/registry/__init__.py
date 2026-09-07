@@ -64,6 +64,18 @@ class SourceRegistry:
                           independent=False, auto_enforcement_allowed=False),
         )
 
+    def effective_class(self, source_id: str) -> str:
+        """The class a source contributes to DECISIONS (review P1 #30):
+        disabling a source QUARANTINES its authority immediately — a
+        disabled source resolves as "unregistered" (zero scoring weight,
+        zero corroboration) while its history stays intact. A disabled
+        incident-response source must not keep vouching for evidence in
+        replays and later decisions."""
+        p = self.profile(source_id)
+        if not p.enabled:
+            return "unregistered"
+        return p.source_class
+
     def class_of(self, source_id: str) -> str:
         return self.profile(source_id).source_class
 

@@ -16,7 +16,7 @@
     },
     {
       "path": ".github/workflows/verify.yml",
-      "sha256": "0e536eda874abbef42575a288bf34210c0063b6b302f5c35074851e9515f96e3"
+      "sha256": "934207cbf80ac73b4b0755d57d2b112aea4691dcb457375d2d121c5932f50053"
     },
     {
       "path": ".gitignore",
@@ -69,6 +69,10 @@
     {
       "path": "SECURITY.md",
       "sha256": "60ff909895983466471a1500980a7745d124faa06fb161f2a32b34c57db8ab73"
+    },
+    {
+      "path": "api/openapi.beta.json",
+      "sha256": "2630fa0f4fb30727e19ae818f5bf1ea81bad5c34c75dfce5737eab1040f237f4"
     },
     {
       "path": "api/openapi.future.yaml",
@@ -292,7 +296,7 @@
     },
     {
       "path": "pyproject.toml",
-      "sha256": "487fc1ee64641cb4c906cc13af197b750e9d374d13a6cae5bb13794ac3df643f"
+      "sha256": "77fe6ed53dc3594da1bfa76ca51dc22b686e5e423edbe7f298c4eb54797e3af5"
     },
     {
       "path": "reference/README.md",
@@ -457,6 +461,10 @@
     {
       "path": "schemas/policy.schema.json",
       "sha256": "cb871c4ff82bdee1aa90620b965b8266137720ec10f1984cc44b740af02ff4b7"
+    },
+    {
+      "path": "scripts/generate_openapi.py",
+      "sha256": "5843328ab9cb78cee52321eb2889e7d0e455b868c2cc657a989a6e51c04d26b9"
     },
     {
       "path": "sources.json",
@@ -631,6 +639,10 @@
       "sha256": "eec777cf0eb1c1e87dc9271bec9d5af894e7443552123daafe2743f083aa90bf"
     },
     {
+      "path": "tests/pg.py",
+      "sha256": "267577fbb666d36fde9d5fd5cc35b6e967a0b3049aa0683631c87afdae591b69"
+    },
+    {
       "path": "tests/test_action_posture.py",
       "sha256": "983bf5980f16173630af700086a6c3925d02476b2270959caf05bb5de2e6cf96"
     },
@@ -689,6 +701,10 @@
     {
       "path": "tests/test_interop.py",
       "sha256": "d2331d139a74b8f7ad83061b2c2f96baf8e0ced7af78c4d80aefe22c50755a48"
+    },
+    {
+      "path": "tests/test_openapi_contract.py",
+      "sha256": "47a092953942a03509c1afb1991a2576a09c74c02e5ff341a6b18beed669430d"
     },
     {
       "path": "tests/test_policy_lifecycle.py",

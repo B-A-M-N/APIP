@@ -354,3 +354,98 @@ def test_persisted_mode_survives_posture_flip_restart(controller):
             ctrl.adapter.config.zone_name + ".zone")).exists() is False
     finally:
         ctrl2.stop()
+
+
+def test_shared_physical_rule_survives_one_revoke(controller):
+    """Review P0 #6: two actions independently deny the same FQDN (identical
+    physical rule_id `owner:<fqdn>`). Revoking ONE action must terminate the
+    action but NOT remove the shared zone rule; revoking the second (last)
+    owner removes it."""
+    ctrl, _ = controller
+    value = "c2-shared.operator.test"
+
+    def _one(did: str) -> str:
+        _record_approval_decision(ctrl, did, value)
+        res = ctrl.approve_decision(did, "operator")
+        assert res["compiled"], res
+        action_id = res["action_ids"][0]
+        ctrl._dispatch_one(ctrl.ledger.get_action(action_id))
+        return action_id
+
+    a1 = _one("decision--it-shared-1")
+    a2 = _one("decision--it-shared-2")
+    act1 = ctrl.ledger.get_action(a1)
+    act2 = ctrl.ledger.get_action(a2)
+    assert act1["rule_id"] == act2["rule_id"], "test precondition: same physical rule"
+
+    out1 = ctrl.revoke_action(a1, "operator", "revoke-one")
+    assert out1["state"] == "revoked"
+    assert out1.get("shared_rule") is True, out1
+    # the physical rule REMAINS (co-owner a2 still active)
+    st = ctrl.adapter.get_state(act1["selector"])
+    assert st["present"] is True
+
+    out2 = ctrl.revoke_action(a2, "operator", "revoke-last")
+    assert out2["state"] == "revoked"
+    assert out2.get("shared_rule") is not True
+    st = ctrl.adapter.get_state(act2["selector"])
+    assert st["present"] is False
+
+
+def test_dispatch_cancels_when_scope_narrowed_after_creation(controller):
+    """Review P0 #7: an action created under a policy authorizing the target
+    must NOT be applied after the operator promotes a narrower policy that
+    excludes it. Dispatch re-authorizes against the CURRENT effective policy
+    and transitions the action to cancelled_policy_changed."""
+    ctrl, _ = controller
+    did = "decision--it-stale"
+    value = "c2-stale.operator.test"
+    _record_approval_decision(ctrl, did, value)
+    res = ctrl.approve_decision(did, "operator")
+    action_id = res["action_ids"][0]
+    assert ctrl.ledger.get_action(action_id)["state"] == "pending"
+
+    # operator promotes a policy whose authorized domain excludes the target
+    narrowed = """
+policy_version = "narrow.1"
+mode = "ENFORCE"
+scope = "acceptance-tenant"
+
+[thresholds]
+observe_m = 40
+fqdn_auto_m = 95
+fqdn_auto_s = 90
+ip_rate_m = 90
+ip_rate_s = 85
+ip_deny_m = 98
+ip_deny_s = 95
+
+[limits]
+max_auto_ttl_seconds = 3600
+
+[authorization]
+authorized_prefixes = []
+authorized_domains = ["other.test"]
+
+[safety]
+auto_prefix_deny = false
+no_ai_components = true
+
+[replay]
+reference_now = "2026-09-07T00:00:00Z"
+"""
+    import hashlib as _h
+    rev = ctrl.ledger.next_policy_revision("narrow.1")
+    ctrl.ledger.stage_policy(policy_version="narrow.1", revision=rev,
+                             content_sha256=_h.sha256(narrowed.encode()).hexdigest(),
+                             raw_text=narrowed, mode="ENFORCE",
+                             staged_by="operator")
+    ctrl.ledger.promote_policy("narrow.1", rev, "operator")
+
+    # dispatch the stale action: must cancel, never touch the adapter
+    action = ctrl.ledger.get_action(action_id)
+    ctrl._dispatch_one(action)
+    row = ctrl.ledger.get_action(action_id)
+    assert row["state"] == "cancelled_policy_changed", row["state"]
+    st = ctrl.adapter.get_state(action["selector"])
+    assert st["present"] is False

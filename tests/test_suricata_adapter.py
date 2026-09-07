@@ -286,3 +286,63 @@ def test_validate_refuses_pair_selector(tmp_path):
     }
     with pytest.raises(AdapterError):
         ad.validate(cand)
+
+
+# ---------------------------------------------------------------------------
+# Durable SID allocation (review P0 #5): deterministic per decision id,
+# restart-safe, multi-controller collision-free.
+# ---------------------------------------------------------------------------
+
+def test_sid_deterministic_per_decision_across_restart(tmp_path):
+    """Two FRESH adapter instances (simulating two APIP processes) compiling
+    the same decision derive the SAME sid — no process-local counter drift,
+    so a restart can never allocate a colliding new sid range."""
+    ad1 = make_adapter(mode="SHADOW", tmp_path=tmp_path)
+    ad2 = make_adapter(mode="SHADOW", tmp_path=tmp_path)
+    fr1 = ad1.compile(_decision(dec_id="decision--restart"), "198.51.100.50", "ipv4")[0]
+    fr2 = ad2.compile(_decision(dec_id="decision--restart"), "198.51.100.50", "ipv4")[0]
+    assert fr1["rule_id"] == fr2["rule_id"]
+
+
+def test_sid_distinct_across_decisions_and_controllers(tmp_path):
+    """Different decisions on fresh instances (independent 'restarts' /
+    controllers) get different sids — the failure mode of the old per-process
+    counter, which restarted at the same value and overwrote an installed
+    rule owned by a different action."""
+    sids = set()
+    for i in range(8):
+        ad = make_adapter(mode="SHADOW", tmp_path=tmp_path)
+        fr = ad.compile(_decision(dec_id=f"decision--multi-{i}"),
+                        "198.51.100.60", "ipv4")[0]
+        sids.add(fr["rule_id"])
+    assert len(sids) == 8
+
+
+def test_sid_avoids_installed_rules_from_other_decisions(tmp_path):
+    """A foreign rule already occupying the derived sid slot (out-of-band
+    install or hash-bucket collision) shifts the allocation past it — the
+    new rule must never overwrite an unrelated installed rule."""
+    ad = make_adapter(mode="SHADOW", tmp_path=tmp_path)
+    derived = ad._next_sid("decision--occupy", "")
+    foreign = (f'alert ip $HOME_NET any -> 198.51.100.70 any '
+               f'(msg:"foreign"; sid:{derived}; rev:1;)')
+    (tmp_path / "apip.rules").write_text(foreign + "\n")
+    fr = ad.compile(_decision(dec_id="decision--occupy"), "198.51.100.70", "ipv4")[0]
+    assert fr["rule_id"] != f"sid:{derived}"
+
+
+def test_same_decision_recompiles_to_same_sid_after_apply(tmp_path):
+    """Re-dispatching an already-applied action (crash recovery, reconcile)
+    recompiles to the identical sid, so apply() replaces its own rule rather
+    than piling up duplicates."""
+    ad = make_adapter(mode="SHADOW", tmp_path=tmp_path)
+    fr = ad.compile(_decision(dec_id="decision--reapply"), "198.51.100.80", "ipv4")[0]
+    cand = _candidate(rule_id=fr["rule_id"], fragment=fr["fragment"],
+                      selector=fr["selector"])
+    assert ad.apply(cand)["ok"] is True
+    fr2 = ad.compile(_decision(dec_id="decision--reapply"), "198.51.100.80", "ipv4")[0]
+    assert fr2["rule_id"] == fr["rule_id"]
+    assert ad.apply(_candidate(rule_id=fr2["rule_id"], fragment=fr2["fragment"],
+                               selector=fr2["selector"]))["ok"] is True
+    content = (tmp_path / "apip.rules").read_text()
+    assert content.count(f'sid:{fr["rule_id"].split("sid:")[1]};') == 1

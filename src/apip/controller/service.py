@@ -438,8 +438,54 @@ class Controller:
                 continue
             self._dispatch_one(action)
 
+    def _stale_authorization(self, action: dict) -> str | None:
+        """None when the action may still be applied; a reason string when
+        its creation-time authorization no longer holds under the CURRENT
+        effective policy (review P0 #7). Checks, in order:
+          1. an effective policy still exists;
+          2. the target is still in the policy's authorized scope;
+          3. the persisted posture is still permitted — a policy demotion
+             never blocks (weaker is fine); a persisted ENFORCE under a
+             non-ENFORCE current policy is stale;
+          4. a PROPOSE-origin action's decision is still awaiting an operator
+             decision that happened (approval remains valid) — i.e. the
+             decision was not re-proposed/rejected meanwhile.
+        """
+        ind_row = self.ledger.get_indicator(action["indicator_id"])
+        if ind_row is None:
+            return "indicator_missing"
+        tenant_id = ind_row.get("tenant_id")
+        policy = self.effective_policy_for(tenant_id)
+        if policy is None:
+            return "no_active_policy"
+        if not in_scope(ind_row["value"], ind_row["itype"], policy):
+            return ("target_out_of_scope_under_current_policy: "
+                    f"{ind_row['value']}")
+        if action["mode"] == "ENFORCE" and policy.mode != "ENFORCE":
+            return (f"posture_not_permitted: persisted ENFORCE under "
+                    f"current policy mode {policy.mode}")
+        if action.get("state") and action["decision_id"]:
+            dec = self.ledger.get_decision(action["decision_id"])
+            if dec is None:
+                return "authorizing_decision_missing"
+        return None
+
     def _dispatch_one(self, action: dict) -> None:
         action_id = action["action_id"]
+        # Re-authorize at DISPATCH time (review P0 #7): creation-time
+        # authorization can go stale — a policy promotion may narrow scope,
+        # retire the authorizing posture, or invalidate the approval between
+        # action creation and worker dispatch. Re-check the CURRENT effective
+        # policy before every external apply; cancel rather than apply.
+        cancel = self._stale_authorization(action)
+        if cancel:
+            self.ledger.record_attempt(
+                action_id=action_id, phase="prepare", ok=False,
+                detail={"cancelled": cancel}, actor=CONTROLLER_ACTOR)
+            self.ledger.set_action_state(
+                action_id, "cancelled_policy_changed", cancel,
+                CONTROLLER_ACTOR)
+            return
         try:
             self.ledger.record_attempt(action_id=action_id, phase="prepare",
                                        ok=True, detail={"mode": action["mode"]},
@@ -563,8 +609,32 @@ class Controller:
                        terminal_state: str, revoked_by: str | None) -> dict:
         """Remove a control through the adapter, VERIFY the removal, then
         record the terminal state. If removal cannot be verified the action
-        stays `drifted` — never silently marked gone."""
+        stays `drifted` — never silently marked gone.
+
+        Multi-action ownership (review P0 #6): the adapter's physical rule
+        (RPZ owner / Suricata sid) may be shared by several active actions
+        (e.g. two decisions denying the same FQDN). While ANY other active
+        action still requires the rule, this action reaches its terminal
+        state WITHOUT removing the shared physical rule — desired state stays
+        while any justification remains."""
         action_id = action["action_id"]
+        co_owners = self.ledger.active_co_owners(
+            adapter=action["adapter"], rule_id=action["rule_id"],
+            exclude_action_id=action_id)
+        if co_owners:
+            self.ledger.record_attempt(
+                action_id=action_id, phase="revoke", ok=True,
+                detail={"deferred_removal": True,
+                        "co_owners": [c["action_id"] for c in co_owners]},
+                actor=actor)
+            self.ledger.set_action_state(action_id, terminal_state, reason, actor)
+            if revoked_by:
+                self.db.execute(
+                    "UPDATE actions SET revoked_by=%s, revoked_at=now() "
+                    "WHERE action_id=%s", (revoked_by, action_id))
+            return {"action_id": action_id, "state": terminal_state,
+                    "verified": True, "shared_rule": True,
+                    "co_owners": [c["action_id"] for c in co_owners]}
         try:
             result = self._adapter_for(action).revoke(
                 {"rule_id": action["rule_id"], "fragment": action["fragment"],

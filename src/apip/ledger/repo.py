@@ -255,6 +255,19 @@ WHERE action_id=%s RETURNING action_id
             self.audit(actor, f"action.{state}", action_id, {"reason": reason})
         return bool(row)
 
+    def active_co_owners(self, *, adapter: str, rule_id: str,
+                         exclude_action_id: str) -> list[dict]:
+        """Other non-terminal actions that require the SAME physical rule
+        (review P0 #6): the adapter's desired state is keyed by the physical
+        identity (RPZ owner / Suricata sid), so revoking one action must not
+        remove a shared rule another active action still justifies. Terminal
+        states (revoked/expired/failed) don't count as owners."""
+        return self.db.query("""
+SELECT action_id FROM actions
+WHERE adapter=%s AND rule_id=%s AND action_id <> %s
+  AND state IN ('pending','dispatching','applied','verified','drifted')
+""", (adapter, rule_id, exclude_action_id))
+
     def actions_due_for_expiry(self, now: datetime) -> list[dict]:
         # Full row (SELECT *): the controlled revoke path reads fragment/selector/
         # bundle_ids from the action to build the exact removal candidate. A

@@ -163,7 +163,7 @@ class SuricataAdapter:
             target = self._compile_ip_target(indicator_value)
             # IDS-export surface: even a firewall_deny decision renders as
             # `alert` — the beta adapter cannot drop traffic (truthfulness).
-            sid = self._next_sid()
+            sid = self._next_sid(decision.id, self._read_rules())
             if decision.action == "firewall_deny":
                 rule = (
                     f'alert ip $HOME_NET any -> {target} any '
@@ -199,7 +199,7 @@ class SuricataAdapter:
             client = suricata_safe(getattr(sel, "client", None) or "unknown",
                                    "apip_client")
             monitoring = True
-            sid = self._next_sid()
+            sid = self._next_sid(decision.id, self._read_rules())
             rule = (
                 f'alert http any any -> any any '
                 f'(msg:"APIP {disposition} {host} rung={rung}"; '
@@ -243,16 +243,42 @@ class SuricataAdapter:
                 f"{sorted(str(n) for n in self.config.suricata_authorized_prefixes)}")
         return target
 
-    def _next_sid(self) -> int:
-        """SID allocation. Process-local counter + scan-past-existing: the
-        counter restarts per process, so apply() first skips any SID already
-        present in the exported ruleset (or its .next marker) and a durable
-        registry fixes this properly (review P0 #5). Durable, restart-safe
-        allocation lands with the ledger-side registry (task #3)."""
-        if not hasattr(self, "_sid_counter"):
-            self._sid_counter = _SURICATA_RULE_START_SID
-        self._sid_counter += 1
-        return self._sid_counter
+    def _next_sid(self, decision_id: str, rules_text: str | None = None) -> int:
+        """Deterministic, restart-safe SID allocation (review P0 #5).
+
+        The SID is derived from the DECISION ID — a globally unique ledger
+        identity — not a process-local counter, so two APIP restarts (or two
+        controllers) compiling the same decision derive the SAME sid and two
+        different decisions can never collide by construction. The derivation
+        is a counter: hash(decision_id) -> start, then scan forward past any
+        sid already claimed by a DIFFERENT decision (from the ruleset text and
+        this process's allocation cache), guaranteeing a free slot and stable
+        recompiles.
+        """
+        base = int.from_bytes(
+            hashlib.sha256(f"{decision_id}".encode()).digest()[:4], "big")
+        candidate = _SURICATA_RULE_START_SID + (base % 900_000)   # 9100000..9999999
+        claimed: dict[str, str] = {}   # sid -> owning line
+        if rules_text:
+            for line in rules_text.splitlines():
+                sid = self._rule_sid(line)
+                if sid is not None:
+                    claimed[sid] = line
+        if not hasattr(self, "_claimed_sids"):
+            self._claimed_sids: dict[str, str] = {}   # decision_id -> sid
+        prior = self._claimed_sids.get(decision_id)
+        if prior is not None:
+            line = claimed.get(prior)
+            # this decision's own installed rule: recompiling to the same sid
+            # is correct (apply replaces its own rule; crash-recovery path)
+            if line is None or f"apip_decision {decision_id}" in line:
+                if int(prior) >= _SURICATA_RULE_START_SID:
+                    return int(prior)
+        # scan wins: never allocate a sid occupied by a DIFFERENT rule
+        while str(candidate) in claimed:
+            candidate += 1
+        self._claimed_sids[decision_id] = str(candidate)
+        return candidate
 
     @staticmethod
     def _rule_sid(line: str) -> str | None:
@@ -269,7 +295,7 @@ class SuricataAdapter:
 
     # -- validate ----------------------------------------------------------------
 
-    def validate(self, candidate: dict) -> dict:
+    def validate(self, candidate: dict, *, check_scope: bool = True) -> dict:
         rule_id = candidate.get("rule_id", "")
         fragment = candidate.get("fragment", "")
         selector = candidate.get("selector") or {}
@@ -318,7 +344,7 @@ class SuricataAdapter:
         # validate time, so a candidate IP target outside the configured
         # authorized prefixes is refused here too — not only at compile.
         if exact_ip is not None:
-            if not self._in_adapter_scope(exact_ip):
+            if check_scope and not self._in_adapter_scope(exact_ip):
                 raise AdapterError(
                     f"target {exact_ip} outside adapter home-net scope "
                     f"{sorted(str(n) for n in self.config.suricata_authorized_prefixes)}")
@@ -404,9 +430,11 @@ class SuricataAdapter:
     def revoke(self, candidate: dict) -> dict:
         """Remove EXACTLY this sid; verify the ruleset no longer holds it. A
         missing ruleset counts as removed (idempotent). Ownership is
-        structural (stored rule_id); current scope never gates removal
-        (review P0 #8) — but structural validation still applies."""
-        checked = self.validate(candidate)
+        structural (stored rule_id + exact selector shape) and the adapter's
+        CURRENT scope never gates removal (review P0 #8): narrowing
+        suricata_authorized_prefixes must not strand APIP's own installed
+        rule — apply authorization and removal authorization differ."""
+        checked = self.validate(candidate, check_scope=False)
         rule_id = checked["rule_id"]
         sid_line = rule_id.split("sid:", 1)[1]
         content = self._read_rules()

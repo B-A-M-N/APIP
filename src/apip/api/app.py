@@ -12,13 +12,13 @@ Auth:
 """
 from __future__ import annotations
 
+import string
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 
 from apip.auth import constant_time_equals, generate_source_key, hash_credential
 from apip.config.service import ServiceConfig
-from apip.controller.engine import DecisionPipeline
 from apip.controller.service import Controller
 from apip.ingest import IngestBatch, IngestChannel, IngestError, parse_indicator_payload
 from apip.ledger.db import DatabaseUnavailable
@@ -33,10 +33,22 @@ def _bearer_from(header: str | None) -> str:
 
 
 def _safe_source_id(value: str) -> bool:
-    """Source ids are identifiers we insert into SQL and noise; keep them to
-    a closed charset (letters, digits, _, -)."""
-    return bool(value) and all(c.isalnum() or c in "_-" for c in value) \
-        and not value.isdigit()
+    """Source ids are identifiers we insert into SQL, logs, and artifact
+    comments; keep them to an ASCII-ONLY closed charset (letters, digits,
+    _, -). ``str.isalnum()`` accepts non-ASCII homoglyphs (review P0 #9) —
+    a Cyrillic 'а' in a source id is a different identity from the ASCII
+    one while rendering identically, so the canonical form is ASCII."""
+    return bool(value) and all(
+        (c in string.ascii_letters or c in string.digits or c in "_-")
+        for c in value) and not value.isdigit()
+
+
+# Identity sentinels the registry protocol reserves (review P0 #9):
+# "unregistered" is the zero-authority class — registering it as a real
+# (possibly curated) source would let deliberately demoted evidence resolve
+# through the registry and recover scoring authority. Blank ids are
+# likewise refused at every layer.
+RESERVED_SOURCE_IDS = frozenset({"unregistered"})
 
 
 # Mirrors the DB CHECK constraint on sources.source_class (migrations.py).
@@ -98,7 +110,13 @@ def build_app(config: ServiceConfig,
         upstream = (payload.get("upstream") or None)
         allowed = tuple(str(x) for x in payload.get("allowed_kinds", []) or [])
         provenance = str(payload.get("provenance_note", "")).strip()
-        if source_id not in {"", "unregistered"} and not _safe_source_id(source_id):
+        # Reserved identities are refused UNCONDITIONALLY (review P0 #9) —
+        # no charset exemption path.
+        if not source_id or source_id.lower() in RESERVED_SOURCE_IDS:
+            raise HTTPException(
+                400, f"source_id {source_id!r} is reserved and cannot be "
+                     "registered")
+        if not _safe_source_id(source_id):
             raise HTTPException(400, f"unsafe source_id {source_id!r}")
         if source_class not in _SOURCE_CLASSES:
             raise HTTPException(
@@ -142,31 +160,22 @@ def build_app(config: ServiceConfig,
             batch = parse_indicator_payload(body, channel)
         except IngestError as e:
             raise HTTPException(400, str(e)) from e
-        # idempotent batch: same bytes + same source => no-op (a replay).
-        replay = controller.ledger.batch_exists(batch.batch_id)
-        if not replay:
-            controller.ledger.record_batch(
-                batch_id=batch.batch_id, source_id=batch.source_id,
-                raw_sha256=batch.raw_sha256, actor=src["source_id"],
-                indicator_count=len(batch.indicators),
-                demoted=batch.demoted_records, channel=src["source_id"])
-            decide = DecisionPipeline(controller.ledger)
-            for ind in batch.indicators:
-                controller.ledger.upsert_indicator(ind, batch.batch_id)
-                # decide independently per indicator; create actions for
-                # actionable dispositions below
-                result = decide.decide_indicator(
-                    ind.id, actor=src["source_id"], batch_id=batch.batch_id)
-                if result and result["decision"].disposition in (
-                        "SHADOW_ACTION", "AUTO_ENFORCE"):
-                    controller.create_action_from_decision(
-                        result["decision"], ind.value, ind.type,
-                        actor=src["source_id"])
-            controller.ledger.touch_source_success(src["source_id"])
+        # The ONE durable ingest unit of work (review P0 #11/#12/#13):
+        # begin 'processing' -> upsert/decide/act -> 'complete'. A replay of
+        # the SAME bytes is a no-op only once the batch is 'complete'; a
+        # crashed run resumes. The blast-radius budget
+        # (max_new_auto_actions_per_batch) is enforced here, and actions are
+        # minted at most once per decision instance (DB-pinned).
+        try:
+            results = controller.process_batch(batch=batch, actor=src["source_id"])
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(503, f"ingest processing failed: {e}") from e
         return {"batch_id": batch.batch_id, "source_id": batch.source_id,
-                "indicators": len(batch.indicators),
+                "indicators": results["indicators"],
                 "demoted_records": batch.demoted_records,
-                "replay": replay}
+                "actions": results["actions"],
+                "demoted_to_observe": results["demoted"],
+                "replay": bool(results.get("replay"))}
 
     # -- health ---------------------------------------------------------------
 

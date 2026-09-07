@@ -24,6 +24,7 @@ from apip.controller.engine import DecisionPipeline, now_iso_utc
 from apip.decision.policy import in_scope
 from apip.decision.policy import Policy
 from apip.domain.models import ActionSelector, Decision
+from apip.ingest import IngestBatch
 from apip.ledger.db import Database, DatabaseUnavailable
 from apip.ledger.repo import Ledger
 
@@ -280,10 +281,17 @@ class Controller:
     # -- action creation (from a decision) --------------------------------------
 
     def create_action_from_decision(self, decision: Decision, indicator_value: str,
-                                    indicator_type: str, actor: str) -> str | None:
+                                    indicator_type: str, actor: str,
+                                    decision_seq: int | None = None) -> str | None:
         """Compile a decision into an action through the adapter, with the
         controller-layer scope check (defense in depth layer 2; the decision
-        engine checked layer 1, the adapter re-checks layer 3)."""
+        engine checked layer 1, the adapter re-checks layer 3).
+
+        ``decision_seq`` is the exact immutable decision instance that
+        authorizes these actions (review P0 #17); when omitted the latest
+        instance of the decision id is resolved from the ledger. Actions
+        already existing for the same (decision instance, adapter, rule) are
+        refused at the database (review P0 #12) and skipped here."""
         # defense-in-depth layer 2 uses the TENANT's effective policy (global, or
         # the tighten-only merge with the tenant's overlay) so a narrowed tenant
         # boundary is honored at the controller scope check too, not just at the
@@ -331,13 +339,118 @@ class Controller:
                 cap = adapter.max_mode()
                 if (MODE_RANK.get(mode, 0) > MODE_RANK.get(cap, 0)):
                     mode = "SHADOW" if MODE_RANK.get(cap, 0) >= MODE_RANK["SHADOW"] else "OBSERVE"
-            self.ledger.record_action(
-                action_id=action_id, decision=decision,
-                indicator_id=decision.indicator_id, adapter=frag["adapter"],
-                mode=mode, fragment=frag, expires_at=expires_at,
-                requested_by=actor)
+            if decision_seq is None:
+                decision_seq = self.ledger.decision_seq_for(
+                    decision.id, decision.content_hash)
+                if decision_seq is None:
+                    # the authorizing decision instance is not durably
+                    # recorded — refuse to create an unprovenanced action
+                    self.ledger.audit(actor, "action.rejected_no_decision",
+                                      decision.id, {"adapter": frag["adapter"]})
+                    return None
+            if not self.ledger.record_action(
+                    action_id=action_id, decision=decision,
+                    indicator_id=decision.indicator_id, adapter=frag["adapter"],
+                    mode=mode, fragment=frag, expires_at=expires_at,
+                    requested_by=actor, decision_seq=decision_seq):
+                continue        # duplicate logical action (P0 #12): skip
             action_ids.append(action_id)
         return action_ids[0] if action_ids else None
+
+    def process_batch(self, *, batch: "IngestBatch", actor: str,
+                      tenant_id: str | None = None) -> dict:
+        """The ONE durable ingest unit of work (review P0 #11/#12/#13).
+
+        Lifecycle: begin_batch claims the raw bytes as 'processing' (a replay
+        of the SAME bytes is the only no-op); indicators, decisions and
+        pending actions are then recorded; only at the end is the batch
+        marked 'complete'. A crash at any point leaves the row 'processing',
+        so the retry RESUMES (re-upserting indicators is idempotent by the
+        server-derived observable id; decisions are idempotent by content
+        hash; actions are idempotent per decision instance + rule at the
+        database) instead of being skipped forever as a phantom replay.
+
+        Blast-radius budget (review P0 #13): policy
+        ``max_new_auto_actions_per_batch`` caps how many action-bearing
+        decisions one batch may mint. Candidates are evaluated in batch
+        order (the payload order is the deterministic tiebreak); overflow is
+        DEMOTED to OBSERVE with reason blast_radius_budget_exceeded and the
+        demoted decision is persisted — never silently acted on.
+        """
+        results = {"batch_id": batch.batch_id, "indicators": 0,
+                   "decisions": 0, "actions": 0, "demoted": 0,
+                   "resumed": False}
+        status = self.ledger.batch_status(batch.batch_id)
+        if status == "complete":
+            results["resumed"] = False
+            results["replay"] = True
+            return results
+        if status is None:
+            if not self.ledger.begin_batch(
+                    batch_id=batch.batch_id, source_id=batch.source_id,
+                    raw_sha256=batch.raw_sha256,
+                    indicator_count=len(batch.indicators),
+                    demoted=batch.demoted_records, channel=batch.source_id,
+                    actor=actor):
+                results["replay"] = True
+                return results
+        else:
+            # 'processing' (crashed run) or 'failed': resume
+            results["resumed"] = True
+
+        granted = 0
+        # the blast-radius budget is the batch's EFFECTIVE policy knob:
+        # the tenant's tighten-only merge when an overlay governs, else the
+        # global policy (batch-level cap; per-indicator tenant overrides
+        # arrive with the per-indicator tenant plumbing).
+        budget = None
+        if tenant_id is not None:
+            t_policy = self.effective_policy_for(tenant_id)
+            budget = (t_policy.max_new_auto_actions_per_batch
+                      if t_policy else None)
+        try:
+            decide = DecisionPipeline(self.ledger)
+            for ind in batch.indicators:
+                durable_id = self.ledger.upsert_indicator(
+                    ind, batch.batch_id, tenant_id=tenant_id)
+                results["indicators"] += 1
+                result = decide.decide_indicator(
+                    durable_id, actor=actor, batch_id=batch.batch_id,
+                    tenant_id=tenant_id)
+                if result is None:
+                    continue
+                decision = result["decision"]
+                if result["recorded"] is not None:
+                    results["decisions"] += 1
+                # proposals await operator approval (approve_decision);
+                # only AUTO dispositions mint actions during ingest
+                if decision.disposition not in ("SHADOW_ACTION", "AUTO_ENFORCE"):
+                    continue
+                if budget is not None and granted >= budget:
+                    # budget exhausted: demote + persist the demoted decision
+                    # (never act on the enforcement-intent decision)
+                    demoted = decision.with_budget_demotion()
+                    self.ledger.record_decision(
+                        demoted, indicator_id=durable_id,
+                        batch_id=batch.batch_id,
+                        policy_content_sha256=result["policy_row"]["content_sha256"],
+                        actor=actor)
+                    results["demoted"] += 1
+                    continue
+                action_id = self.create_action_from_decision(
+                    decision, ind.value, ind.type, actor=actor)
+                if action_id:
+                    granted += 1
+                    results["actions"] += 1
+            self.ledger.complete_batch(batch.batch_id)
+            self.ledger.touch_source_success(batch.source_id)
+        except Exception as e:
+            self.ledger.fail_batch(batch.batch_id, str(e))
+            raise
+        if results.get("demoted"):
+            self.ledger.audit(actor, "policy.blast_radius_budget", batch.batch_id,
+                              {"demoted": results["demoted"], "budget": budget})
+        return results
 
     def approve_decision(self, decision_id: str, actor: str) -> dict:
         """Operator approval of a decision awaiting it (PROPOSE_OPERATOR_APPROVAL).
@@ -620,7 +733,7 @@ class Controller:
         action_id = action["action_id"]
         co_owners = self.ledger.active_co_owners(
             adapter=action["adapter"], rule_id=action["rule_id"],
-            exclude_action_id=action_id)
+            exclude_action_id=action_id, mode=action.get("mode"))
         if co_owners:
             self.ledger.record_attempt(
                 action_id=action_id, phase="revoke", ok=True,

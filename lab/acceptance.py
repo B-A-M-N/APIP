@@ -86,6 +86,7 @@ import psycopg2  # noqa: E402
 import psycopg2.extensions  # noqa: E402
 
 from apip.config.service import AdapterConfig, DatabaseConfig, load_config  # noqa: E402
+from apip.ledger.repo import Ledger  # noqa: E402
 from apip.domain.models import (  # noqa: E402
     ActionSelector, Decision, Evidence, Indicator,
 )
@@ -129,18 +130,19 @@ def _propose(ctrl, *, did: str, ind_id: str, value: str,
                            source_class="local",
                            observed_at=_utc(minutes_ago=20), independent=True),),
         tags=("c2",))
-    ctrl.ledger.upsert_indicator(ind, batch_id)
+    durable = ctrl.ledger.upsert_indicator(ind, batch_id)
     sel = ActionSelector(scope_type="destination_global", destination=value)
     d = Decision(
-        id=did, indicator_id=ind.id, maliciousness=97, action_safety=90,
+        id=did, indicator_id=durable, maliciousness=97, action_safety=90,
         disposition="PROPOSE_OPERATOR_APPROVAL", action="dns_nxdomain", rung="L4",
         scope=ctrl.current_policy().scope, ttl_seconds=3600,
         policy_version=ctrl.current_policy().version,
         reason_codes=("proposed",), explanation="acceptance proposal",
         selector=sel,
         content_hash="hash-" + hashlib.sha256(did.encode()).hexdigest())
-    ctrl.ledger.record_decision(d, indicator_id=ind.id, batch_id=batch_id,
+    ctrl.ledger.record_decision(d, indicator_id=durable, batch_id=batch_id,
                                 policy_content_sha256="sha", actor=ACTOR)
+    return durable
 
 
 # --------------------------------------------------------------------------- #
@@ -356,15 +358,15 @@ def _shadow_leg(ctrl, zone_dir: str) -> tuple[str, str, str]:
     channel = IngestChannel(source_id=SOURCE,
                             allowed_source_ids=frozenset({SOURCE}))
     pb = parse_indicator_payload(json.dumps(payload).encode(), channel)
-    for ind in pb.indicators:
-        ctrl.ledger.upsert_indicator(ind, "batch--acep-shadow")
+    assert pb.indicators, "shadow-leg payload must parse to >=1 indicator"
+    durable = ctrl.ledger.upsert_indicator(pb.indicators[0], "batch--acep-shadow")
     print(f"      ingested {C2_NAME}; evidence recorded")
 
     _step(5, "APIP generates a deterministic decision")
-    res = ctrl.pipeline.decide_indicator("indicator--acceptance-c2", actor=ACTOR)
+    res = ctrl.pipeline.decide_indicator(durable, actor=ACTOR)
     assert res and res["recorded"]
     # determinism: same evidence + policy -> same content hash (no recompute)
-    again = ctrl.pipeline.decide_indicator("indicator--acceptance-c2", actor=ACTOR)
+    again = ctrl.pipeline.decide_indicator(durable, actor=ACTOR)
     decision = res["decision"]
     print(f"      deterministic {decision.disposition} "
           f"(M={decision.maliciousness}, action={decision.action}); "
@@ -458,7 +460,9 @@ def _enforce_leg(ctrl, zone_dir: str, shadow_action_id: str) -> None:
     print(f"      real UDP query for {C2_NAME!r} -> rcode={res13['rcode']} (NXDOMAIN)")
 
     _step(14, "ledger shows decision, policy, evidence, adapter receipt, verification")
-    evidence = ctrl.ledger.indicator_evidence("indicator--acep-enforce")
+    # server-derived identity (P0 #10): evidence lives under the DURABLE id
+    enforce_durable = Ledger.observable_id("fqdn", C2_NAME)
+    evidence = ctrl.ledger.indicator_evidence(enforce_durable)
     assert len(evidence) >= 1
     receipts = ctrl.ledger.list_receipts(action_id)
     assert any(r["status"] == "verified" for r in receipts)
@@ -478,7 +482,7 @@ def _enforce_leg(ctrl, zone_dir: str, shadow_action_id: str) -> None:
     gone = ctrl._adapter_for(action).verify(
         {"rule_id": action["rule_id"], "fragment": action["fragment"],
          "mode": action["mode"], "selector": action["selector"]})
-    assert not gone.get("ok")
+    assert not gone.get("ok"), f"verify after removal still ok: {gone}"
     print(f"      removal verified ({gone.get('error')})")
 
     _step(18, "real query proves baseline restored")

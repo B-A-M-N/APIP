@@ -136,6 +136,9 @@ class DecisionPipeline:
             policy_content_sha256=policy_row["content_sha256"], actor=actor)
         return {
             "decision": decision,
+            # recorded is now the decision instance's seq (None when this
+            # exact instance was already recorded) — truthy/falsy semantics
+            # are unchanged for callers.
             "recorded": recorded,
             "policy_row": policy_row,
             "indicator": indicator,

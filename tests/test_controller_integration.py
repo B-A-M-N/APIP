@@ -140,16 +140,16 @@ def _record_approval_decision(ctrl, decision_id: str, value: str) -> None:
                            source_class="local", observed_at="2026-09-03T03:00:00Z",
                            independent=True),),
         tags=("c2",))
-    ctrl.ledger.upsert_indicator(ind, batch)
+    durable = ctrl.ledger.upsert_indicator(ind, batch)
     sel = ActionSelector(scope_type="client_destination_pair", client=None,
                          destination=value, protocol_class="interactive_http")
     d = Decision(
-        id=decision_id, indicator_id=ind.id, maliciousness=97, action_safety=90,
+        id=decision_id, indicator_id=durable, maliciousness=97, action_safety=90,
         disposition="PROPOSE_OPERATOR_APPROVAL", action="dns_nxdomain", rung="L4",
         scope=ctrl.current_policy().scope, ttl_seconds=3600, policy_version="beta",
         reason_codes=("proposed",), explanation="integration approval",
         selector=sel, content_hash="hash--" + hashlib.sha256(decision_id.encode()).hexdigest())
-    ctrl.ledger.record_decision(d, indicator_id=ind.id, batch_id=batch,
+    ctrl.ledger.record_decision(d, indicator_id=durable, batch_id=batch,
                                 policy_content_sha256="sha", actor="operator")
 
 
@@ -245,9 +245,9 @@ def test_operator_reads_never_leak_key_hash(controller):
 
 def test_record_decision_idempotent_at_the_database(controller):
     """record_decision is idempotent on (decision_id, content_hash) and that
-    invariant is pinned by a UNIQUE index (no check-then-insert race): two
-    inserts of the identical decision return (True, False), and the DB holds
-    exactly one row."""
+    invariant is pinned by a UNIQUE index (no check-then-insert race): the
+    first insert returns the instance's seq, the identical re-insert returns
+    None, and the DB holds exactly one row for that content hash."""
     ctrl, _ = controller
     # seed a fresh indicator then record the same decision twice
     value = "c2-idedup.operator.test"
@@ -262,9 +262,9 @@ def test_record_decision_idempotent_at_the_database(controller):
                            source_class="local", observed_at="2026-09-03T03:00:00Z",
                            independent=True),),
         tags=("c2",))
-    ctrl.ledger.upsert_indicator(ind, batch)
+    durable = ctrl.ledger.upsert_indicator(ind, batch)
     d = Decision(
-        id="decision--idedup", indicator_id=ind.id, maliciousness=60,
+        id="decision--idedup", indicator_id=durable, maliciousness=60,
         action_safety=80, disposition="SHADOW_ACTION", action="dns_nxdomain",
         rung="L4", scope=ctrl.current_policy().scope, ttl_seconds=600,
         policy_version="beta", reason_codes=("shadow",),
@@ -273,27 +273,29 @@ def test_record_decision_idempotent_at_the_database(controller):
                                 client=None, destination=value,
                                 protocol_class="interactive_http"),
         content_hash="hash--idedup-constant")
+    seq = ctrl.ledger.record_decision(
+        d, indicator_id=durable, batch_id=batch,
+        policy_content_sha256="sha", actor="operator")
+    assert isinstance(seq, int)
+    # identical decision instance => refused (returns None)
     assert ctrl.ledger.record_decision(
-        d, indicator_id=ind.id, batch_id=batch,
-        policy_content_sha256="sha", actor="operator") is True
-    # identical decision instance => refused (returns False)
-    assert ctrl.ledger.record_decision(
-        d, indicator_id=ind.id, batch_id=batch,
-        policy_content_sha256="sha", actor="operator") is False
+        d, indicator_id=durable, batch_id=batch,
+        policy_content_sha256="sha", actor="operator") is None
     rows = ctrl.db.query(
         "SELECT seq FROM decisions WHERE decision_id=%s", ("decision--idedup",))
     assert len(rows) == 1          # the UNIQUE index held
     # a DIFFERENT content_hash for the same decision_id is still allowed
     d2 = Decision(
-        id="decision--idedup", indicator_id=ind.id, maliciousness=61,
+        id="decision--idedup", indicator_id=durable, maliciousness=61,
         action_safety=80, disposition="SHADOW_ACTION", action="dns_nxdomain",
         rung="L4", scope=ctrl.current_policy().scope, ttl_seconds=600,
         policy_version="beta", reason_codes=("shadow",),
         explanation="integration idempotency v2",
         selector=d.selector, content_hash="hash--idedup-other")
-    assert ctrl.ledger.record_decision(
-        d2, indicator_id=ind.id, batch_id=batch,
-        policy_content_sha256="sha", actor="operator") is True
+    seq2 = ctrl.ledger.record_decision(
+        d2, indicator_id=durable, batch_id=batch,
+        policy_content_sha256="sha", actor="operator")
+    assert isinstance(seq2, int) and seq2 != seq
     rows = ctrl.db.query(
         "SELECT seq FROM decisions WHERE decision_id=%s", ("decision--idedup",))
     assert len(rows) == 2

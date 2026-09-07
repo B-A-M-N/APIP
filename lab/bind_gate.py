@@ -428,17 +428,17 @@ def _propose(ctrl, *, did: str, ind_id: str, value: str, batch_id: str) -> None:
                            observed_at=_utc(minutes_ago=15),
                            independent=True)),
         tags=("c2",))
-    ctrl.ledger.upsert_indicator(ind, batch_id)
+    durable = ctrl.ledger.upsert_indicator(ind, batch_id)
     sel = ActionSelector(scope_type="client_destination_pair", client=None,
                          destination=value, protocol_class="interactive_http")
     d = Decision(
-        id=did, indicator_id=ind_id, maliciousness=97, action_safety=90,
+        id=did, indicator_id=durable, maliciousness=97, action_safety=90,
         disposition="PROPOSE_OPERATOR_APPROVAL", action="dns_nxdomain",
         rung="L4", scope=ctrl.current_policy().scope, ttl_seconds=3600,
         policy_version="bind-gate", reason_codes=("proposed",),
         explanation="bind gate proposal", selector=sel,
         content_hash="hash--" + hashlib.sha256(did.encode()).hexdigest())
-    ctrl.ledger.record_decision(d, indicator_id=ind_id, batch_id=batch_id,
+    ctrl.ledger.record_decision(d, indicator_id=durable, batch_id=batch_id,
                                 policy_content_sha256="sha", actor=ACTOR)
 
 

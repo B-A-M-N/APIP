@@ -10,6 +10,7 @@ Rules:
 """
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta
 
 import psycopg2
@@ -30,6 +31,14 @@ class Ledger:
                         upstream: str | None = None, enabled: bool = True,
                         allowed_kinds: tuple[str, ...] = (),
                         provenance_note: str = "") -> None:
+        # Domain-layer reservation guard (review P0 #9): the same sentinel
+        # refusal as the API and the DB CHECK — "unregistered" is the
+        # zero-authority class and can never become a registered identity.
+        from apip.registry import RESERVED_SOURCE_IDS as _RESERVED
+        v = (source_id or "").strip()
+        if not v or v.lower() in _RESERVED:
+            raise ValueError(
+                f"source_id {source_id!r} is reserved and cannot be registered")
         self.db.execute("""
 INSERT INTO sources (source_id, source_class, independent, auto_enforcement_allowed,
                      upstream, enabled, allowed_kinds, provenance_note, key_hash, created_by)
@@ -103,16 +112,28 @@ ON CONFLICT (source_id) DO UPDATE SET
         return self.db.query_one(
             "SELECT batch_id FROM ingest_batches WHERE batch_id=%s", (batch_id,)) is not None
 
-    def record_batch(self, *, batch_id: str, source_id: str, raw_sha256: str,
-                     indicator_count: int, demoted: int, channel: str,
-                     actor: str) -> bool:
-        """Idempotent by (source_id, raw_sha256): returns True if recorded,
-        False if this exact batch was already ingested."""
+    def batch_status(self, batch_id: str) -> str | None:
+        """The batch's processing status: None (never seen), 'processing'
+        (a crashed/interrupted ingest — the retry must RESUME it, review
+        P0 #11) or 'complete' (a replay no-op)."""
+        row = self.db.query_one(
+            "SELECT status FROM ingest_batches WHERE batch_id=%s", (batch_id,))
+        return row["status"] if row else None
+
+    def begin_batch(self, *, batch_id: str, source_id: str, raw_sha256: str,
+                    indicator_count: int, demoted: int, channel: str,
+                    actor: str) -> bool:
+        """Claim the batch for processing: insert it as 'processing' in its
+        own transaction. Returns False when this exact batch was already
+        recorded (same source + raw bytes — a replay), which is the ONLY
+        state treated as a no-op. A crash mid-processing leaves the row
+        'processing' so the retry resumes instead of skipping forever
+        (review P0 #11)."""
         try:
             self.db.execute("""
 INSERT INTO ingest_batches (batch_id, source_id, raw_sha256, indicator_count,
-                            demoted_records, channel)
-VALUES (%s,%s,%s,%s,%s,%s)
+                            demoted_records, channel, status)
+VALUES (%s,%s,%s,%s,%s,%s,'processing')
 """, (batch_id, source_id, raw_sha256, indicator_count, demoted, channel))
         except psycopg2.errors.UniqueViolation:
             self.audit(actor, "ingest.duplicate_ignored", batch_id,
@@ -123,17 +144,68 @@ VALUES (%s,%s,%s,%s,%s,%s)
                     "demoted": demoted})
         return True
 
+    def record_batch(self, *, batch_id: str, source_id: str, raw_sha256: str,
+                     indicator_count: int, demoted: int, channel: str,
+                     actor: str) -> bool:
+        """Direct-seeding form used by labs/tests: records the batch already
+        'complete' (there is no in-flight processing to resume). Same
+        idempotency by (source_id, raw_sha256) as begin_batch."""
+        try:
+            self.db.execute("""
+INSERT INTO ingest_batches (batch_id, source_id, raw_sha256, indicator_count,
+                            demoted_records, channel, status)
+VALUES (%s,%s,%s,%s,%s,%s,'complete')
+""", (batch_id, source_id, raw_sha256, indicator_count, demoted, channel))
+        except psycopg2.errors.UniqueViolation:
+            self.audit(actor, "ingest.duplicate_ignored", batch_id,
+                       {"source_id": source_id})
+            return False
+        self.audit(actor, "ingest.accept", batch_id,
+                   {"source_id": source_id, "indicators": indicator_count,
+                    "demoted": demoted})
+        return True
+
+    def complete_batch(self, batch_id: str) -> None:
+        """Mark the batch 'complete' — only now is a replay of the same raw
+        bytes a no-op (review P0 #11)."""
+        self.db.execute(
+            "UPDATE ingest_batches SET status='complete' WHERE batch_id=%s",
+            (batch_id,))
+
+    def fail_batch(self, batch_id: str, error: str) -> None:
+        self.db.execute(
+            "UPDATE ingest_batches SET status='failed' WHERE batch_id=%s",
+            (batch_id,))
+        self.audit("controller", "ingest.failed", batch_id, {"error": error[:400]})
+
+    @staticmethod
+    def observable_id(itype: str, canonical_value: str) -> str:
+        """The SERVER-DERIVED durable identity of an observable (review P0
+        #10): a content hash of (itype, canonical value). Two sources
+        assigning different ids to the same observable derive the SAME id
+        (corroboration merges); one source reusing another's id for a
+        different observable derives a DIFFERENT id and can never attach
+        evidence to it. Source-native ids survive as provenance only."""
+        digest = hashlib.sha256(
+            f"{itype}|{canonical_value.strip().rstrip('.').lower() if itype == 'fqdn' else canonical_value.strip()}".encode()
+        ).hexdigest()[:24]
+        return "indicator--" + digest
+
     def upsert_indicator(self, ind: Indicator, batch_id: str,
-                         tenant_id: str | None = None) -> None:
+                         tenant_id: str | None = None) -> str:
+        """Upsert by the server-derived observable id (review P0 #10); the
+        submitted id is stored as provenance (source_object_id), never as
+        identity. Returns the durable indicator id used."""
+        durable_id = self.observable_id(ind.type, ind.value)
         with self.db.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-INSERT INTO indicators (indicator_id, itype, value, tags, tenant_id)
-VALUES (%s,%s,%s,%s,%s)
+INSERT INTO indicators (indicator_id, itype, value, tags, tenant_id, source_object_id)
+VALUES (%s,%s,%s,%s,%s,%s)
 ON CONFLICT (indicator_id) DO UPDATE SET
     last_seen = now(), tags = EXCLUDED.tags,
     tenant_id = COALESCE(EXCLUDED.tenant_id, indicators.tenant_id)
-""", (ind.id, ind.type, ind.value, list(ind.tags), tenant_id))
+""", (durable_id, ind.type, ind.value, list(ind.tags), tenant_id, ind.id))
                 # source refs are NOT FK'd to sources: a channel-certified
                 # upstream id may be asserted before the operator registers
                 # it; unregistered ids simply carry zero authority at
@@ -142,26 +214,29 @@ ON CONFLICT (indicator_id) DO UPDATE SET
                     cur.execute("""
 INSERT INTO indicator_source_refs (indicator_id, source_id)
 VALUES (%s,%s) ON CONFLICT DO NOTHING
-""", (ind.id, sid))
+""", (durable_id, sid))
                 for ev in ind.evidence:
                     cur.execute("""
 INSERT INTO evidence (indicator_id, batch_id, kind, source_id, channel_source,
                       observed_at, detail)
 VALUES (%s,%s,%s,%s,%s,%s,%s)
-""", (ind.id, batch_id, ev.kind, ev.source_id, ev.channel_source,
+""", (durable_id, batch_id, ev.kind, ev.source_id, ev.channel_source,
       None if not ev.observed_at else ev.observed_at,
       psycopg2.extras.Json(ev.detail)))
+        return durable_id
 
     # -- decisions ------------------------------------------------------------
 
     def record_decision(self, d: Decision, *, indicator_id: str, batch_id: str | None,
-                        policy_content_sha256: str, actor: str) -> bool:
+                        policy_content_sha256: str, actor: str) -> int | None:
         """Append a decision; idempotent on (decision_id, content_hash).
 
         Atomic: the uniqueness is pinned by migration idx_decisions_dedup
         (UNIQUE on decision_id, content_hash) and enforced with a single
         ``ON CONFLICT DO NOTHING`` statement — no check-then-insert race.
-        Returns False when this exact decision instance is already recorded."""
+        Returns the decision instance's seq (the immutable versioned row a
+        later action cites as its authorization provenance, review P0 #17),
+        or None when this exact decision instance is already recorded."""
         inserted = self.db.query_one("""
 INSERT INTO decisions (decision_id, indicator_id, batch_id, maliciousness,
     action_safety, disposition, action, rung, scope, ttl_seconds,
@@ -178,11 +253,19 @@ RETURNING seq
       psycopg2.extras.Json(d.randomization) if d.randomization is not None else None,
       d.content_hash))
         if inserted is None:
-            return False
+            return None
         self.audit(actor, "decision.record", d.id,
                    {"disposition": d.disposition, "action": d.action,
                     "rung": d.rung, "policy": d.policy_version})
-        return True
+        return int(inserted["seq"])
+
+    def decision_seq_for(self, decision_id: str, content_hash: str) -> int | None:
+        """The seq of the exact decision instance (decision_id, content_hash)
+        — the authorization provenance an action cites (review P0 #17)."""
+        row = self.db.query_one(
+            "SELECT seq FROM decisions WHERE decision_id=%s AND content_hash=%s",
+            (decision_id, content_hash))
+        return int(row["seq"]) if row else None
 
     def get_decision(self, decision_id: str) -> dict | None:
         return self.db.query_one(
@@ -214,16 +297,35 @@ RETURNING seq
     def record_action(self, *, action_id: str, decision: Decision,
                       indicator_id: str, adapter: str, mode: str,
                       fragment: dict, expires_at: datetime | None,
-                      requested_by: str) -> None:
-        self.db.execute("""
+                      requested_by: str, decision_seq: int) -> bool:
+        """Persist an action citing the EXACT decision instance that
+        authorized it (decision_id, decision_seq — review P0 #17). Idempotent
+        per (decision instance, adapter, rule): a re-evaluated identical
+        decision can never mint a second action (review P0 #12) — that
+        invariant is pinned by uq_actions_per_decision at the database.
+        Returns False when this logical action already exists."""
+        try:
+            self.db.execute("""
 INSERT INTO actions (action_id, decision_id, decision_seq, indicator_id, adapter,
     action_type, mode, selector, rule_id, fragment, fragment_hash, bundle_id,
     bundle_hash, requested_by, expires_at, state)
 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')
-""", (action_id, decision.id, 0, indicator_id, adapter, decision.action, mode,
+""", (action_id, decision.id, decision_seq, indicator_id, adapter,
+      decision.action, mode,
       psycopg2.extras.Json(fragment.get("selector", {})),
       fragment["rule_id"], fragment["fragment"], fragment["fragment_hash"],
       fragment["bundle_id"], fragment["bundle_hash"], requested_by, expires_at))
+        except psycopg2.errors.UniqueViolation:
+            self.audit(requested_by, "action.duplicate_ignored", action_id,
+                       {"decision_id": decision.id, "decision_seq": decision_seq,
+                        "adapter": adapter, "rule_id": fragment["rule_id"]})
+            return False
+        self.audit(requested_by, "action.created", action_id,
+                   {"decision_id": decision.id, "decision_seq": decision_seq,
+                    "adapter": adapter, "mode": mode,
+                    "rule_id": fragment["rule_id"],
+                    "expires_at": expires_at.isoformat() if expires_at else None})
+        return True
         self.audit(requested_by, "action.created", action_id,
                    {"decision_id": decision.id, "adapter": adapter,
                     "mode": mode, "rule_id": fragment["rule_id"],
@@ -256,17 +358,27 @@ WHERE action_id=%s RETURNING action_id
         return bool(row)
 
     def active_co_owners(self, *, adapter: str, rule_id: str,
-                         exclude_action_id: str) -> list[dict]:
+                         exclude_action_id: str, mode: str | None = None) -> list[dict]:
         """Other non-terminal actions that require the SAME physical rule
         (review P0 #6): the adapter's desired state is keyed by the physical
         identity (RPZ owner / Suricata sid), so revoking one action must not
         remove a shared rule another active action still justifies. Terminal
-        states (revoked/expired/failed) don't count as owners."""
-        return self.db.query("""
+        states (revoked/expired/failed) don't count as owners.
+
+        ``mode`` partitions ownership by ARTIFACT: a SHADOW action owns a
+        rule in the shadow artifact, an ENFORCE action one in the live
+        artifact — same rule_id, different physical state, so a shadow
+        action never defers a live revoke (or vice versa)."""
+        query = """
 SELECT action_id FROM actions
 WHERE adapter=%s AND rule_id=%s AND action_id <> %s
   AND state IN ('pending','dispatching','applied','verified','drifted')
-""", (adapter, rule_id, exclude_action_id))
+"""
+        params: list = [adapter, rule_id, exclude_action_id]
+        if mode is not None:
+            query += "  AND mode=%s"
+            params.append(mode)
+        return self.db.query(query, tuple(params))
 
     def actions_due_for_expiry(self, now: datetime) -> list[dict]:
         # Full row (SELECT *): the controlled revoke path reads fragment/selector/

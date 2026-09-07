@@ -25,6 +25,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Identity sentinels that can never become registered sources (review P0 #9):
+# "unregistered" IS the zero-authority class — registering it (e.g. as
+# curated) would let deliberately demoted evidence resolve through the
+# registry as authoritative. Refused at API, ledger, and DB CHECK layers.
+RESERVED_SOURCE_IDS = frozenset({"unregistered"})
+
 
 @dataclass(frozen=True)
 class SourceProfile:

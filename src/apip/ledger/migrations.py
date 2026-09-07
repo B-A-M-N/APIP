@@ -252,6 +252,96 @@ WHERE status='active'
 CREATE UNIQUE INDEX IF NOT EXISTS uq_policy_versions_one_active
     ON policy_versions ((1)) WHERE status='active';
 """),
+    (7, "source identity reservation + server-derived observables + batch status", """
+-- P0 #9: reserved identity sentinels can never be registered. A CHECK
+-- constraint closes the authority escape at the database layer (the API and
+-- ledger guards re-refuse it earlier with better errors).
+ALTER TABLE sources DROP CONSTRAINT IF EXISTS sources_id_reserved_check;
+ALTER TABLE sources ADD CONSTRAINT sources_id_reserved_check
+    CHECK (source_id <> '' AND lower(source_id) <> 'unregistered');
+
+-- P0 #10: canonical observable identity is SERVER-DERIVED from
+-- (itype, canonical value), not the source-submitted id. The submitted id
+-- survives only as provenance (source_object_id). Two sources assigning
+-- different ids to the same observable now merge; one source reusing
+-- another's id for a DIFFERENT observable can never attach to it.
+ALTER TABLE indicators ADD COLUMN IF NOT EXISTS source_object_id TEXT;
+-- normalize existing rows to the canonical value form before deduping
+UPDATE indicators SET value = lower(rtrim(value, '.'))
+    WHERE itype = 'fqdn' AND (value <> lower(rtrim(value, '.')));
+-- merge duplicates (keep the OLDEST indicator_id per canonical observable;
+-- children of dropped duplicates are re-pointed first so no history is lost)
+UPDATE evidence e SET indicator_id = keep.keep_id
+FROM (
+    SELECT DISTINCT ON (itype, value) itype, value, indicator_id AS keep_id
+    FROM indicators ORDER BY itype, value, first_seen ASC
+) keep
+JOIN indicators dup
+    ON dup.itype = keep.itype AND dup.value = keep.value
+WHERE e.indicator_id = dup.indicator_id
+  AND dup.indicator_id <> keep.keep_id;
+UPDATE indicator_source_refs r SET indicator_id = keep.keep_id
+FROM (
+    SELECT DISTINCT ON (itype, value) itype, value, indicator_id AS keep_id
+    FROM indicators ORDER BY itype, value, first_seen ASC
+) keep
+JOIN indicators dup
+    ON dup.itype = keep.itype AND dup.value = keep.value
+WHERE r.indicator_id = dup.indicator_id
+  AND dup.indicator_id <> keep.keep_id
+  AND NOT EXISTS (SELECT 1 FROM indicator_source_refs x
+                  WHERE x.indicator_id = keep.keep_id
+                    AND x.source_id = r.source_id);
+DELETE FROM indicator_source_refs WHERE indicator_id NOT IN
+    (SELECT indicator_id FROM indicators);
+DELETE FROM evidence WHERE indicator_id NOT IN
+    (SELECT indicator_id FROM indicators);
+DELETE FROM decisions WHERE indicator_id NOT IN
+    (SELECT indicator_id FROM indicators);
+DELETE FROM indicators a USING indicators b
+    WHERE a.itype = b.itype AND a.value = b.value
+      AND a.first_seen > b.first_seen;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_indicators_canonical
+    ON indicators (itype, value);
+
+-- P0 #11: batch processing status — only 'complete' batches are replay
+-- no-ops; a crash mid-ingest leaves 'processing' and the retry resumes.
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS status TEXT
+    NOT NULL DEFAULT 'complete'
+    CHECK (status IN ('processing', 'complete', 'failed'));
+"""),
+    (8, "action provenance + per-decision action idempotency", """
+-- P0 #17: an action must prove exactly WHICH immutable decision row
+-- authorized it. record_decision now returns the inserted seq and every
+-- action row carries it. Backfill historical rows to the latest instance
+-- of their decision (the newest seq), then pin the relationship with a
+-- composite FK against decisions(decision_id, seq).
+UPDATE actions a SET decision_seq = sub.seq
+FROM (
+    SELECT DISTINCT ON (a2.action_id) a2.action_id, d.seq
+    FROM actions a2
+    JOIN decisions d ON d.decision_id = a2.decision_id
+    ORDER BY a2.action_id, d.seq DESC
+) sub
+WHERE a.action_id = sub.action_id AND a.decision_seq = 0;
+ALTER TABLE actions DROP CONSTRAINT IF EXISTS fk_actions_decision_instance;
+ALTER TABLE actions ADD CONSTRAINT fk_actions_decision_instance
+    FOREIGN KEY (decision_id, decision_seq)
+    REFERENCES decisions (decision_id, seq);
+
+-- P0 #12: one decision INSTANCE authorizes each (adapter, rule) at most
+-- once — duplicate actions from a re-evaluated identical decision are
+-- refused at the database, not by Python control flow. Old duplicates are
+-- removed first (keep the earliest created row per logical action).
+DELETE FROM actions a USING actions b
+WHERE a.decision_id = b.decision_id
+  AND a.decision_seq = b.decision_seq
+  AND a.adapter = b.adapter
+  AND a.rule_id = b.rule_id
+  AND a.created_at > b.created_at;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_actions_per_decision
+    ON actions (decision_id, decision_seq, adapter, rule_id);
+"""),
 ]
 
 

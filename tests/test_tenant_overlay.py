@@ -265,12 +265,12 @@ def test_tenant_overlay_drives_a_tighter_decision():
                                         independent=True, key_hash="x", actor="test",
                                         auto_enforcement_allowed=True, enabled=True)
 
-            def _seed(ind_id, tenant_id):
+            def _seed(ind_id, tenant_id) -> str:
                 ctrl.ledger.record_batch(batch_id=f"b-{ind_id}", source_id="feeda",
                                          raw_sha256=f"s-{ind_id}", indicator_count=1, demoted=0,
                                          channel="t", actor="test")
                 ind = Indicator(
-                    id=ind_id, type="fqdn", value="evil.corp.test",
+                    id=ind_id, type="fqdn", value=f"{ind_id}.evil.corp.test",
                     sources=("feeda", "feedb"),
                     evidence=(Evidence(kind="curated_source", source_id="feeda",
                                        source_class="curated",
@@ -282,16 +282,19 @@ def test_tenant_overlay_drives_a_tighter_decision():
                                        source_class="curated",
                                        observed_at="2026-09-03T00:00:00Z", independent=True)),
                     tags=("c2",))
-                ctrl.ledger.upsert_indicator(ind, f"b-{ind_id}", tenant_id=tenant_id)
+                durable = ctrl.ledger.upsert_indicator(ind, f"b-{ind_id}",
+                                                       tenant_id=tenant_id)
                 from datetime import datetime, timedelta, timezone
                 # bump observed_at into recency window relative to run clock
                 recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
                 ctrl.db.execute(
-                    "UPDATE evidence SET observed_at=%s WHERE indicator_id=%s", (recent, ind_id))
+                    "UPDATE evidence SET observed_at=%s WHERE indicator_id=%s",
+                    (recent, durable))
+                return durable
 
             # global tenant: same evidence, no overlay
-            _seed("ind--global", None)
-            gres = ctrl.pipeline.decide_indicator("ind--global", actor="test")
+            gdurable = _seed("ind--global", None)
+            gres = ctrl.pipeline.decide_indicator(gdurable, actor="test")
             assert gres is not None
             g_m = gres["decision"].maliciousness
 
@@ -310,8 +313,9 @@ fqdn_auto_m = 100
                 tenant_id="tenant-hot", raw_text=overlay_raw,
                 overlay_sha256=hashlib.sha256(overlay_raw.encode()).hexdigest(),
                 created_by="test")
-            _seed("ind--tenant", "tenant-hot")
-            tres = ctrl.pipeline.decide_indicator("ind--tenant", actor="test", tenant_id="tenant-hot")
+            tdurable = _seed("ind--tenant", "tenant-hot")
+            tres = ctrl.pipeline.decide_indicator(tdurable, actor="test",
+                                                  tenant_id="tenant-hot")
             assert tres is not None
             t_m = tres["decision"].maliciousness
             # both share the same maliciousness score (same evidence/policy weights)

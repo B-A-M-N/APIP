@@ -342,6 +342,44 @@ WHERE a.decision_id = b.decision_id
 CREATE UNIQUE INDEX IF NOT EXISTS uq_actions_per_decision
     ON actions (decision_id, decision_seq, adapter, rule_id);
 """),
+    (9, "indexed source credential lookup (key_id)", """
+-- P0 #14: the source key carries its PUBLIC key_id
+-- (apipk_<key_id>.<secret>), so channel auth is ONE indexed row + ONE
+-- PBKDF2 verification — never a scan of every source's hash (an
+-- unauthenticated attacker could otherwise drive O(sources x 240k
+-- iterations) per request). Legacy rows (key_id NULL) keep working until
+-- their keys are rotated.
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS key_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sources_key_id
+    ON sources (key_id) WHERE key_id IS NOT NULL;
+"""),
+    (10, "durable approval state machine", """
+-- P0 #16: an operator approval is DURABLE STATE, not just an audit event.
+-- Each approval cites the EXACT immutable decision instance
+-- (decision_id, seq) and pins the policy revision/content hash that
+-- authorized it. One approval instance per decision instance:
+-- uq_approvals_per_decision makes a decision awaiting approval impossible
+-- to approve twice (a second attempt is refused at the database, not by
+-- API control flow). Rejection likewise terminates the proposal.
+CREATE TABLE decision_approvals (
+    approval_id     TEXT PRIMARY KEY,
+    decision_id     TEXT NOT NULL,
+    decision_seq    BIGINT NOT NULL,
+    outcome         TEXT NOT NULL CHECK (outcome IN ('approved','rejected')),
+    actor           TEXT NOT NULL,
+    reason          TEXT NOT NULL DEFAULT '',
+    policy_version  TEXT NOT NULL,
+    policy_content_sha256 TEXT NOT NULL,
+    action_ids      TEXT[] NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at      TIMESTAMPTZ,
+    FOREIGN KEY (decision_id, decision_seq)
+        REFERENCES decisions (decision_id, seq)
+);
+CREATE UNIQUE INDEX uq_approvals_per_decision
+    ON decision_approvals (decision_id, decision_seq);
+CREATE INDEX idx_approvals_decision ON decision_approvals(decision_id, created_at DESC);
+"""),
 ]
 
 

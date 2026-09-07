@@ -16,6 +16,8 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import psycopg2.extras
+
 from apip.adapters.base import AdapterError, EnforcementAdapter, MODE_RANK
 from apip.adapters import build_adapters
 from apip.adapters.rpz import RpzAdapter
@@ -452,14 +454,15 @@ class Controller:
                               {"demoted": results["demoted"], "budget": budget})
         return results
 
-    def approve_decision(self, decision_id: str, actor: str) -> dict:
-        """Operator approval of a decision awaiting it (PROPOSE_OPERATOR_APPROVAL).
-
-        Rebuilds the decision from ledger state (never re-decides), re-applies
-        the controller scope check, compiles actions at the approvals rating,
-        and audits the operator identity. Fails closed when the decision is
-        not awaiting approval or cannot be compiled.
-        """
+    def approve_decision(self, decision_id: str, actor: str,
+                         reason: str = "") -> dict:
+        """ONE-SHOT durable approval (review P0 #16): the proposal becomes
+        an approved decision_approvals row citing the EXACT decision
+        instance; a second approval of the same instance is refused at the
+        database. Rebuilds the decision from ledger state (never re-decides),
+        re-applies the controller scope check, compiles actions, and audits
+        the operator identity. Fails closed when the decision is not
+        awaiting approval or cannot be compiled."""
         row = self.ledger.get_decision(decision_id)
         if row is None:
             raise LookupError(f"unknown decision {decision_id}")
@@ -467,23 +470,68 @@ class Controller:
             raise ValueError(
                 f"decision {decision_id} is {row['disposition']!r}; "
                 "only PROPOSE_OPERATOR_APPROVAL decisions can be approved")
+        seq = int(row["seq"])
+        prior = self.ledger.approval_for(decision_id, seq)
+        if prior is not None:
+            raise ValueError(
+                f"decision {decision_id} seq {seq} already has a "
+                f"{prior['outcome']} approval ({prior['approval_id']}); "
+                "approvals are one-shot")
         ind = self.ledger.get_indicator(row["indicator_id"])
         if ind is None:
             raise LookupError(
                 f"indicator {row['indicator_id']} for decision {decision_id} missing")
         decision = decision_from_row(row)
+        # claim the approval FIRST (atomic at the database): a concurrent
+        # duplicate approve can never double-compile actions. If action
+        # compilation then fails, the approval stands (durable operator
+        # intent) and compilation is retried via actions/approve retry.
+        approval_id = "approval--" + uuid.uuid4().hex[:24]
+        if not self.ledger.record_approval(
+                approval_id=approval_id, decision_id=decision_id,
+                decision_seq=seq, outcome="approved", actor=actor, reason=reason,
+                policy_version=row["policy_version"],
+                policy_content_sha256=row["policy_content_sha256"]):
+            raise ValueError(
+                f"decision {decision_id} seq {seq} was just approved or "
+                "rejected by another operator; approvals are one-shot")
         action_ids: list[str] = []
         # a decision may render fragments for multiple adapters
         result = self.create_action_from_decision(
-            decision, ind["value"], ind["itype"], actor=actor)
+            decision, ind["value"], ind["itype"], actor=actor, decision_seq=seq)
         if result:
             action_ids.append(result)
-        self.ledger.audit(
-            actor, "decision.approved", decision_id,
-            {"disposition": row["disposition"], "indicator_id": ind["indicator_id"],
-             "value": ind["value"], "type": ind["itype"], "action_ids": action_ids})
-        return {"decision_id": decision_id, "action_ids": action_ids,
+            self.ledger.set_approval_actions(
+                approval_id, tuple(action_ids))
+        return {"decision_id": decision_id, "approval_id": approval_id,
+                "action_ids": action_ids,
                 "compiled": bool(action_ids)}
+
+    def reject_decision(self, decision_id: str, actor: str,
+                        reason: str = "operator_rejected") -> dict:
+        """Reject a proposal durably: the decision instance can never be
+        approved afterwards (review P0 #16)."""
+        row = self.ledger.get_decision(decision_id)
+        if row is None:
+            raise LookupError(f"unknown decision {decision_id}")
+        if row["disposition"] != "PROPOSE_OPERATOR_APPROVAL":
+            raise ValueError(
+                f"decision {decision_id} is {row['disposition']!r}; "
+                "only PROPOSE_OPERATOR_APPROVAL decisions can be rejected")
+        seq = int(row["seq"])
+        prior = self.ledger.approval_for(decision_id, seq)
+        if prior is not None:
+            raise ValueError(
+                f"decision {decision_id} seq {seq} already has a "
+                f"{prior['outcome']} approval ({prior['approval_id']})")
+        approval_id = "approval--" + uuid.uuid4().hex[:24]
+        self.ledger.record_approval(
+            approval_id=approval_id, decision_id=decision_id,
+            decision_seq=seq, outcome="rejected", actor=actor, reason=reason,
+            policy_version=row["policy_version"],
+            policy_content_sha256=row["policy_content_sha256"])
+        return {"decision_id": decision_id, "approval_id": approval_id,
+                "outcome": "rejected"}
 
     def replay_policy(self, actor: str) -> dict:
         """Re-run every existing indicator through the ACTIVE policy version,
@@ -518,15 +566,36 @@ class Controller:
                 "policy_version": self._active_policy_revision() or new_policy.version}
 
     def revoke_action(self, action_id: str, actor: str, reason: str = "operator_revoke") -> dict:
-        """Manual revoke uses the SAME controlled path as expiry (goal G)."""
+        """Manual revoke uses the SAME controlled path as expiry (goal G),
+        SERIALIZED against every other removal path by the same CAS claim
+        the lease-holding worker uses (review P0 #21): no operator call can
+        mutate the adapter concurrently with a worker expiry/reconcile, and
+        two operators revoking on different controllers cannot double-remove."""
         action = self.ledger.get_action(action_id)
         if action is None:
             raise LookupError(f"unknown action {action_id}")
         if action["state"] in ("revoked", "expired"):
             return {"action_id": action_id, "state": action["state"],
                     "already_terminal": True}
-        return self._remove_action(action, actor, reason,
-                                   terminal_state="revoked", revoked_by=actor)
+        if action["state"] in ("pending", "cancelled_policy_changed"):
+            # nothing was ever applied: terminal without touching the adapter
+            self.ledger.set_action_state(action_id, "revoked", reason, actor)
+            self.db.execute(
+                "UPDATE actions SET revoked_by=%s, revoked_at=now() "
+                "WHERE action_id=%s", (actor, action_id))
+            return {"action_id": action_id, "state": "revoked",
+                    "verified": True, "not_applied": True}
+        if not self.ledger.claim_for_removal(
+                action_id, ("applied", "verified", "drifted", "dispatching")):
+            return {"action_id": action_id, "state": action["state"],
+                    "already_removing": True}
+        result = self._remove_action(action, actor, reason,
+                                     terminal_state="revoked", revoked_by=actor)
+        if result["state"] == "drifted":
+            # unverified removal: the reconcile sweep retries; put it back in
+            # a non-terminal state instead of stranding the claim
+            self.ledger.unclaim_action(action_id)
+        return result
 
     # -- worker: dispatch ---------------------------------------------------------
 
@@ -676,10 +745,20 @@ class Controller:
             10, 3 * self.config.controller.reconcile_interval_s))
         for action in self.ledger.actions_stuck_dispatching(stale):
             self.ledger.unclaim_action(action["action_id"])
-        # 1. expiry sweep: TTL reached -> remove via controlled path
+        # 1. expiry sweep: TTL reached -> remove via controlled path.
+        # CAS claim first (P0 #21): an operator revoke on another controller
+        # may be mid-removal of the same action — only one path proceeds.
         for action in self.ledger.actions_due_for_expiry(now):
-            self._remove_action(action, CONTROLLER_ACTOR, "ttl_expired",
-                                terminal_state="expired", revoked_by=None)
+            if not self.ledger.claim_for_removal(
+                    action["action_id"], ("applied", "verified", "drifted")):
+                continue
+            result = self._remove_action(action, CONTROLLER_ACTOR, "ttl_expired",
+                                         terminal_state="expired",
+                                         revoked_by=None)
+            if result["state"] == "drifted":
+                # removal unverified: return for retry rather than leaving it
+                # wedged in the transient claim state
+                self.ledger.unclaim_action(action["action_id"])
         # 2. verification sweep: applied/verified actions re-checked
         older_than = now - timedelta(seconds=self.config.controller.verify_interval_s)
         for action in self.ledger.actions_needing_verification(older_than):

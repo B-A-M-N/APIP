@@ -180,6 +180,62 @@ def test_approve_compiles_and_applies_action(controller):
     assert "zone_file" in observed and "zone_sha256" in observed
 
 
+def test_approval_is_one_shot_and_rejection_terminates(controller):
+    """P0 #16: approvals are DURABLE one-shot state. A second approval of
+    the same decision instance is refused; a rejected proposal can never be
+    approved; the approval row cites the exact decision seq + policy hash."""
+    ctrl, _ = controller
+
+    # approve once -> durable row citing the exact decision instance
+    did = "decision--it-once"
+    _record_approval_decision(ctrl, did, "once.operator.test")
+    seq = ctrl.ledger.get_decision(did)["seq"]
+    res = ctrl.approve_decision(did, "operator", reason="validated")
+    assert res["compiled"] is True
+    row = ctrl.ledger.approval_for(did, seq)
+    assert row is not None and row["outcome"] == "approved"
+    assert row["actor"] == "operator" and row["reason"] == "validated"
+    assert row["policy_content_sha256"]
+    assert row["action_ids"] == res["action_ids"]
+
+    # a second approval of the SAME instance is refused
+    try:
+        ctrl.approve_decision(did, "operator")
+        assert False, "second approval must be refused"
+    except ValueError as e:
+        assert "one-shot" in str(e) or "already" in str(e)
+
+    # rejection terminates a proposal durably
+    did2 = "decision--it-reject"
+    _record_approval_decision(ctrl, did2, "reject.operator.test")
+    out = ctrl.reject_decision(did2, "operator", reason="fp")
+    assert out["outcome"] == "rejected"
+    rrow = ctrl.ledger.approval_for(did2)
+    assert rrow["outcome"] == "rejected"
+    try:
+        ctrl.approve_decision(did2, "operator")
+        assert False, "approving a rejected proposal must be refused"
+    except ValueError:
+        pass
+
+
+def test_action_cites_the_exact_authorizing_decision_instance(controller):
+    """P0 #17: an action's decision_seq is the REAL immutable decision
+    instance that authorized it (never 0), and the composite FK holds."""
+    ctrl, _ = controller
+    did = "decision--it-seq"
+    _record_approval_decision(ctrl, did, "seq.operator.test")
+    res = ctrl.approve_decision(did, "operator")
+    action = ctrl.ledger.get_action(res["action_ids"][0])
+    expected = ctrl.ledger.get_decision(did)["seq"]
+    assert action["decision_seq"] == expected and expected != 0
+    # the (decision_id, seq) pair resolves to exactly one decision row
+    row = ctrl.db.query_one(
+        "SELECT decision_id FROM decisions WHERE decision_id=%s AND seq=%s",
+        (did, action["decision_seq"]))
+    assert row is not None
+
+
 def test_approve_refuses_non_approval_decision(controller):
     ctrl, _ = controller
     # NO_ACTION decisions must never be approved into an action

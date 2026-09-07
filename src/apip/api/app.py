@@ -17,7 +17,12 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 
-from apip.auth import constant_time_equals, generate_source_key, hash_credential
+from apip.auth import (
+    constant_time_equals,
+    generate_source_key,
+    hash_credential,
+    parse_source_key,
+)
 from apip.config.service import ServiceConfig
 from apip.controller.service import Controller
 from apip.ingest import IngestBatch, IngestChannel, IngestError, parse_indicator_payload
@@ -90,7 +95,8 @@ def build_app(config: ServiceConfig,
         if not x_apip_source_key:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED,
                                 "x-apip-source-key required for ingest")
-        row = controller.ledger.source_by_credential(x_apip_source_key)
+        row = controller.ledger.source_by_credential(
+            x_apip_source_key, pepper=config.secret_key or "")
         if row is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED,
                                 "unknown source key")
@@ -122,15 +128,28 @@ def build_app(config: ServiceConfig,
             raise HTTPException(
                 400, f"invalid source_class {source_class!r}; "
                      f"must be one of {sorted(_SOURCE_CLASSES)}")
-        # one secret per source; only the hash is persisted
-        secret = generate_source_key()
+        # one secret per source; only the (peppered) hash + PUBLIC key_id are
+        # persisted. Registration FAILS CLOSED without the deployment secret
+        # (APIP_SECRET_KEY): an unpeppered hash would make a leaked sources
+        # table alone sufficient for channel forgery (review P0 #15).
+        pepper = config.secret_key or ""
+        if not pepper:
+            raise HTTPException(
+                503, "APIP_SECRET_KEY is not configured; source registration "
+                     "is refused (credential hashes must be peppered)")
+        token, key_id = generate_source_key()
+        # only the SECRET component is hashed: the presented token's key_id
+        # selects the row and its secret verifies against this hash
+        parsed = parse_source_key(token)
+        assert parsed is not None and parsed[0] == key_id
+        secret = parsed[1]
         controller.ledger.register_source(
             source_id=source_id, source_class=source_class,
-            independent=independent, key_hash=hash_credential(secret),
+            independent=independent, key_hash=hash_credential(secret, pepper),
             actor=_op["actor"], auto_enforcement_allowed=auto_enf,
             upstream=upstream, enabled=True, allowed_kinds=allowed,
-            provenance_note=provenance)
-        return {"source_id": source_id, "source_key": secret,
+            provenance_note=provenance, key_id=key_id)
+        return {"source_id": source_id, "source_key": token,
                 "note": "store the key now; it is not retrievable again"}
 
     # -- ingest -------------------------------------------------------------
@@ -260,18 +279,38 @@ def build_app(config: ServiceConfig,
         return {"decision": d, "evidence": ev}
 
     @app.post("/decisions/{decision_id}/approve")
-    def approve_decision(decision_id: str, _op: dict = Depends(_operator)) -> dict:
-        """Operator approval of a PROPOSE_OPERATOR_APPROVAL decision into one
-        or more compiled actions (via the controller scope check — defense in
-        depth layer 2). Audited with the operator identity."""
+    def approve_decision(decision_id: str, payload: dict | None = None,
+                         _op: dict = Depends(_operator)) -> dict:
+        """ONE-SHOT durable operator approval (review P0 #16): records the
+        approval citing the exact decision instance, then compiles actions.
+        A second approval of the same instance is refused (409)."""
+        reason = str((payload or {}).get("reason", ""))
         try:
-            result = controller.approve_decision(decision_id, _op["actor"])
+            result = controller.approve_decision(decision_id, _op["actor"],
+                                                 reason=reason)
         except (LookupError, ValueError) as e:
             raise HTTPException(409, str(e)) from e
         if not result.get("compiled"):
             raise HTTPException(409,
                                 f"decision {decision_id} compiles to no action")
         return result
+
+    @app.post("/decisions/{decision_id}/reject")
+    def reject_decision(decision_id: str, payload: dict | None = None,
+                        _op: dict = Depends(_operator)) -> dict:
+        """Durably reject a proposal: the decision instance can never be
+        approved afterwards (review P0 #16)."""
+        reason = str((payload or {}).get("reason", "operator_rejected"))
+        try:
+            return controller.reject_decision(decision_id, _op["actor"],
+                                              reason=reason)
+        except (LookupError, ValueError) as e:
+            raise HTTPException(409, str(e)) from e
+
+    @app.get("/approvals")
+    def list_approvals(limit: int = 100,
+                       _op: dict = Depends(_operator)) -> dict:
+        return {"approvals": controller.ledger.list_approvals(limit)}
 
     @app.get("/actions")
     def list_actions(limit: int = 50, state: str | None = None,
@@ -334,6 +373,14 @@ def build_app(config: ServiceConfig,
         except tomllib.TOMLDecodeError as e:
             raise HTTPException(400, f"TOML parse error: {e}") from e
         problems = validate_policy(raw)
+        # P0 #20: the staged row's mode column MUST equal the mode inside
+        # the policy text (the runtime truth). A history saying ENFORCE while
+        # the loaded policy says SHADOW is exactly the drift this closes.
+        text_mode = str(raw.get("mode", "")).upper()
+        if text_mode != mode:
+            raise HTTPException(
+                400, f"mode {mode!r} does not match the policy text's "
+                f"mode {text_mode!r}; they must agree")
         sha = _hash.sha256(text.encode()).hexdigest()
         rev = controller.ledger.next_policy_revision(version)
         controller.ledger.stage_policy(

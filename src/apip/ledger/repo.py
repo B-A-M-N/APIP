@@ -30,7 +30,8 @@ class Ledger:
                         key_hash: str, actor: str, auto_enforcement_allowed: bool = True,
                         upstream: str | None = None, enabled: bool = True,
                         allowed_kinds: tuple[str, ...] = (),
-                        provenance_note: str = "") -> None:
+                        provenance_note: str = "",
+                        key_id: str | None = None) -> None:
         # Domain-layer reservation guard (review P0 #9): the same sentinel
         # refusal as the API and the DB CHECK — "unregistered" is the
         # zero-authority class and can never become a registered identity.
@@ -41,8 +42,9 @@ class Ledger:
                 f"source_id {source_id!r} is reserved and cannot be registered")
         self.db.execute("""
 INSERT INTO sources (source_id, source_class, independent, auto_enforcement_allowed,
-                     upstream, enabled, allowed_kinds, provenance_note, key_hash, created_by)
-VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     upstream, enabled, allowed_kinds, provenance_note, key_hash,
+                     key_id, created_by)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
 ON CONFLICT (source_id) DO UPDATE SET
     source_class = EXCLUDED.source_class,
     independent = EXCLUDED.independent,
@@ -51,9 +53,11 @@ ON CONFLICT (source_id) DO UPDATE SET
     allowed_kinds = EXCLUDED.allowed_kinds,
     provenance_note = EXCLUDED.provenance_note,
     key_hash = EXCLUDED.key_hash,
+    key_id = EXCLUDED.key_id,
     updated_at = now()
 """, (source_id, source_class, independent, auto_enforcement_allowed,
-      upstream, enabled, list(allowed_kinds), provenance_note, key_hash, actor))
+      upstream, enabled, list(allowed_kinds), provenance_note, key_hash,
+      key_id, actor))
         self.audit(actor, "source.register", source_id,
                    {"class": source_class, "upstream": upstream, "enabled": enabled})
 
@@ -74,25 +78,24 @@ ON CONFLICT (source_id) DO UPDATE SET
             "upstream, enabled, allowed_kinds, provenance_note, created_at, "
             "last_success_at, health FROM sources WHERE source_id=%s", (source_id,))
 
-    def source_by_credential(self, secret: str) -> dict | None:
-        """Resolve the source that owns `secret` by verifying it against each
-        stored PBKDF2 hash (channel auth). The hashes are salted with random
-        salts, so lookup is an equality scan via verify_credential — never
-        re-hashing the input. Returns None when nothing matches."""
-        from apip.auth import verify_credential
-        # Fast-fail: every source key this product generates is prefixed
-        # ``apipk_``. A presented secret that lacks the prefix cannot satisfy
-        # any stored hash, so skip the PBKDF2 scan (O(N x iterations) per
-        # unauthenticated request) — a cheap default-deny against CPU
-        # amplification on the ingest boundary.
-        if not secret.startswith("apipk_"):
+    def source_by_credential(self, token: str, pepper: str | None = None) -> dict | None:
+        """Resolve the source that owns `token` (channel auth). The token
+        carries its PUBLIC key_id (``apipk_<key_id>.<secret>``), so lookup is
+        ONE indexed row + ONE PBKDF2 verification (review P0 #14) — never a
+        per-source scan an attacker could amplify. Tokens not in the keyed
+        form default-deny (None). Returns None when nothing matches."""
+        from apip.auth import parse_source_key, verify_credential
+        parsed = parse_source_key(token)
+        if parsed is None:
             return None
-        rows = self.db.query(
-            "SELECT source_id, source_class, independent, auto_enforcement_allowed, "
-            "upstream, enabled, allowed_kinds, key_hash FROM sources")
-        for row in rows:
-            if row.get("key_hash") and verify_credential(secret, row["key_hash"]):
-                return row
+        key_id, secret = parsed
+        row = self.db.query_one(
+            "SELECT source_id, source_class, independent, "
+            "auto_enforcement_allowed, upstream, enabled, allowed_kinds, "
+            "key_hash FROM sources WHERE key_id=%s", (key_id,))
+        if (row is not None and row.get("key_hash")
+                and verify_credential(secret, row["key_hash"], pepper)):
+            return row
         return None
 
     def list_sources(self) -> list[dict]:
@@ -421,6 +424,18 @@ UPDATE actions SET state='pending', last_reconciled_at=now()
 WHERE action_id=%s AND state='dispatching'
 """, (action_id,))
 
+    def claim_for_removal(self, action_id: str, from_states: tuple[str, ...]) -> bool:
+        """Atomic CAS claim for ANY removal path (operator revoke, worker
+        expiry, reconcile drift removal — review P0 #21): flips
+        state -> 'dispatching' only from the given states, so an operator
+        revoke racing the worker's expiry (in another controller, or in the
+        same one) is serialized — exactly one path performs the adapter
+        removal; the loser sees False and reports already-removing."""
+        q = "UPDATE actions SET state='dispatching', last_reconciled_at=now() "
+        q += "WHERE action_id=%s AND state = ANY(%s) RETURNING action_id"
+        row = self.db.query_one(q, (action_id, list(from_states)))
+        return row is not None
+
     def actions_stuck_dispatching(self, older_than: datetime) -> list[dict]:
         """Actions wedged in 'dispatching' (a leader died mid-apply) older than
         a full reconcile window — safe for the next leader to re-queue. A live
@@ -506,6 +521,32 @@ VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                 if row["status"] != "staged":
                     raise ValueError(
                         f"policy {policy_version} r{revision} is {row['status']!r}, not staged")
+                # P0 #18: the documented posture ladder
+                # (OBSERVE -> SHADOW -> ENFORCE) is ENFORCED, not remembered:
+                # a stronger-posture promotion advances at most ONE governed
+                # stage; downgrades (safety) and EMERGENCY (a separate
+                # explicit transition) are always permitted.
+                new_mode = str(self._staged_mode(cur, policy_version, revision)
+                               or "").upper()
+                cur.execute("""
+SELECT v.mode FROM policy_current c
+JOIN policy_versions v ON v.policy_version = c.policy_version
+    AND v.revision = c.revision
+WHERE c.singleton
+""")
+                active = cur.fetchone()
+                active_mode = str((active or {}).get("mode") or "").upper()
+                ladder = {"OFF": 0, "OBSERVE": 1, "SHADOW": 2, "ENFORCE": 3}
+                new_rank = ladder.get(new_mode)
+                active_rank = ladder.get(active_mode)
+                if (new_rank is not None and active_rank is not None
+                        and new_mode != "EMERGENCY"
+                        and active_mode != "EMERGENCY"
+                        and new_rank - active_rank > 1):
+                    raise ValueError(
+                        f"posture ladder violation: {active_mode} -> "
+                        f"{new_mode} skips a governed stage; promote "
+                        f"through the intermediate stage first (P0 #18)")
                 # Retire the GLOBALLY active row regardless of version (review
                 # P0 #19): promoting a different version must not leave an
                 # older row active while policy_current points elsewhere —
@@ -524,6 +565,22 @@ ON CONFLICT (singleton) DO UPDATE SET
 """, (policy_version, revision))
         self.audit(actor, "policy.promoted", policy_version, {"revision": revision})
 
+    @staticmethod
+    def _staged_mode(cur, policy_version: str, revision: int) -> str | None:
+        """The mode INSIDE the staged raw policy text — the runtime truth
+        (P0 #20: the staging-time mode column may drift from the text)."""
+        import re as _re
+        cur.execute(
+            "SELECT raw_text FROM policy_versions "
+            "WHERE policy_version=%s AND revision=%s",
+            (policy_version, revision))
+        row = cur.fetchone()
+        if not row:
+            return None
+        m = _re.search(r'^\s*mode\s*=\s*"([^"]+)"', row["raw_text"] or "",
+                       _re.MULTILINE)
+        return m.group(1) if m else None
+
     def current_policy_row(self) -> dict | None:
         cur = self.db.query_one("""
 SELECT v.* FROM policy_current c
@@ -541,6 +598,62 @@ SELECT policy_version, revision, content_sha256, mode, status, staged_by,
 FROM policy_versions ORDER BY staged_at DESC, revision DESC""")
 
     # -- audit -----------------------------------------------------------------
+
+    # -- approvals -----------------------------------------------------------
+
+    def record_approval(self, *, approval_id: str, decision_id: str,
+                        decision_seq: int, outcome: str, actor: str,
+                        reason: str, policy_version: str,
+                        policy_content_sha256: str,
+                        action_ids: tuple[str, ...] = (),
+                        expires_at: datetime | None = None) -> bool:
+        """Persist the one-shot approval/rejection of an exact decision
+        instance (review P0 #16). Idempotent-refusing: a second approval of
+        the same decision instance is refused at the DATABASE
+        (uq_approvals_per_decision) — returns False when an approval already
+        exists."""
+        try:
+            self.db.execute("""
+INSERT INTO decision_approvals (approval_id, decision_id, decision_seq, outcome,
+    actor, reason, policy_version, policy_content_sha256, action_ids, expires_at)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+""", (approval_id, decision_id, decision_seq, outcome, actor, reason,
+      policy_version, policy_content_sha256, list(action_ids), expires_at))
+        except psycopg2.errors.UniqueViolation:
+            self.audit(actor, "approval.duplicate_ignored", decision_id,
+                       {"decision_seq": decision_seq, "outcome": outcome})
+            return False
+        self.audit(actor, f"decision.{outcome}", decision_id,
+                   {"decision_seq": decision_seq, "approval_id": approval_id,
+                    "reason": reason, "action_ids": list(action_ids)})
+        return True
+
+    def approval_for(self, decision_id: str,
+                     decision_seq: int | None = None) -> dict | None:
+        """The approval row for a decision instance (or its latest instance
+        when no seq is given)."""
+        if decision_seq is not None:
+            return self.db.query_one(
+                "SELECT * FROM decision_approvals "
+                "WHERE decision_id=%s AND decision_seq=%s",
+                (decision_id, decision_seq))
+        return self.db.query_one(
+            "SELECT * FROM decision_approvals WHERE decision_id=%s "
+            "ORDER BY decision_seq DESC LIMIT 1", (decision_id,))
+
+    def set_approval_actions(self, approval_id: str,
+                             action_ids: tuple[str, ...]) -> None:
+        """Attach the compiled action ids to a recorded approval."""
+        self.db.execute(
+            "UPDATE decision_approvals SET action_ids=%s WHERE approval_id=%s",
+            (list(action_ids), approval_id))
+
+    def list_approvals(self, limit: int = 100) -> list[dict]:
+        return self.db.query(
+            "SELECT approval_id, decision_id, decision_seq, outcome, actor, "
+            "reason, policy_version, action_ids, created_at, expires_at "
+            "FROM decision_approvals ORDER BY created_at DESC LIMIT %s",
+            (limit,))
 
     def audit(self, actor: str, event_type: str, subject: str = "",
               detail: dict | None = None) -> None:

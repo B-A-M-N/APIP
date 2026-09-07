@@ -74,6 +74,7 @@ def _table(rows: list[dict], cols: list[str]) -> None:
 @click.option("--base", envvar="APIP_BASE", default=None, help="controller API base URL")
 @click.option("--token", envvar="APIP_OPERATOR_TOKEN", default=None,
               help="operator bearer token (prefer env)")
+@click.version_option(package_name="apip-beta", prog_name="apip")
 @click.pass_context
 def cli(ctx: click.Context, base: str | None, token: str | None) -> None:
     """APIP operator CLI. Deterministic, AI-free defensive control plane."""

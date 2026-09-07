@@ -82,7 +82,7 @@ The **Attribution Lab** (`lab/`, see its README) demonstrates the `docs/30` requ
 - `docs/28_AI_ERA_ATTACK_POSTURE.md` — no-AI design invariant; deterministic counters to AI-era attack properties; automation abuse resistance.
 - `docs/29_DETERMINISTIC_RANDOMIZATION.md` — seeded randomization of defensive parameters within policy bounds; replay-preserving moving-target defense.
 - `docs/30_REQUESTER_ATTRIBUTION_AND_FINGERPRINTING.md` — deterministic challenge-based requester fingerprinting for campaign correlation; never an enforcement input.
-- `api/openapi.yaml` — draft control-plane REST contract.
+- `api/openapi.future.yaml` — forward-design control-plane contract (NOT implemented; the contract the beta product actually serves is `api/openapi.beta.json`, generated from the FastAPI app).
 - `sources.json` — machine-readable research source inventory.
 - `schemas/` — JSON schemas for indicators, decisions, and receipts.
 - `examples/` — safe sample configuration and synthetic indicators using reserved/test namespaces.

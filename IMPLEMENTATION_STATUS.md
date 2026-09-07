@@ -46,13 +46,13 @@ The reference is never imported into the production process.
 | Authenticated ingest boundary (channel-bound source identity) | BETA SUPPORTED | `src/apip/ingest/`, `src/apip/auth/` |
 | Operator CLI | BETA SUPPORTED | `src/apip/cli/` (incl. `decision approve`, `decision replay`, `adapter list/status` across all adapters) |
 | Operator HTTP API | BETA SUPPORTED | `src/apip/api/` (incl. `POST /decisions/{id}/approve`, `POST /policy/replay`, `GET /adapters`) |
-| RPZ adapter (exact FQDN, OFF/OBSERVE/SHADOW/ENFORCE) | BETA SUPPORTED | `src/apip/adapters/rpz.py` |
-| Suricata/IPS adapter (IP rate-limit/deny, exact selectors, OFF/OBSERVE/SHADOW/ENFORCE, home-net scope) | BETA SUPPORTED | `src/apip/adapters/suricata.py` |
+| RPZ adapter (exact FQDN, OFF/OBSERVE/SHADOW/ENFORCE) — real-BIND compatibility proven by `lab/bind_gate.py` (LEVEL 2 evidence, review P1 #41) | BETA SUPPORTED | `src/apip/adapters/rpz.py` |
+| Suricata/IDS adapter (exact selectors, OFF/OBSERVE/SHADOW, home-net scope) — **IDS/EXPORT surface only**; ENFORCE config is REFUSED at construction (no live reload / engine-loaded verification exists in beta) | BETA SUPPORTED (ENFORCE: NOT OFFERED) | `src/apip/adapters/suricata.py` |
 | Adapter verification/conciliation (no fabricated receipts) | BETA SUPPORTED | `rpz.verify`, `suricata.verify`, controller `_verify_action` |
 | Expiry + revoke through controlled path, restart-safe | BETA SUPPORTED | controller `_remove_action` |
 | Policy lifecycle (validate/stage/promote/current/history) | BETA SUPPORTED | `src/apip/ledger/repo.py`, `loader.py` |
 | Policy replay / re-baseline after promote | BETA SUPPORTED | `Controller.replay_policy`, `POST /policy/replay`, `apip decision replay` |
-| Operator approval of `PROPOSE_OPERATOR_APPROVAL` decisions | BETA SUPPORTED | `Controller.approve_decision`, `POST /decisions/{id}/approve`, `apip decision approve` |
+| Operator approval of `PROPOSE_OPERATOR_APPROVAL` decisions — durable one-shot state (`decision_approvals`, migration 10); reject terminates permanently | BETA SUPPORTED | `Controller.approve_decision`/`reject_decision`, `POST /decisions/{id}/approve` + `/reject`, `GET /approvals`, `apip decision approve` |
 | Triple authorization-boundary scope check | BETA SUPPORTED | policy `in_scope` + controller dispatch + adapter scope (RPZ `_in_adapter_scope`, Suricata home-net) |
 | Component-level health (multi-adapter, defense-in-depth) | BETA SUPPORTED | `ControllerState.snapshot`, `Controller.adapters_status` — every configured adapter surfaces; any unhealthy adapter degrades overall status |
 | Component-level health | BETA SUPPORTED | `ControllerState.snapshot`, `rpz.health` |
@@ -357,9 +357,17 @@ the decision path / differential oracle is unchanged:
   fix above, including the two-layer tenant narrowing (`_narrow_domains` open-global
   fix from the first pass).
 
-Full product suite: 190 tests pass, `pyright --project pyproject.toml
-src/apip tests` reports 0 errors, the acceptance drive passes 20/20 against a
-real UDP resolver, and the decision path / differential oracle is unchanged.
+Full product suite: 251 tests pass (includes Postgres-backed integration,
+HA-lease, DB-recovery, policy-lifecycle, credential, and adapter-boundary
+suites), `pyright src/` reports 0 errors, the acceptance drive passes 20/20
+in `--require-postgres` release mode, and the real-BIND gate
+(`lab/bind_gate.py`) passes against real `named` — LEVEL 2 evidence for the
+RPZ artifact (see the evidence-hierarchy table above). The decision path /
+differential oracle is unchanged. CI (`.github/workflows/verify.yml`) runs
+the reference gates AND product lanes: pytest against a required Postgres
+service, pyright, the decision-path no-AI invariant, a
+deprecation-warnings-as-errors lane, product wheel + clean-venv CLI, a
+Compose smoke test, and the BIND gate.
 
 ---
 

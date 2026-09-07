@@ -83,10 +83,10 @@ Data/interface validation:
   and JSON examples
 - OpenAPI YAML parse: PASS (PyYAML)
 - examples/policy.toml TOML parse: PASS
-- MANIFEST.json: 166 files hashed (regenerated 2026-09-03 against the git
-  tree — every tracked file except MANIFEST.json itself, which is
-  self-excluded); re-verified SHA-256 over all 166 paths, all match this
-  tree. Verify with:
+- MANIFEST.json: 174 files hashed (manifest_version 5, regenerated
+  2026-09-07 after the 48-finding remediation — every tracked file except
+  MANIFEST.json itself, which is self-excluded); re-verified SHA-256 over
+  all 174 paths, all match this tree. Verify with:
     python3 -c "import json,hashlib as h;m=json.load(open('MANIFEST.json'));\
 b=[f['path'] for f in m['files'] if h.sha256(open(f['path'],'rb').read()).hexdigest()!=f['sha256']];\
 print('DRIFT' if b else f'OK {len(m[\"files\"])} files')"

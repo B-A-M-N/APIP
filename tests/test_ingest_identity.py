@@ -30,6 +30,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import pg  # noqa: E402  (shared Postgres test endpoints)
+
 from apip.config.service import (  # noqa: E402
     AdapterConfig,
     DatabaseConfig,
@@ -42,13 +44,11 @@ from apip.domain.models import (  # noqa: E402
 )
 from apip.ingest import IngestChannel, parse_indicator_payload  # noqa: E402
 
-SOCKET_DIR = "/var/run/postgresql"
 
 
 def _can_connect() -> bool:
     try:
-        conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                                connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
         conn.close()
         return True
     except psycopg2.Error:
@@ -62,8 +62,7 @@ pytestmark = pytest.mark.skipif(
 
 def _scratch_db():
     name = "apip_it_" + uuid.uuid4().hex[:12]
-    conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                            connect_timeout=3)
+    conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = conn.cursor()
     try:
@@ -75,8 +74,7 @@ def _scratch_db():
 
 
 def _drop_db(name: str) -> None:
-    conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                            connect_timeout=3)
+    conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = conn.cursor()
     try:
@@ -93,8 +91,8 @@ def _make_controller(dburi: str, *, zone: str):
 
     cfg = replace(
         load_config(None),
-        db=DatabaseConfig(host=SOCKET_DIR, dbname=dburi,
-                          user=os.environ.get("USER", "bamn")),
+        db=DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=dburi,
+                          user=pg.USER),
         adapter=replace(AdapterConfig(rpz_mode="SHADOW", zone_dir=zone),
                         authorized_domains=("operator.test",)),
     )

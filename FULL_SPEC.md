@@ -705,7 +705,7 @@ The consolidated design is expanded in the following normative companion specifi
 - `docs/28_AI_ERA_ATTACK_POSTURE.md`: the no-AI design invariant; deterministic counters to AI-era offensive properties; evidence-channel injection resistance; automation abuse resistance.
 - `docs/29_DETERMINISTIC_RANDOMIZATION.md`: moving-target defense via seeded randomization of defensive parameters within policy bounds; replay-preserving.
 - `docs/30_REQUESTER_ATTRIBUTION_AND_FINGERPRINTING.md`: deterministic challenge-based requester fingerprinting for campaign correlation; attribution output is never an enforcement input.
-- `api/openapi.yaml`: draft API contract.
+- `api/openapi.future.yaml`: forward-design API contract (not implemented; the beta contract is `api/openapi.beta.json`).
 - `schemas/*.json`: canonical object/policy schemas.
 - `sources.json`: machine-readable research inventory.
 

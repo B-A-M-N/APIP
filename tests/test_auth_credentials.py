@@ -15,6 +15,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import pg  # noqa: E402  (shared Postgres test endpoints)
+
 from apip.auth import (  # noqa: E402
     CredentialError,
     generate_source_key,
@@ -88,9 +90,8 @@ def api():
     from apip.ledger.db import Database
     from apip.ledger.migrations import apply_migrations
 
-    socket = "/var/run/postgresql"
     try:
-        conn = psycopg2.connect(host=socket, dbname="postgres", connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
     except psycopg2.Error:
         yield None
         return
@@ -100,8 +101,8 @@ def api():
     conn.close()
     cfg = replace(
         load_config(None),
-        db=DatabaseConfig(host=socket, dbname=name,
-                          user=os.environ.get("USER", "bamn")),
+        db=DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=name,
+                          user=pg.USER),
         adapter=replace(AdapterConfig(rpz_mode="SHADOW",
                                       zone_dir=tempfile.mkdtemp()),
                         authorized_domains=("operator.test",)),
@@ -120,7 +121,7 @@ def api():
     finally:
         client.close()
         ctrl.stop()
-        conn = psycopg2.connect(host=socket, dbname="postgres", connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
         conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
         conn.cursor().execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
         conn.close()

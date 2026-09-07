@@ -25,6 +25,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import pg  # noqa: E402  (shared Postgres test endpoints)
+
 from apip.config.service import (  # noqa: E402
     AdapterConfig,
     ControllerConfig,
@@ -35,13 +37,11 @@ from apip.ledger.db import Database  # noqa: E402
 from apip.ledger.migrations import apply_migrations  # noqa: E402
 from apip.ledger.repo import Ledger  # noqa: E402
 
-SOCKET_DIR = "/var/run/postgresql"
 
 
 def _can_connect() -> bool:
     try:
-        conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                                connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
         conn.close()
         return True
     except psycopg2.Error:
@@ -50,7 +50,7 @@ def _can_connect() -> bool:
 
 def _create_scratch() -> str:
     name = "apip_ha_" + uuid.uuid4().hex[:12]
-    conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres", connect_timeout=3)
+    conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = conn.cursor()
     try:
@@ -62,7 +62,7 @@ def _create_scratch() -> str:
 
 
 def _drop_scratch(name: str) -> None:
-    conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres", connect_timeout=3)
+    conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = conn.cursor()
     try:
@@ -81,8 +81,8 @@ pytestmark = pytest.mark.skipif(
 def two_ledgers():
     """Two Ledger handles over one scratch DB (fresh migrations applied)."""
     dburi = _create_scratch()
-    db = Database(DatabaseConfig(host=SOCKET_DIR, dbname=dburi,
-                                 user=os.environ.get("USER", "bamn")).dsn_kwargs())
+    db = Database(DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=dburi,
+                                 user=pg.USER).dsn_kwargs())
     db.wait_until_ready(timeout_s=10)
     try:
         apply_migrations(db)
@@ -137,8 +137,8 @@ def test_controller_lease_gate_single_worker():
     from apip.controller.service import Controller
 
     dburi = _create_scratch()
-    db = Database(DatabaseConfig(host=SOCKET_DIR, dbname=dburi,
-                                 user=os.environ.get("USER", "bamn")).dsn_kwargs())
+    db = Database(DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=dburi,
+                                 user=pg.USER).dsn_kwargs())
     db.wait_until_ready(timeout_s=10)
     apply_migrations(db)
     db.close()
@@ -146,8 +146,8 @@ def test_controller_lease_gate_single_worker():
     def _make(zone_dir: str, reconcile: float) -> Controller:
         cfg = replace(
             load_config(None),
-            db=DatabaseConfig(host=SOCKET_DIR, dbname=dburi,
-                              user=os.environ.get("USER", "bamn")),
+            db=DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=dburi,
+                              user=pg.USER),
             controller=replace(ControllerConfig(), reconcile_interval_s=reconcile),
             adapter=replace(AdapterConfig(rpz_mode="SHADOW", zone_dir=zone_dir),
                             authorized_domains=("operator.test",)),

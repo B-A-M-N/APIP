@@ -24,19 +24,19 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import pg  # noqa: E402  (shared Postgres test endpoints)
+
 from apip.config.service import (  # noqa: E402
     AdapterConfig,
     DatabaseConfig,
     load_config,
 )
 
-SOCKET_DIR = "/var/run/postgresql"
 
 
 def _can_connect() -> bool:
     try:
-        conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                                connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
         conn.close()
         return True
     except psycopg2.Error:
@@ -74,15 +74,14 @@ def ledger():
     from apip.ledger.migrations import apply_migrations
 
     name = "apip_it_" + uuid.uuid4().hex[:12]
-    conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                            connect_timeout=3)
+    conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     conn.cursor().execute(f'CREATE DATABASE "{name}"')
     conn.close()
     cfg = replace(
         load_config(None),
-        db=DatabaseConfig(host=SOCKET_DIR, dbname=name,
-                          user=os.environ.get("USER", "bamn")),
+        db=DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=name,
+                          user=pg.USER),
         adapter=replace(AdapterConfig(rpz_mode="SHADOW",
                                       zone_dir=tempfile.mkdtemp()),
                         authorized_domains=("operator.test",)),
@@ -95,8 +94,7 @@ def ledger():
         yield Ledger(db), db
     finally:
         db.close()
-        conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                                connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
         conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
         conn.cursor().execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
         conn.close()
@@ -169,15 +167,14 @@ def test_staged_mode_must_agree_with_policy_text():
     from apip.ledger.db import Database
 
     name = "apip_it_" + uuid.uuid4().hex[:12]
-    conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                            connect_timeout=3)
+    conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     conn.cursor().execute(f'CREATE DATABASE "{name}"')
     conn.close()
     cfg = _replace(
         load_config(None),
-        db=DatabaseConfig(host=SOCKET_DIR, dbname=name,
-                          user=os.environ.get("USER", "bamn")),
+        db=DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=name,
+                          user=pg.USER),
         adapter=_replace(AdapterConfig(rpz_mode="SHADOW",
                                        zone_dir=tempfile.mkdtemp()),
                          authorized_domains=("operator.test",)),
@@ -205,8 +202,7 @@ def test_staged_mode_must_agree_with_policy_text():
     finally:
         client.close()
         ctrl.stop()
-        conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                                connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
         conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
         conn.cursor().execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
         conn.close()

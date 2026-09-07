@@ -34,6 +34,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import pg  # noqa: E402  (shared Postgres test endpoints)
+
 from apip.config.service import (  # noqa: E402
     AdapterConfig,
     ControllerConfig,
@@ -44,13 +46,11 @@ from apip.ledger.db import Database, DatabaseUnavailable  # noqa: E402
 from apip.ledger.migrations import apply_migrations  # noqa: E402
 from apip.ledger.repo import Ledger  # noqa: E402
 
-SOCKET_DIR = "/var/run/postgresql"
 
 
 def _can_connect() -> bool:
     try:
-        conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                                connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
         conn.close()
         return True
     except psycopg2.Error:
@@ -64,8 +64,7 @@ pytestmark = pytest.mark.skipif(
 
 def _scratch() -> str:
     name = "apip_rec_" + uuid.uuid4().hex[:12]
-    conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                            connect_timeout=3)
+    conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     conn.cursor().execute(f'CREATE DATABASE "{name}"')
     conn.close()
@@ -73,16 +72,15 @@ def _scratch() -> str:
 
 
 def _drop(name: str) -> None:
-    conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres",
-                            connect_timeout=3)
+    conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     conn.cursor().execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
     conn.close()
 
 
 def _make_db(name: str) -> Database:
-    db = Database(DatabaseConfig(host=SOCKET_DIR, dbname=name,
-                                 user=os.environ.get("USER", "bamn")).dsn_kwargs())
+    db = Database(DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=name,
+                                 user=pg.USER).dsn_kwargs())
     db.wait_until_ready(timeout_s=10)
     return db
 
@@ -101,9 +99,7 @@ def test_connection_level_failure_reconnects_on_next_use():
         apply_migrations(db)
         db.query_one("SELECT 1 AS ok")
         # kill every backend of this scratch DB = all pooled sockets die
-        conn = psycopg2.connect(host=SOCKET_DIR, dbname=name,
-                                user=os.environ.get("USER", "bamn"),
-                                connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs(name))
         conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
         conn.cursor().execute(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -220,8 +216,8 @@ def _controller_for(name: str, zone_dir: str):
     from apip.controller.service import Controller
     cfg = replace(
         load_config(None),
-        db=DatabaseConfig(host=SOCKET_DIR, dbname=name,
-                          user=os.environ.get("USER", "bamn")),
+        db=DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=name,
+                          user=pg.USER),
         controller=replace(ControllerConfig(), reconcile_interval_s=0.2,
                            verify_interval_s=3600),
         adapter=replace(AdapterConfig(rpz_mode="SHADOW", zone_dir=zone_dir),
@@ -290,9 +286,7 @@ def test_workers_survive_outage_and_dispatch_exactly_once_after_recovery():
                 "action not dispatched while healthy"
 
             # ---- outage: kill every backend for this DB ----
-            conn = psycopg2.connect(host=SOCKET_DIR, dbname=name,
-                                    user=os.environ.get("USER", "bamn"),
-                                    connect_timeout=3)
+            conn = psycopg2.connect(**pg.dsn_kwargs(name))
             conn.set_isolation_level(
                 psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
             conn.cursor().execute(

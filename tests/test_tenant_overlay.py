@@ -22,6 +22,8 @@ import tomllib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import pg  # noqa: E402  (shared Postgres test endpoints)
+
 from apip.decision.layer import merge_policy_overlay  # noqa: E402
 from apip.decision.loader import load_policy_text  # noqa: E402
 from apip.decision.policy import Policy  # noqa: E402
@@ -207,8 +209,7 @@ allowlist = [ { value = "untrusted.corp.test", owner = "tenant", ticket = "t-x" 
 
 def _can_connect() -> bool:
     try:
-        SOCKET_DIR = "/var/run/postgresql"
-        conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres", connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
         conn.close()
         return True
     except psycopg2.Error:
@@ -228,7 +229,7 @@ def test_tenant_overlay_drives_a_tighter_decision():
     from apip.domain.models import Evidence, Indicator  # noqa: PLC0415
 
     dburi = "apip_tn_" + uuid.uuid4().hex[:12]
-    conn = psycopg2.connect(host="/var/run/postgresql", dbname="postgres", connect_timeout=3)
+    conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = conn.cursor()
     try:
@@ -238,8 +239,8 @@ def test_tenant_overlay_drives_a_tighter_decision():
 
     cfg = replace(
         load_config(None),
-        db=DatabaseConfig(host="/var/run/postgresql", dbname=dburi,
-                          user=os.environ.get("USER", "bamn")),
+        db=DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=dburi,
+                          user=pg.USER),
         adapter=replace(AdapterConfig(rpz_mode="SHADOW", zone_dir="/tmp/apip_tn_rpz"),
                         authorized_domains=("corp.test",)),
     )
@@ -329,7 +330,7 @@ fqdn_auto_m = 100
             ctrl.stop()
     finally:
         db.close()
-        conn = psycopg2.connect(host="/var/run/postgresql", dbname="postgres", connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
         conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
         cur = conn.cursor()
         try:

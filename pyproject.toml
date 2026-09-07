@@ -29,20 +29,29 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Topic :: Security",
   "Topic :: System :: Networking",
-  "Typing :: Typed",
 ]
 # The DECISION PATH is stdlib-only by design (docs/28 no-AI invariant): it
 # imports nothing beyond the standard library, so a decision can never pull
 # an inference SDK. The dependencies below are the SERVICE surface only —
 # HTTP transport (fastapi/uvicorn), PostgreSQL persistence (psycopg2), and
 # the operator CLI (click). None of them sits between evidence and decision.
+# P1 #43: the service surface is pinned to the exact minor lines the beta
+# is TESTED at (see tests/ and CI). FastAPI 0.115 pairs with Starlette
+# 0.37 and AnyIO 4.15; the previously pinned Starlette range (>=0.37,<0.38)
+# documented a fastapi-0.141 conflict that no longer exists and did not
+# constrain the resolver anyway. `dev` extra pins pytest/httpx for the
+# suite; a warnings-as-errors CI lane guards new deprecations.
 dependencies = [
-  "click>=8.1",
-  "fastapi>=0.110",
-  # fastapi 0.141 pins starlette<0.38; a newer starlette breaks Router init.
-  "starlette>=0.37.2,<0.38.0",
-  "uvicorn>=0.29",
-  "psycopg2-binary>=2.9",
+  "click>=8.1,<9",
+  # the operator CLI talks to the control-plane API (apip/cli); a real
+  # runtime dependency, not a dev-only one — the Compose smoke caught the
+  # wheel shipping a CLI that died on import without it (#42/#43).
+  "httpx>=0.27,<1",
+  "fastapi>=0.115.2,<0.116",
+  "starlette>=0.37.2,<0.38",
+  "anyio>=4.15.0,<4.16",
+  "uvicorn>=0.29,<0.53",
+  "psycopg2-binary>=2.9,<3",
 ]
 
 [project.optional-dependencies]
@@ -59,9 +68,6 @@ dev = [
 # the oracle runs as a subprocess on reference/src (see tests/oracle_client.py).
 [project.scripts]
 apip = "apip.cli.main:cli"
-
-[project.urls]
-Homepage = "https://example.invalid/apip"
 
 [tool.setuptools.packages.find]
 where = ["src"]

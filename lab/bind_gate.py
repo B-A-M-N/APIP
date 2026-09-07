@@ -481,19 +481,50 @@ def _last_serial(zones_dir: Path, live: bool) -> int:
 def main() -> int:
     global BIND_HOST_PORT
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--socket-dir", default=SOCKET_DIR)
+    ap.add_argument("--socket-dir", default=None,
+                    help="Postgres unix-socket dir (local default)")
+    ap.add_argument("--pg-host", default=None,
+                    help="Postgres TCP host (CI service containers); "
+                         "overrides --socket-dir")
+    ap.add_argument("--pg-port", type=int, default=5432)
+    ap.add_argument("--pg-user", default=os.environ.get("USER", "bamn"))
     ap.add_argument("--bind-port", type=int, default=BIND_HOST_PORT)
+    ap.add_argument("--require-postgres", action="store_true",
+                    help="release mode: a missing Postgres is a hard "
+                         "failure (it already is for docker)")
     args = ap.parse_args()
     BIND_HOST_PORT = args.bind_port
+
+    # P1 #42/#40: CI reaches Postgres over TCP (service container); the
+    # local default stays the unix socket.
+    pg_endpoint = (args.pg_host if args.pg_host
+                   else args.socket_dir or SOCKET_DIR)
+    pg_kw = (dict(host=args.pg_host, port=args.pg_port, user=args.pg_user,
+                  connect_timeout=3)
+             if args.pg_host else
+             dict(host=pg_endpoint, dbname="postgres", connect_timeout=3))
+
+    def _pg_connect(dbname: str) -> object:
+        import psycopg2 as _p2
+        kw = (dict(host=args.pg_host, port=args.pg_port, dbname=dbname,
+                   user=args.pg_user, connect_timeout=3)
+              if args.pg_host else
+              dict(host=pg_endpoint, dbname=dbname, connect_timeout=3))
+        return _p2.connect(**kw)
 
     missing = []
     if not _docker_ok():
         missing.append("docker (required to run real BIND/named)")
-    if not _pg_ok(args.socket_dir):
-        missing.append(f"Postgres on {args.socket_dir}")
+    try:
+        c = _pg_connect("postgres")
+        c.close()
+    except Exception as e:
+        missing.append(f"Postgres on {pg_endpoint}: {e}")
     if missing:
-        print("PREREQUISITES MISSING — this is a RELEASE GATE and cannot be "
-              "skipped silently:\n  - " + "\n  - ".join(missing), flush=True)
+        always_fatal = "docker" in " ".join(missing) or args.require_postgres
+        print(("FAIL (release gate): " if always_fatal
+               else "PREREQUISITES MISSING: ")
+              + "\n  - ".join([""] + missing).lstrip(), flush=True)
         return 2
 
     from apip.config.service import (AdapterConfig, DatabaseConfig,
@@ -502,7 +533,12 @@ def main() -> int:
     from apip.ledger.db import Database
     from apip.ledger.migrations import apply_migrations
 
-    dburi = _create_scratch(args.socket_dir)
+    dburi = ("apip_bind_" + uuid.uuid4().hex[:12])
+    _c = _pg_connect("postgres")
+    import psycopg2.extensions as _p2e
+    _c.set_isolation_level(_p2e.ISOLATION_LEVEL_AUTOCOMMIT)
+    _c.cursor().execute(f'CREATE DATABASE "{dburi}"')
+    _c.close()
     zones_dir = Path(tempfile.mkdtemp(prefix="apip_bind_gate_"))
     bind = BindServer(zones_dir)
     ctrl: Controller | None = None
@@ -519,8 +555,11 @@ def main() -> int:
         def _make_controller(posture: str) -> Controller:
             cfg = replace(
                 load_config(None),
-                db=DatabaseConfig(host=args.socket_dir, dbname=dburi,
-                                  user=os.environ.get("USER", "bamn")),
+                db=(DatabaseConfig(host=args.pg_host, port=args.pg_port,
+                                   dbname=dburi, user=args.pg_user)
+                    if args.pg_host else
+                    DatabaseConfig(host=pg_endpoint, dbname=dburi,
+                                   user=os.environ.get("USER", "bamn"))),
                 adapter=replace(
                     AdapterConfig(rpz_mode=posture, zone_dir=str(zones_dir),
                                   zone_name=ZONE_NAME),
@@ -686,7 +725,15 @@ def main() -> int:
                 except Exception:
                     pass
         bind.stop()
-        _drop_scratch(dburi, args.socket_dir)
+        try:
+            _c = _pg_connect("postgres")
+            import psycopg2.extensions as _p2e
+            _c.set_isolation_level(_p2e.ISOLATION_LEVEL_AUTOCOMMIT)
+            _c.cursor().execute(f'DROP DATABASE IF EXISTS "{dburi}" '
+                                f'WITH (FORCE)')
+            _c.close()
+        except Exception:
+            pass
         shutil.rmtree(zones_dir, ignore_errors=True)
 
 

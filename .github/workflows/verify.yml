@@ -134,3 +134,168 @@ jobs:
         run: |
           cd examples/generated
           named-checkzone apip.invalid rpz.zone
+
+  # ---- PRODUCT lanes (review P1 #42): everything above exercises the
+  # reference scaffold. These jobs exercise the PRODUCT (src/apip) — the
+  # wheel a user actually installs — so a product regression cannot hide
+  # behind a green scaffold gate.
+  product-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: apip
+          POSTGRES_PASSWORD: apip
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U apip"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      # integration tests probe this TCP endpoint (the socket-dir default
+      # does not exist on the runner)
+      APIP_TEST_PG_HOST: 127.0.0.1
+      APIP_TEST_PG_USER: apip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install product + dev deps
+        run: python -m pip install -e '.[dev]'
+      - name: Run the product test suite (Postgres REQUIRED, no skips)
+        run: |
+          # P1 #40 analog for CI: the Postgres-backed suites must RUN, not
+          # skip. The scratch-DB suites connect over TCP in CI.
+          python -m pytest tests/ -p no:cacheprovider --junitxml=junit.xml
+      - name: Type check the product
+        run: |
+          python -m pip install pyright
+          python -m pyright src/
+      - name: Product no-AI invariant (decision path stays stdlib-only)
+        run: |
+          # The DECISION PATH must never import an inference SDK or any
+          # third-party module (docs/28). Grep the decision/ + policy/
+          # modules for imports outside the standard library.
+          python - <<'PY'
+          import ast, pathlib, sys
+          STDLIB = set(sys.stdlib_module_names)
+          bad = []
+          for p in list(pathlib.Path("src/apip/decision").rglob("*.py")) + \
+                   list(pathlib.Path("src/apip/domain").rglob("*.py")):
+              tree = ast.parse(p.read_text())
+              for node in ast.walk(tree):
+                  mods = []
+                  if isinstance(node, ast.Import):
+                      mods = [a.name.split(".")[0] for a in node.names]
+                  elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                      mods = [node.module.split(".")[0]]
+                  for m in mods:
+                      if m not in STDLIB and not m.startswith("apip"):
+                          bad.append(f"{p}: imports {m}")
+          if bad:
+              print("no-AI invariant VIOLATED:", *bad, sep="\n")
+              sys.exit(1)
+          print("decision path is stdlib-only: OK")
+          PY
+      - name: Fail on new deprecation warnings from the product surface
+        run: |
+          # P1 #43 warnings lane: new DeprecationWarnings from FastAPI/
+          # Starlette/AnyIO surface as failures, so a dependency bump that
+          # degrades the API cannot land silently. (The known AnyIO
+          # BlockingPortal alias warning from starlette's testclient is
+          # filtered until starlette fixes it upstream.)
+          python -m pytest tests/ -p no:cacheprovider -W error::DeprecationWarning \
+            -W 'ignore:The anyio.abc.BlockingPortal alias is deprecated'
+
+  product-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the product wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel -o dist .
+      - name: Clean-venv install WITH deps, CLI must work
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/apip-product-venv
+          /tmp/apip-product-venv/bin/pip install dist/*.whl
+          test -x /tmp/apip-product-venv/bin/apip
+          /tmp/apip-product-venv/bin/apip --help
+          # the version the wheel claims is the version the repo pins
+          /tmp/apip-product-venv/bin/apip --version
+
+  product-compose-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start the Compose deployment
+        run: |
+          cat > .env <<'ENV'
+          POSTGRES_PASSWORD=ci-postgres-pass
+          APIP_OPERATOR_TOKEN=apipt_ci-smoke-token
+          APIP_SECRET_KEY=ci-secret-key-0123456789abcdef
+          ENV
+          docker compose -f deploy/docker-compose.yml up -d --build
+      - name: Health endpoint answers through the published port
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8510/health; then exit 0; fi
+            sleep 2
+          done
+          echo "container never became healthy"
+          docker compose -f deploy/docker-compose.yml logs
+          exit 1
+      - name: Authenticated /status via the operator token
+        run: |
+          curl -fsS -H "Authorization: Bearer apipt_ci-smoke-token" \
+            http://127.0.0.1:8510/status | grep -q '"status"'
+      - name: Tear down
+        if: always()
+        run: |
+          # compose interpolates required vars even for `down`; provide dummies
+          POSTGRES_PASSWORD=x APIP_OPERATOR_TOKEN=x APIP_SECRET_KEY=x \
+            docker compose -f deploy/docker-compose.yml down -v
+
+  product-bind-gate:
+    # LEVEL 2 evidence (review P1 #41): real BIND consumes the product's RPZ
+    # artifact through a real response-policy chain. A missing prerequisite
+    # is a FAILURE here, not a skip (release mode).
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: apip
+          POSTGRES_PASSWORD: apip
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U apip"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      APIP_TEST_PG_HOST: 127.0.0.1
+      APIP_TEST_PG_USER: apip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install product + BIND tools
+        run: |
+          python -m pip install -e '.[dev]'
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bind9-utils bind9
+      - name: Run the BIND gate in required mode
+        run: |
+          PYTHONPATH="lab:src" python lab/bind_gate.py --require-postgres

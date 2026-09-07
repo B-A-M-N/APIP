@@ -603,16 +603,20 @@ class Controller:
                 "WHERE action_id=%s", (actor, action_id))
             return {"action_id": action_id, "state": "revoked",
                     "verified": True, "not_applied": True}
-        if not self.ledger.claim_for_removal(
+        # Commit the durable ABSENT intent FIRST (audit P0 #4/#9): the
+        # request itself only mutates desired state — the physical removal
+        # below is the same converging operation the worker performs. A
+        # crash after this commit converges to removal, never re-apply.
+        if not self.ledger.request_removal(
                 action_id, ("applied", "verified", "drifted", "dispatching")):
             return {"action_id": action_id, "state": action["state"],
                     "already_removing": True}
         result = self._remove_action(action, actor, reason,
                                      terminal_state="revoked", revoked_by=actor)
         if result["state"] == "drifted":
-            # unverified removal: the reconcile sweep retries; put it back in
-            # a non-terminal state instead of stranding the claim
-            self.ledger.unclaim_action(action_id)
+            # unverified removal: the reconcile sweep retries as a REMOVAL
+            # (desired stays ABSENT) rather than stranding the claim
+            self.ledger.retry_removal(action_id)
         return result
 
     # -- worker: dispatch ---------------------------------------------------------
@@ -754,29 +758,40 @@ class Controller:
 
     def _reconcile_pass(self) -> None:
         now = datetime.now(timezone.utc)
-        # 0. crash-recovery of a claimed-but-never-applied dispatch: a leader
-        #    that was mid-apply when it died leaves the action 'dispatching'.
-        #    Return any such action (untouched for a full reconcile window,
-        #    so we never yank an actually in-flight apply) to pending so the
-        #    next leader re-claims and applies it.
+        # 0. crash-recovery of claimed-but-unfinished operations (audit P0 #4).
+        #    The durable desired_state disambiguates intent: an APPLY claim
+        #    ('dispatching', desired PRESENT) returns to pending so the next
+        #    leader re-applies; a REMOVAL claim ('removing', desired ABSENT)
+        #    is requeued AS A REMOVAL — it can never become an apply.
         stale = now - timedelta(seconds=max(
             10, 3 * self.config.controller.reconcile_interval_s))
         for action in self.ledger.actions_stuck_dispatching(stale):
             self.ledger.unclaim_action(action["action_id"])
+        for action in self.ledger.actions_stuck_removing(stale):
+            self.ledger.retry_removal(action["action_id"])
+        # 0b. any action whose desired_state is ABSENT but which still sits
+        #     in an active state (a removal interrupted before the adapter
+        #     call) re-enters the removal phase — converge toward ABSENT.
+        for action in self.ledger.actions_desired_absent_active():
+            if self.ledger.request_removal(
+                    action["action_id"],
+                    ("applied", "verified", "drifted", "removing")):
+                self._remove_action(action, CONTROLLER_ACTOR,
+                                    "desired_absent_reconcile",
+                                    terminal_state="revoked", revoked_by=None)
         # 1. expiry sweep: TTL reached -> remove via controlled path.
-        # CAS claim first (P0 #21): an operator revoke on another controller
-        # may be mid-removal of the same action — only one path proceeds.
+        # Commit the ABSENT intent FIRST (audit P0 #4), then remove: a crash
+        # anywhere after the intent commit converges to removal, never apply.
         for action in self.ledger.actions_due_for_expiry(now):
-            if not self.ledger.claim_for_removal(
+            if not self.ledger.request_removal(
                     action["action_id"], ("applied", "verified", "drifted")):
                 continue
             result = self._remove_action(action, CONTROLLER_ACTOR, "ttl_expired",
                                          terminal_state="expired",
                                          revoked_by=None)
             if result["state"] == "drifted":
-                # removal unverified: return for retry rather than leaving it
-                # wedged in the transient claim state
-                self.ledger.unclaim_action(action["action_id"])
+                # removal unverified: requeue as removal (desired stays ABSENT)
+                self.ledger.retry_removal(action["action_id"])
         # 2. verification sweep: applied/verified actions re-checked
         older_than = now - timedelta(seconds=self.config.controller.verify_interval_s)
         for action in self.ledger.actions_needing_verification(older_than):

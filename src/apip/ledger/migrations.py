@@ -353,6 +353,30 @@ ALTER TABLE sources ADD COLUMN IF NOT EXISTS key_id TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_sources_key_id
     ON sources (key_id) WHERE key_id IS NOT NULL;
 """),
+    (11, "desired-state reconciliation intent", """
+-- Audit P0 #4: the durable record must never forget whether the operation
+-- in progress was APPLY or REMOVE. Previously both used state='dispatching',
+-- so a crash during a removal claim could be recovered by unclaim_action()
+-- to 'pending' — and the dispatch worker would RE-APPLY the control the
+-- operator revoked. Now every action carries a desired_state:
+--   PRESENT  the control should exist (created at dispatch, crash-recovery
+--            converges by (re)applying);
+--   ABSENT   the control must not exist (set by revoke/expiry/policy
+--            invalidation BEFORE touching infrastructure; crash-recovery
+--            converges by removing).
+-- Removal runs in the distinct 'removing' phase; only 'dispatching' (an
+-- APPLY claim) is ever returned to 'pending'.
+ALTER TABLE actions ADD COLUMN IF NOT EXISTS desired_state TEXT NOT NULL
+    DEFAULT 'PRESENT' CHECK (desired_state IN ('PRESENT','ABSENT'));
+ALTER TABLE actions DROP CONSTRAINT IF EXISTS actions_state_check;
+ALTER TABLE actions ADD CONSTRAINT actions_state_check CHECK (state IN
+    ('pending','dispatching','removing','applied','verified','failed','expired',
+     'revoked','drifted','cancelled_policy_changed'));
+CREATE INDEX IF NOT EXISTS idx_actions_desired ON actions(desired_state, state);
+-- An action claimed for removal and orphaned by a crash must stay claimed
+-- for REMOVAL: anything in 'removing' has desired_state ABSENT by invariant.
+UPDATE actions SET desired_state='ABSENT' WHERE state='removing';
+"""),
     (10, "durable approval state machine", """
 -- P0 #16: an operator approval is DURABLE STATE, not just an audit event.
 -- Each approval cites the EXACT immutable decision instance

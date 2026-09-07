@@ -59,6 +59,7 @@ import os
 import socket
 import struct
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -70,17 +71,22 @@ _SHADOW_ZONE_SUFFIX = ".shadow.zone"
 _LIVE_ZONE_SUFFIX = ".zone"
 
 
-def _soa_serial() -> int:
-    """Monotonic serial: unix epoch seconds mod 2^31 (BIND SOA serials are
-    32-bit; a YYYYMMDDNN serial repeats within its bucket and BIND then
-    IGNORES the reload as 'no serial change' — and rate-limits policy-zone
-    updates that advance 'too soon' anyway). Epoch seconds are strictly
-    increasing for forward-running clocks and fit until 2038, and every
-    publish rewrites the SOA line wholesale (a backwards clock can only
-    produce a lower serial, surfaced rather than hidden by the fresh line).
-    """
-    now = _dt.datetime.now(_dt.timezone.utc)
-    return int(now.timestamp()) % (2**31)
+_SERIAL_MOD = 2**32   # SOA serials are 32-bit
+
+
+def _serial_newer(a: int, b: int) -> bool:
+    """RFC 1982 serial comparison: is serial ``a`` newer than ``b``?"""
+    return ((a - b) % _SERIAL_MOD) < 2**31
+
+
+def _next_serial(current: int) -> int:
+    """The next serial AFTER ``current`` in RFC 1982 space (audit P0 #3):
+    serial numbers belong to the ARTIFACT GENERATION, not to wall-clock
+    time. ``current + 1`` mod 2^32 always advances (even 100 publishes in
+    the same millisecond), survives a backwards-moving clock, and wraps
+    through 2^32-1 -> 0 exactly like BIND's own serial arithmetic. Wall
+    clock seeds the FIRST generation of an artifact only."""
+    return (current + 1) % _SERIAL_MOD
 
 
 def _zone_header(zone_name: str, *, serial: int, live: bool) -> list[str]:
@@ -101,11 +107,22 @@ def _zone_header(zone_name: str, *, serial: int, live: bool) -> list[str]:
     ]
 
 
-def _restamp_soa(lines: list[str]) -> list[str]:
-    """Rewrite the SOA line with a fresh monotonic serial and the short
+def _zone_serial(lines: list[str]) -> int | None:
+    """Extract the current SOA serial from rendered zone lines."""
+    for l in lines:
+        if l.lstrip().startswith("@ IN SOA"):
+            for tok in l.replace("(", " ").replace(")", " ").split():
+                if tok.isdigit():
+                    return int(tok)
+    return None
+
+
+def _restamp_soa(lines: list[str], serial: int) -> list[str]:
+    """Rewrite the SOA line with the GIVEN generation serial and the short
     refresh/retry timers (BIND ignores a zone reload whose serial did not
-    advance, and rate-limits policy-zone updates against the SOA timers)."""
-    serial = _soa_serial()
+    advance, and rate-limits policy-zone updates against the SOA timers).
+    The caller derives the serial from the artifact's persisted generation
+    under the artifact lock (audit P0 #3) — never from wall clock."""
     out = []
     for l in lines:
         if l.lstrip().startswith("@ IN SOA"):
@@ -145,6 +162,11 @@ class RpzAdapter:
             raise AdapterError("; ".join(problems))
         self._mode = mode
         self._zone_dir = Path(config.zone_dir)
+        # Audit P0 #10: artifact mutation is serialized per artifact
+        # (apply/revoke can be called from an API thread AND worker loops).
+        # The serial lives in the ARTIFACT, so readers of the file always
+        # see the generation they published.
+        self._artifact_lock = threading.Lock()
         # ENFORCE requires an explicit authorized-domain scope — never
         # authorize-by-omission at the enforcement edge.
         if mode == "ENFORCE" and not config.authorized_domains:
@@ -287,13 +309,40 @@ class RpzAdapter:
         return ""
 
     def _write_zone(self, lines: list[str], live: bool) -> str:
+        """Atomically publish one artifact generation (audit P0 #10): a
+        UNIQUE same-directory temp file (never a fixed name a concurrent
+        writer could collide with), fsync before the rename, os.replace.
+        Caller holds ``self._artifact_lock``."""
         self._zone_dir.mkdir(parents=True, exist_ok=True)
         content = "\n".join(lines) + "\n"
-        tmp_suffix = ".zone.tmp" if live else ".shadow.zone.tmp"
-        tmp = self._zone_path(live).with_suffix(tmp_suffix)
-        tmp.write_text(content, encoding="utf-8")
-        os.replace(tmp, self._zone_path(live))
+        suffix = ".zone" if live else ".shadow.zone"
+        tmp = self._zone_path(live).with_suffix(suffix + f".tmp-{os.getpid()}-{threading.get_ident()}-{os.urandom(4).hex()}")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._zone_path(live))
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
         return content
+
+    def _next_generation(self, live: bool, lines: list[str]) -> list[str]:
+        """Advance the artifact's SOA serial to the next generation (audit
+        P0 #3). The CURRENT serial is read from the artifact itself — never
+        from wall clock — so publishes in the same second always advance,
+        restarts cannot regress the serial, and a backwards clock cannot
+        either. First generation of a fresh artifact seeds from wall clock.
+        Caller holds ``self._artifact_lock``."""
+        current = _zone_serial(lines)
+        if current is None:
+            seed = int(_dt.datetime.now(_dt.timezone.utc).timestamp()) % _SERIAL_MOD
+            return _restamp_soa(lines, seed)
+        return _restamp_soa(lines, _next_serial(current))
 
     def _render_entry(self, owner: str, *, live: bool, comment: str) -> str:
         """The physical zone line for one owner at one posture. LIVE = the
@@ -350,19 +399,24 @@ class RpzAdapter:
             raise AdapterError(
                 f"effective posture {eff} below SHADOW: refusing to publish")
         live = eff == "ENFORCE"
-        zone = self._read_zone(live)
-        if zone:
-            lines = zone.splitlines()
-        else:
-            lines = _zone_header(self.config.zone_name, serial=_soa_serial(),
-                                 live=live)
-        entry = self._render_entry(owner, live=live,
-                                   comment=_entry_comment(candidate))
-        entry_key = entry.split(";")[0].strip()
-        lines = [l for l in lines if l.split(";")[0].strip() != entry_key]
-        lines.append(entry)
-        lines = _restamp_soa(lines)   # reload only propagates on serial bump
-        content = self._write_zone(lines, live)
+        with self._artifact_lock:   # audit P0 #10: serialize the generation
+            zone = self._read_zone(live)
+            if zone:
+                lines = zone.splitlines()
+            else:
+                lines = _zone_header(self.config.zone_name, serial=0,
+                                     live=live)
+            entry = self._render_entry(owner, live=live,
+                                       comment=_entry_comment(candidate))
+            entry_key = entry.split(";")[0].strip()
+            lines = [l for l in lines if l.split(";")[0].strip() != entry_key]
+            lines.append(entry)
+            # serial belongs to the artifact GENERATION (audit P0 #3): read
+            # the current serial from the artifact, advance it by one under
+            # the lock. A reload only propagates when the serial advances.
+            lines = self._next_generation(live, lines)
+            serial = _zone_serial(lines)
+            content = self._write_zone(lines, live)
         reload_info: dict[str, Any] = {"reloaded": False, "reason": "not attempted"}
         reload_error = None
         if live and self.config.reload_command:
@@ -385,6 +439,7 @@ class RpzAdapter:
                     "zone_sha256": content_hash,
                     "owner": owner,
                     "effective_mode": eff,
+                    "soa_serial": serial,
                     "reload": reload_info,
                 },
             },
@@ -480,48 +535,73 @@ class RpzAdapter:
         return {"ok": True, "observed": observed}
 
     def revoke(self, candidate: dict) -> dict:
-        """Remove EXACTLY this owner line from BOTH artifacts; verify the
-        zone(s) no longer hold it. A missing zone counts as removed
-        (idempotent). Ownership is structural (stored rule_id + exact
-        selector match); the adapter's CURRENT scope never gates removal —
-        scope narrowing must not prevent cleanup (review P0 #8)."""
+        """Remove the owner line from EXACTLY the candidate's OWN artifact —
+        the posture its effective mode selects (audit P0 #1). Revoke is NOT
+        a "remove this FQDN everywhere" primitive: the same FQDN may
+        legitimately be present in BOTH artifacts at once (SHADOW action
+        expiring while an ENFORCE action for the same name is active), and
+        deleting the other posture's line would destroy a live control.
+        Co-ownership in the ledger is partitioned by mode; the adapter must
+        agree.
+
+        ENFORCE rollback is verified against the RESOLVER (audit P0 #2):
+        when a verify_query_server is configured and reachable, the post-
+        revoke query must NOT return the APIP-induced suppression anymore.
+        File absence alone never proves behavior restoration. A missing
+        zone counts as removed (idempotent). Ownership is structural
+        (stored rule_id + exact selector); the adapter's CURRENT scope
+        never gates removal (review P0 #8)."""
         shape = self._validate_shape(candidate, check_scope=False)
         owner = shape["owner"]
+        eff = self._effective(candidate)
+        live = eff == "ENFORCE"
         results: list[dict] = []
         reload_needed = False
-        for live in (True, False):
+        with self._artifact_lock:   # audit P0 #10: serialize the generation
             zone = self._read_zone(live)
+            artifact = "live" if live else "shadow"
             if not zone:
-                results.append({"artifact": "live" if live else "shadow",
-                                "zone_absent": True})
-                continue
-            prefix = f"{owner} "
-            lines = zone.splitlines()
-            kept = [l for l in lines
-                    if not l.split(";")[0].strip().startswith(prefix)]
-            if len(kept) == len(lines):
-                results.append({"artifact": "live" if live else "shadow",
-                                "was_absent": True})
-                continue
-            content = self._write_zone(kept, live)
-            if live:
-                reload_needed = True
-            results.append({"artifact": "live" if live else "shadow",
-                            "removed": True,
-                            "zone_sha256": hashlib.sha256(
-                                content.encode()).hexdigest()})
+                results.append({"artifact": artifact, "zone_absent": True})
+            else:
+                prefix = f"{owner} "
+                lines = zone.splitlines()
+                kept = [l for l in lines
+                        if not l.split(";")[0].strip().startswith(prefix)]
+                if len(kept) == len(lines):
+                    results.append({"artifact": artifact, "was_absent": True})
+                else:
+                    kept = self._next_generation(live, kept)  # revoke republishes
+                    content = self._write_zone(kept, live)
+                    reload_needed = live
+                    results.append({"artifact": artifact, "removed": True,
+                                    "zone_sha256": hashlib.sha256(
+                                        content.encode()).hexdigest()})
         reload_info: dict[str, Any] = {"reloaded": False, "reason": "not attempted"}
         if reload_needed and self.config.reload_command:
             reload_info = self._reload()
-        # independent post-check: the owner must be gone from both artifacts
-        for live in (True, False):
-            zone = self._read_zone(live)
-            if zone and any(l.split(";")[0].strip().startswith(f"{owner} ")
-                            for l in zone.splitlines()):
-                return {"ok": False, "error": "rule still present after revoke",
-                        "observed": {"removed": owner, "zones": results}}
-        return {"ok": True, "observed": {
-            "removed": owner, "zones": results, "reload": reload_info}}
+        # post-check: the owner must be gone from ITS artifact
+        zone = self._read_zone(live)
+        if zone and any(l.split(";")[0].strip().startswith(f"{owner} ")
+                        for l in zone.splitlines()):
+            return {"ok": False, "error": "rule still present after revoke",
+                    "observed": {"removed": owner, "zones": results}}
+        observed: dict[str, Any] = {"removed": owner,
+                                    "effective_mode": eff,
+                                    "zones": results, "reload": reload_info}
+        if live:
+            # ENFORCE rollback contract (audit P0 #2): prove the resolver
+            # stopped serving the APIP-induced answer. Without a configured
+            # resolver this degrades to the file+reload evidence above —
+            # surfaced honestly in the observed dict as resolver-unverified.
+            if self.config.verify_query_server:
+                dns = self._dns_query_nxdomain(owner)
+                observed["dns_after"] = dns
+                if dns.get("queried") and dns.get("rcode") == 3:
+                    return {"ok": False,
+                            "error": "resolver STILL answers NXDOMAIN after "
+                                     "revoke (rollback not verified)",
+                            "observed": observed}
+        return {"ok": True, "observed": observed}
 
     def get_state(self, selector: dict) -> dict:
         owner = (selector.get("exact_fqdn") or "").rstrip(".")

@@ -420,12 +420,73 @@ RETURNING action_id
         return bool(row)
 
     def unclaim_action(self, action_id: str) -> None:
-        """Return a claimed-but-not-applied action to pending (crash between
-        claim and apply). Does nothing if the state moved on."""
+        """Return a claimed-but-not-applied action toward its DESIRED state
+        (audit P0 #4): an APPLY claim (state='dispatching') returns to
+        'pending' so the next leader re-applies; a REMOVAL claim
+        (state='removing') can only converge toward removal — it goes to
+        'applied' (re-queued for removal) if the control was live, never to
+        'pending', so a crash during revoke can NEVER become a re-apply."""
         self.db.execute("""
 UPDATE actions SET state='pending', last_reconciled_at=now()
 WHERE action_id=%s AND state='dispatching'
+  AND desired_state='PRESENT'
 """, (action_id,))
+        self.db.execute("""
+UPDATE actions SET state='applied', last_reconciled_at=now()
+WHERE action_id=%s AND state='removing'
+  AND desired_state='ABSENT'
+""", (action_id,))
+
+    def request_removal(self, action_id: str, from_states: tuple[str, ...]) -> bool:
+        """Commit the durable ABSENT intent BEFORE touching infrastructure
+        (audit P0 #4): CAS desired_state PRESENT->ABSENT and flip the
+        action into the 'removing' phase from the given states. Recovery
+        semantics after a crash: a 'removing' action retries removal — it
+        can never be re-claimed as an apply."""
+        # Exclusivity comes from the state CAS (the first claimer moves the
+        # row to 'removing', outside every caller's from_states). The
+        # desired_state guard admits both a fresh intent commit (PRESENT)
+        # and a recovery re-entry (already ABSENT — intent committed, the
+        # removal never completed); it can never flip ABSENT back.
+        row = self.db.query_one("""
+UPDATE actions SET desired_state='ABSENT', state='removing',
+    last_reconciled_at=now()
+WHERE action_id=%s AND state = ANY(%s) AND desired_state IN ('PRESENT','ABSENT')
+RETURNING action_id
+""", (action_id, list(from_states)))
+        return row is not None
+
+    def retry_removal(self, action_id: str) -> None:
+        """A 'removing' action whose removal failed returns to the
+        pre-removal active state for a bounded retry — desired_state stays
+        ABSENT, so no code path can ever interpret it as apply-work."""
+        self.db.execute("""
+UPDATE actions SET state='applied', last_reconciled_at=now()
+WHERE action_id=%s AND state='removing' AND desired_state='ABSENT'
+""", (action_id,))
+
+    def actions_desired_absent_active(self) -> list[dict]:
+        """Actions whose durable intent is ABSENT but which still sit in an
+        active state — e.g. a removal committed (desired ABSENT) and then
+        the process died before entering the 'removing' phase. The
+        reconciler converges these toward removal."""
+        return self.db.query("""
+SELECT * FROM actions
+WHERE desired_state='ABSENT'
+  AND state IN ('applied','verified','drifted')
+ORDER BY created_at
+""")
+
+    def actions_stuck_removing(self, older_than: datetime) -> list[dict]:
+        """Actions wedged in 'removing' past a full reconcile window (their
+        leader died mid-removal): the next leader retries the removal — the
+        desired state is durably ABSENT."""
+        return self.db.query("""
+SELECT * FROM actions
+WHERE state='removing' AND desired_state='ABSENT'
+  AND last_reconciled_at IS NOT NULL AND last_reconciled_at < %s
+ORDER BY created_at
+""", (older_than,))
 
     def claim_for_removal(self, action_id: str, from_states: tuple[str, ...]) -> bool:
         """Atomic CAS claim for ANY removal path (operator revoke, worker

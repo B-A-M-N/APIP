@@ -183,8 +183,46 @@ class RpzAdapter:
             raise AdapterError(
                 "rpz ENFORCE mode requires adapter.authorized_domains "
                 "(the adapter never authorizes by omission)")
+        # audit P1 #13: ENFORCE capability is proven at controller startup
+        # (probe_startup): adapter construction is also an offline/
+        # config-validation surface, so the physical probe is not run here.
 
     # -- posture --------------------------------------------------------------
+
+    def probe_startup(self) -> None:
+        """Startup capability probe (audit P1 #13): before the controller
+        accepts work, an ENFORCE posture must PROVE its mechanism —
+          - a reload operation is configured (without one the published
+            generation never reaches the resolver);
+          - an independent resolver endpoint is configured (without one
+            NXDOMAIN verification would be fabricated from file state);
+          - the artifact directory accepts a write — exercised, not
+            assumed.
+        Resolver reachability itself is deliberately NOT a startup gate
+        (a resolver may be transiently down when the controller boots);
+        every verify path fails closed against an unreachable resolver.
+        A probe failure refuses startup (fail closed to a posture that
+        cannot silently lie)."""
+        if self._mode != "ENFORCE":
+            return
+        missing = [n for n, v in (
+            ("adapter.reload_command", self.config.reload_command),
+            ("adapter.verify_query_server",
+             self.config.verify_query_server))
+            if not v]
+        if missing:
+            raise AdapterError(
+                "rpz ENFORCE mode requires " + ", ".join(missing) +
+                " (enforcement without reload+verify is unprovable)")
+        try:
+            self._zone_dir.mkdir(parents=True, exist_ok=True)
+            probe = self._zone_dir / ".apip-capability-probe"
+            probe.write_text("probe", encoding="utf-8")
+            probe.unlink()
+        except OSError as e:
+            raise AdapterError(
+                f"rpz ENFORCE capability probe failed: zone dir "
+                f"{self._zone_dir} is not writable: {e}") from e
 
     def max_mode(self) -> str:
         return self._mode
@@ -360,6 +398,11 @@ class RpzAdapter:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
+            # whole-generation parser validation (audit P1 #14): refuse the
+            # publish while the new generation is still confined to the
+            # temp file — the artifact is never replaced by a zone the
+            # trusted parser rejects.
+            self._validate_zone_file(tmp, live)
             # os.replace swaps in a NEW inode: without this the artifact's
             # mode becomes the writer's umask (commonly 0600) and the
             # resolver user loses read access — the reload then fails with
@@ -436,6 +479,44 @@ class RpzAdapter:
                 f"reload command failed rc={proc.returncode}: "
                 f"{proc.stderr.decode(errors='replace')[:200]}")
         return {"reloaded": True}
+
+    def _validate_zone_file(self, path: Path, live: bool) -> None:
+        """Whole-artifact parser validation BEFORE publication (audit
+        P1 #14): the COMPLETE new generation — not just the generated
+        fragment — is checked by the configured trusted parser (e.g.
+        named-checkzone) while it still lives in its temp file. A parser
+        rejection refuses the publish; the previously published generation
+        stays in place. Same trust model as reload_command: argv form
+        (JSON array) is executed without a shell; any other string is
+        trusted operator code via the shell. Substitutions:
+        ``{file}`` = artifact path, ``{zone}`` = zone name."""
+        cmd = self.config.zone_validate_command
+        if not cmd:
+            return
+        import json as _json
+        stripped = cmd.strip()
+        if stripped.startswith("["):
+            try:
+                argv = _json.loads(stripped)
+                if (not isinstance(argv, list) or not argv
+                        or not all(isinstance(a, str) for a in argv)):
+                    raise ValueError("not an argv")
+            except ValueError as e:
+                raise AdapterError(f"zone_validate_command argv form is "
+                                   f"invalid: {e}")
+            argv = [a.replace("{file}", str(path))
+                     .replace("{zone}", self.config.zone_name) for a in argv]
+            proc = subprocess.run(argv, capture_output=True, timeout=30,
+                                  shell=False)
+        else:
+            rendered = cmd.replace("{file}", str(path)).replace(
+                "{zone}", self.config.zone_name)
+            proc = subprocess.run(rendered, shell=True, capture_output=True,
+                                  timeout=30)
+        if proc.returncode != 0:
+            raise AdapterError(
+                f"zone validation failed rc={proc.returncode}: "
+                f"{(proc.stderr or proc.stdout).decode(errors='replace')[:300]}")
 
     # -- apply / verify / revoke ---------------------------------------------------
 
@@ -575,11 +656,27 @@ class RpzAdapter:
                                  "independent NXDOMAIN verification",
                         "observed": observed}
             dns = self._dns_query_nxdomain(owner)
+            attempts = [dns]
+            # a reload (SIGHUP/rndc) is ASYNCHRONOUS — BIND may still be
+            # loading the just-published generation when the first probe
+            # lands. Bounded retry (audit P1 #11): keep asking within the
+            # verify budget until the resolver answers NXDOMAIN; the
+            # budget's expiry is an honest verification failure, never a
+            # fabricated success.
+            deadline = time.monotonic() + max(
+                1.0, self.config.revoke_verify_budget_s)
+            while (dns.get("queried") and dns.get("rcode") != 3
+                   and time.monotonic() < deadline):
+                time.sleep(0.5)
+                dns = self._dns_query_nxdomain(owner)
+                attempts.append(dns)
             observed["dns"] = dns
+            observed["dns_attempts"] = len(attempts)
             if not dns.get("queried"):
                 return {"ok": False, "error": "dns verify query failed",
                         "observed": observed}
             if dns.get("rcode") != 3:   # NXDOMAIN
+                observed["dns_attempts_log"] = attempts
                 return {"ok": False, "error": "resolver did not answer NXDOMAIN",
                         "observed": observed}
         return {"ok": True, "observed": observed}

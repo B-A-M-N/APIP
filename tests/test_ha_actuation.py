@@ -194,7 +194,10 @@ def ha():
                                reconcile_interval_s=0.2,
                                verify_interval_s=3600),
             adapter=replace(
-                AdapterConfig(rpz_mode="ENFORCE", zone_dir=zone_dir),
+                AdapterConfig(rpz_mode="ENFORCE", zone_dir=zone_dir,
+                              reload_command="true",
+                              verify_query_server="127.0.0.1",
+                              verify_query_port=5333),
                 authorized_domains=("corp.test",)),
         )
         return Controller(cfg)

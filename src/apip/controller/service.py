@@ -226,6 +226,13 @@ class Controller:
         self.db.wait_until_ready(timeout_s=wait_db_s)
         from apip.ledger.migrations import apply_migrations
         apply_migrations(self.db)
+        # audit P1 #13: before any worker accepts work, every adapter that
+        # claims an actuator posture PROVES its physical prerequisites — a
+        # refusing controller is visible; a silently unenforcing one is not.
+        for adapter in self._adapters.values():
+            probe = getattr(adapter, "probe_startup", None)
+            if callable(probe):
+                probe()
         self.ledger.audit(CONTROLLER_ACTOR, "controller.start", "", {})
         self.state.started_at = datetime.now(timezone.utc)
         self._refresh_policy_state()
@@ -233,6 +240,7 @@ class Controller:
         for name, target in (
             ("dispatch", self._dispatch_loop),
             ("reconcile", self._reconcile_loop),
+            ("ingest", self._ingest_loop),
         ):
             t = threading.Thread(target=target, name=f"apip-{name}", daemon=True)
             t.start()
@@ -359,6 +367,19 @@ class Controller:
                 cap = adapter.max_mode()
                 if (MODE_RANK.get(mode, 0) > MODE_RANK.get(cap, 0)):
                     mode = "SHADOW" if MODE_RANK.get(cap, 0) >= MODE_RANK["SHADOW"] else "OBSERVE"
+            # audit P1 #12: OBSERVE is DECISION-ONLY. An adapter whose
+            # maximum posture is below SHADOW has no actuator surface —
+            # persisting a dispatchable action row would dispatch into an
+            # adapter that must refuse it, manufacturing a bogus `failed`
+            # action from an intentionally disabled actuator. The decision
+            # (and this audit event) IS the observation; no action row.
+            if adapter is not None and MODE_RANK.get(mode, 0) < MODE_RANK["SHADOW"]:
+                self.ledger.audit(actor, "action.observe_decision_only",
+                                  decision.id,
+                                  {"adapter": frag["adapter"],
+                                   "cap": adapter.max_mode(),
+                                   "value": indicator_value})
+                continue
             if decision_seq is None:
                 decision_seq = self.ledger.decision_seq_for(
                     decision.id, decision.content_hash)
@@ -670,6 +691,59 @@ class Controller:
                 continue
             self._dispatch_one(action)
 
+    # -- worker: decoupled ingest (audit P1 #15) --------------------------------
+
+    def _ingest_loop(self) -> None:
+        """Bounded queue drain: one worker claims ONE accepted batch at a
+        time (FOR UPDATE SKIP LOCKED) and runs the pipeline. Bounded by
+        construction — never more batches in flight than workers (one) —
+        and the durable queue itself is the backpressure: the API only
+        accepts what it can persist. Poll cadence is short (1s): the queue
+        is the decoupling boundary, not a scheduler."""
+        # first poll promptly after start
+        while not self._stop.wait(1.0):
+            break
+        while not self._stop.is_set():
+            started = time.monotonic()
+            try:
+                claimed = self.ledger.claim_queued_batch()
+                if claimed is not None:
+                    self._process_queued(claimed)
+            except DatabaseUnavailable as e:
+                self.state.last_reconcile_error = f"ingest: {e}"
+            except Exception as e:   # worker must never die silently
+                self.state.last_reconcile_error = f"ingest: {e!r}"
+            elapsed = time.monotonic() - started
+            self._stop.wait(max(1.0, 1.0 - elapsed))
+
+    def _process_queued(self, claimed: dict) -> None:
+        """Resume-or-run one claimed batch. The payload is re-parsed from
+        the persisted bytes with the SAME channel binding, so a crash at
+        any point resumes instead of losing work; a payload that no longer
+        parses (registry drift) fails the batch loudly."""
+        from apip.ingest import IngestChannel, parse_indicator_payload
+        src = self.ledger.get_source(claimed["source_id"]) or {}
+        channel = IngestChannel(
+            source_id=claimed["source_id"],
+            allowed_source_ids=frozenset(
+                s for s in (src.get("upstream") or "").split(",") if s),
+            allowed_kinds=frozenset(src.get("allowed_kinds") or ()))
+        try:
+            payload = claimed["raw_payload"]
+            if isinstance(payload, memoryview):
+                payload = payload.tobytes()
+            batch = parse_indicator_payload(
+                bytes(payload), channel)
+        except Exception as e:   # noqa: BLE001
+            self.ledger.fail_batch(claimed["batch_id"], f"reparse failed: {e}")
+            return
+        self.process_batch(batch=batch, actor=claimed["source_id"],
+                           tenant_id=claimed.get("tenant_id"))
+
+    def ingest_status(self, batch_id: str) -> dict | None:
+        """Public batch processing status (audit P1 #15)."""
+        return self.ledger.batch_outcome(batch_id)
+
     def _stale_authorization(self, action: dict, *,
                              require_current_revision: bool = True) -> str | None:
         """None when the action may still be applied (or may remain
@@ -757,8 +831,44 @@ class Controller:
                 observed=receipt.get("observed", {}),
                 status=receipt.get("status", "applied"),
                 verified=False)
-            self.ledger.set_action_state(action_id, "applied", "dispatched",
-                                         CONTROLLER_ACTOR)
+            # audit P1 #11: apply is immediately followed by independent
+            # verification — an "applied" declaration without observed
+            # effect is exactly the file-state != enforcement-state gap.
+            # Success -> 'verified'; failure -> 'applied' (the reconcile
+            # sweep keeps verifying on cadence and can still converge).
+            try:
+                v = self._adapter_for(action).verify(
+                    {"rule_id": action["rule_id"],
+                     "fragment": action["fragment"],
+                     "mode": action["mode"],
+                     "selector": action["selector"]})
+                self.ledger.record_attempt(
+                    action_id=action_id, phase="verify",
+                    ok=bool(v.get("ok")), detail=v, actor=CONTROLLER_ACTOR)
+                if v.get("ok"):
+                    self.ledger.set_action_state(
+                        action_id, "verified", "verified_on_apply",
+                        CONTROLLER_ACTOR,
+                        verified_at=datetime.now(timezone.utc))
+                    self.ledger.record_receipt(
+                        receipt_id=f"receipt--{action_id}--verify-on-apply",
+                        action_id=action_id, adapter=action["adapter"],
+                        rule_id=action["rule_id"],
+                        fragment_hash=action["fragment_hash"],
+                        bundle_id=action["bundle_id"],
+                        bundle_hash=action["bundle_hash"],
+                        observed=v.get("observed", {}),
+                        status="verified", verified=True)
+                    return
+                verify_error = v.get("error", "verification_failed")
+            except AdapterError as e:
+                verify_error = str(e)
+                self.ledger.record_attempt(
+                    action_id=action_id, phase="verify", ok=False,
+                    detail={"error": verify_error}, actor=CONTROLLER_ACTOR)
+            self.ledger.set_action_state(
+                action_id, "applied", f"dispatched_unverified: {verify_error}",
+                CONTROLLER_ACTOR)
         except AdapterError as e:
             self.ledger.record_attempt(action_id=action_id, phase="apply",
                                        ok=False, detail={"error": str(e)},

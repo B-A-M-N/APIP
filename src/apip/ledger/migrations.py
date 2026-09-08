@@ -353,6 +353,46 @@ ALTER TABLE sources ADD COLUMN IF NOT EXISTS key_id TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_sources_key_id
     ON sources (key_id) WHERE key_id IS NOT NULL;
 """),
+    (13, "evidence observation identity (audit P1 #16)", """
+-- A failed/resumed batch re-runs upsert_indicator(); the indicator itself
+-- is idempotent but its evidence rows were re-INSERTed blindly — duplicate
+-- provenance growth. Every evidence record gets a deterministic
+-- observation identity (hash of the full observation tuple); a resumed
+-- batch re-inserting the same observation is a no-op at the database.
+ALTER TABLE evidence ADD COLUMN IF NOT EXISTS observation_hash TEXT;
+UPDATE evidence SET observation_hash = md5(
+    coalesce(indicator_id,'') || '|' || coalesce(kind,'') || '|' ||
+    coalesce(source_id,'') || '|' || coalesce(channel_source,'') || '|' ||
+    coalesce(observed_at::text,'') || '|' || coalesce(detail::text,''))
+WHERE observation_hash IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_evidence_observation
+    ON evidence (indicator_id, observation_hash);
+"""),
+    (14, "decoupled ingest queue (audit P1 #15)", """
+-- POST /ingest durably ACCEPTS a batch (raw payload persisted) and a
+-- bounded worker drains it — one HTTP request no longer runs the whole
+-- pipeline (parse -> evaluate -> compile) inline. 'queued' is the accepted-
+-- not-yet-claimed state; the existing resume semantics cover a crash in
+-- any state.
+DO $$ DECLARE c TEXT;
+BEGIN
+    SELECT conname INTO c FROM pg_constraint
+    WHERE conrelid = 'ingest_batches'::regclass AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%status%';
+    IF c IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE ingest_batches DROP CONSTRAINT %I', c);
+    END IF;
+END $$;
+ALTER TABLE ingest_batches ADD CONSTRAINT ingest_batches_status_check
+    CHECK (status IN ('queued', 'processing', 'complete', 'failed'));
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS raw_payload BYTEA;
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS failure TEXT;
+CREATE INDEX IF NOT EXISTS idx_batches_queue
+    ON ingest_batches (received_at) WHERE status = 'queued';
+"""),
     (12, "tenant identity and credential scoping (audit P0 #8)", """
 -- Tenant identity becomes first-class and credential-authorized:
 --   1. a source credential declares the tenant ids it may submit for

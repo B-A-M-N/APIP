@@ -500,3 +500,22 @@ class SuricataAdapter:
             base["status"] = "ok"
             base["note"] = "ruleset not yet created (no applies yet)"
         return base
+
+    def probe_startup(self) -> None:
+        """Startup capability probe (audit P1 #13). SHADOW+ for Suricata is
+        ruleset compilation only until a reload path exists (beta
+        truthfulness), so the probe exercises exactly what is claimed: the
+        artifact directory accepts writes."""
+        if self._mode == "OFF":
+            return
+        from apip.adapters.base import AdapterError
+        path = self._rules_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            probe = path.parent / ".apip-capability-probe"
+            probe.write_text("probe", encoding="utf-8")
+            probe.unlink()
+        except OSError as e:
+            raise AdapterError(
+                f"suricata capability probe failed: rules dir "
+                f"{path.parent} is not writable: {e}") from e

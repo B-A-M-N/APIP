@@ -98,6 +98,13 @@ class AdapterConfig:
     # came too soon" defers the load), so this must cover a worst-case deferral
     # — several multiples of the zone's refresh timer — not just one query.
     revoke_verify_budget_s: float = 75.0
+    # Whole-artifact validation before publication (audit P1 #14): a
+    # configurable trusted parser command (argv template; e.g.
+    # "named-checkzone {zone} {file}") run against the COMPLETE new
+    # generation in its temp file. A non-zero exit refuses the publish —
+    # the live artifact is never replaced by a zone the real parser
+    # rejects. Empty = structural validation only.
+    zone_validate_command: str = ""
     # -- Suricata IPS / file exporter --------------------------------------
     suricata_mode: str = "OFF"          # OFF | OBSERVE | SHADOW | ENFORCE
     suricata_rules_dir: str = "/var/lib/apip/suricata"
@@ -187,6 +194,8 @@ def load_config(path: str | Path | None = None) -> ServiceConfig:
         verify_timeout_s=float(_get(raw, "adapter.verify_timeout_s", 3.0)),
         revoke_verify_budget_s=float(
             _get(raw, "adapter.revoke_verify_budget_s", 75.0)),
+        zone_validate_command=str(
+            _get(raw, "adapter.zone_validate_command", "")),
         suricata_mode=str(_get(raw, "adapter.suricata_mode", "OFF")).upper(),
         suricata_rules_dir=str(_get(raw, "adapter.suricata_rules_dir", "/var/lib/apip/suricata")),
         suricata_rules_file=str(_get(raw, "adapter.suricata_rules_file", "apip.rules")),

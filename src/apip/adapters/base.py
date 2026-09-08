@@ -105,3 +105,9 @@ class EnforcementAdapter(Protocol):
     def health(self) -> dict:
         """Adapter health: status + configuration summary."""
         ...
+
+    def probe_startup(self) -> None:
+        """Startup capability probe (audit P1 #13): physically exercise the
+        posture's prerequisites before the controller accepts work. Raises
+        AdapterError to refuse startup; a no-op default is fine."""
+        ...

@@ -174,10 +174,11 @@ def test_approve_compiles_and_applies_action(controller):
     assert action["mode"] == "SHADOW"
     assert action["state"] == "pending"
 
-    # manual dispatch applies it and records a REAL receipt (observed infra state)
+    # manual dispatch applies it, VERIFIES on apply (audit P1 #11), and
+    # records a REAL receipt (observed infra state)
     ctrl._dispatch_one(action)
     applied = ctrl.ledger.get_action(action["action_id"])
-    assert applied["state"] == "applied"
+    assert applied["state"] == "verified"
     receipts = ctrl.ledger.list_receipts(action["action_id"])
     assert receipts
     observed = receipts[0]["observed"]
@@ -386,6 +387,7 @@ def test_persisted_mode_survives_posture_flip_restart(controller):
     cfg_enf = replace(
         cfg,
         adapter=replace(cfg.adapter, rpz_mode="ENFORCE",
+                        reload_command="true",
                         verify_query_server="127.0.0.1",
                         verify_query_port=5333),
     )

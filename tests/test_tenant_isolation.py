@@ -80,7 +80,7 @@ def api():
     apply_migrations(db)
     db.close()
     ctrl = Controller(cfg)
-    ctrl.ledger.db.connect()
+    ctrl.start(wait_db_s=10)   # the decoupled-ingest worker runs here
     client = TestClient(build_app(cfg, controller=ctrl))
     try:
         yield client, ctrl
@@ -94,6 +94,24 @@ def api():
 
 
 HDR = {"Authorization": "Bearer apipt_test"}
+
+
+def _await_batch(client, token: str, batch_id: str,
+                 timeout_s: float = 10.0) -> dict:
+    """Poll the batch status endpoint until the bounded worker finishes
+    (audit P1 #15: ingest is decoupled — acceptance returns immediately)."""
+    import time as _time
+    deadline = _time.monotonic() + timeout_s
+    last: dict = {}
+    while _time.monotonic() < deadline:
+        r = client.get(f"/ingest/{batch_id}",
+                       headers={"x-apip-source-key": token})
+        if r.status_code == 200:
+            last = r.json()
+            if last.get("status") in ("complete", "failed"):
+                return last
+        _time.sleep(0.05)
+    return last
 
 SHARED_FQDN = "shared.operator.test"
 
@@ -125,12 +143,15 @@ def _register(client, source_id: str, tenants: list[str]) -> str:
 
 
 def _ingest(client, token: str, tag: str, value: str,
-            tenant: str | None) -> object:
+            tenant: str | None, wait: bool = True) -> object:
     headers = {"x-apip-source-key": token}
     if tenant:
         headers["x-apip-tenant"] = tenant
-    return client.post("/ingest", headers=headers,
-                       content=_payload(tag, value).encode())
+    r = client.post("/ingest", headers=headers,
+                    content=_payload(tag, value).encode())
+    if wait and r.status_code == 200:
+        _await_batch(client, token, r.json()["batch_id"])
+    return r
 
 
 def test_same_fqdn_two_tenants_distinct_durable_observables(api):

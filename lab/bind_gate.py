@@ -458,11 +458,14 @@ def _approve_and_dispatch(ctrl, did: str) -> tuple[str, dict]:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         action = ctrl.ledger.get_action(action_id)
-        if action["state"] in ("applied", "failed"):
+        # audit P1 #11: dispatch verifies on apply — the converged state
+        # is `verified`; `applied` (dispatched_unverified) or `failed`
+        # breaks the wait but is refused below.
+        if action["state"] in ("verified", "applied", "failed"):
             break
         time.sleep(0.05)
-    if action["state"] != "applied":
-        _fail(f"action {action_id} did not apply: {action}")
+    if action["state"] != "verified":
+        _fail(f"action {action_id} did not apply+verify: {action}")
     return action_id, action
 
 

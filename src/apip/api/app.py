@@ -271,18 +271,52 @@ def build_app(config: ServiceConfig,
                                     "is required")
         else:
             tenant_id = None
-        try:
-            results = controller.process_batch(
-                batch=batch, actor=src["source_id"],
-                tenant_id=tenant_id)
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(503, f"ingest processing failed: {e}") from e
+        # audit P1 #15: the request DURABLY ACCEPTS the batch (payload
+        # persisted, status 'queued') and returns immediately — the
+        # pipeline (evaluate -> decide -> compile) runs in the bounded
+        # worker, so one HTTP request can no longer tie itself to unbounded
+        # evaluation work or fail half-way through durable mutation. The
+        # queue IS the backpressure: acceptance is bounded by what can be
+        # persisted.
+        accepted = controller.ledger.accept_batch(
+            batch_id=batch.batch_id, source_id=batch.source_id,
+            raw_sha256=batch.raw_sha256, raw_payload=body,
+            indicator_count=len(batch.indicators),
+            demoted=batch.demoted_records, channel=batch.source_id,
+            tenant_id=tenant_id, actor=src["source_id"])
+        if not accepted:
+            # exact replay of already-accepted bytes: report the recorded
+            # status instead of re-queueing
+            outcome = controller.ingest_status(batch.batch_id) or {}
+            return {"batch_id": batch.batch_id,
+                    "source_id": batch.source_id,
+                    "status": outcome.get("status", "complete"),
+                    "indicators": outcome.get("indicator_count", 0),
+                    "demoted_records": batch.demoted_records,
+                    "replay": True}
         return {"batch_id": batch.batch_id, "source_id": batch.source_id,
-                "indicators": results["indicators"],
-                "demoted_records": batch.demoted_records,
-                "actions": results["actions"],
-                "demoted_to_observe": results["demoted"],
-                "replay": bool(results.get("replay"))}
+                "status": "queued",
+                "indicators": len(batch.indicators),
+                "demoted_records": batch.demoted_records}
+
+    @app.get("/ingest/{batch_id}")
+    def ingest_status(batch_id: str, src: dict = Depends(_ingest_source)) -> dict:
+        """Batch processing status (audit P1 #15): processing / complete /
+        failed with counts. Authentication is the same ingest credential —
+        a source sees batch status, not other sources'."""
+        outcome = controller.ingest_status(batch_id)
+        if outcome is None:
+            raise HTTPException(404, f"unknown batch {batch_id}")
+        if outcome["source_id"] != src["source_id"]:
+            raise HTTPException(403, "batch belongs to another source")
+        return {"batch_id": outcome["batch_id"],
+                "status": outcome["status"],
+                "indicator_count": outcome["indicator_count"],
+                "demoted_records": outcome["demoted_records"],
+                "received_at": str(outcome["received_at"] or ""),
+                "started_at": str(outcome["started_at"] or ""),
+                "completed_at": str(outcome["completed_at"] or ""),
+                "failure": outcome["failure"] or ""}
 
     # -- health ---------------------------------------------------------------
 

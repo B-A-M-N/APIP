@@ -175,14 +175,69 @@ VALUES (%s,%s,%s,%s,%s,%s,'complete')
         """Mark the batch 'complete' — only now is a replay of the same raw
         bytes a no-op (review P0 #11)."""
         self.db.execute(
-            "UPDATE ingest_batches SET status='complete' WHERE batch_id=%s",
-            (batch_id,))
+            "UPDATE ingest_batches SET status='complete', completed_at=now() "
+            "WHERE batch_id=%s", (batch_id,))
 
     def fail_batch(self, batch_id: str, error: str) -> None:
         self.db.execute(
-            "UPDATE ingest_batches SET status='failed' WHERE batch_id=%s",
-            (batch_id,))
+            "UPDATE ingest_batches SET status='failed', failure=%s, "
+            "completed_at=now() WHERE batch_id=%s",
+            (error[:400], batch_id))
         self.audit("controller", "ingest.failed", batch_id, {"error": error[:400]})
+
+    # -- decoupled ingest queue (audit P1 #15) --------------------------------
+
+    def accept_batch(self, *, batch_id: str, source_id: str, raw_sha256: str,
+                     raw_payload: bytes, indicator_count: int, demoted: int,
+                     channel: str, tenant_id: str | None,
+                     actor: str) -> bool:
+        """Durably ACCEPT a batch without running the pipeline: the raw
+        payload is persisted and the row lands 'queued'. Returns False for
+        a replay of already-accepted bytes (the API answers it from the
+        recorded status). The bounded worker claims 'queued' rows and runs
+        the SAME resumable unit of work process_batch has always used."""
+        try:
+            self.db.execute("""
+INSERT INTO ingest_batches (batch_id, source_id, raw_sha256, indicator_count,
+                            demoted_records, channel, status, raw_payload,
+                            tenant_id)
+VALUES (%s,%s,%s,%s,%s,%s,'queued',%s,%s)
+""", (batch_id, source_id, raw_sha256, indicator_count, demoted, channel,
+      psycopg2.Binary(raw_payload), tenant_id))
+        except psycopg2.errors.UniqueViolation:
+            self.audit(actor, "ingest.duplicate_ignored", batch_id,
+                       {"source_id": source_id})
+            return False
+        self.audit(actor, "ingest.accepted_queued", batch_id,
+                   {"source_id": source_id, "indicators": indicator_count,
+                    "demoted": demoted, "tenant_id": tenant_id})
+        return True
+
+    def claim_queued_batch(self) -> dict | None:
+        """Atomically claim the OLDEST queued batch for processing
+        (FOR UPDATE SKIP LOCKED): exactly one worker takes each batch, and
+        a crashed claimant leaves the row 'processing' — the existing
+        resume path."""
+        with self.db.connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+UPDATE ingest_batches SET status='processing', started_at=now()
+WHERE batch_id = (
+    SELECT batch_id FROM ingest_batches
+    WHERE status='queued'
+    ORDER BY received_at
+    FOR UPDATE SKIP LOCKED LIMIT 1)
+RETURNING batch_id, source_id, raw_payload, tenant_id, demoted_records
+""")
+                return cur.fetchone()
+
+    def batch_outcome(self, batch_id: str) -> dict | None:
+        """Processing status + counts for the ingest status surface."""
+        return self.db.query_one("""
+SELECT batch_id, source_id, status, indicator_count, demoted_records,
+       received_at, started_at, completed_at, failure
+FROM ingest_batches WHERE batch_id=%s
+""", (batch_id,))
 
     @staticmethod
     def observable_id(itype: str, canonical_value: str,
@@ -229,13 +284,23 @@ INSERT INTO indicator_source_refs (indicator_id, source_id)
 VALUES (%s,%s) ON CONFLICT DO NOTHING
 """, (durable_id, sid))
                 for ev in ind.evidence:
+                    # deterministic observation identity (audit P1 #16): a
+                    # resumed batch re-inserting the same observation is a
+                    # database no-op — the ledger never grows duplicate
+                    # provenance for one (indicator, observation) pair.
+                    observation_hash = hashlib.sha256(
+                        f"{ev.kind}|{ev.source_id}|{ev.channel_source}|"
+                        f"{ev.observed_at or ''}|"
+                        f"{sorted((ev.detail or {}).items())}|{batch_id}"
+                        .encode()).hexdigest()
                     cur.execute("""
 INSERT INTO evidence (indicator_id, batch_id, kind, source_id, channel_source,
-                      observed_at, detail)
-VALUES (%s,%s,%s,%s,%s,%s,%s)
+                      observed_at, detail, observation_hash)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+ON CONFLICT (indicator_id, observation_hash) DO NOTHING
 """, (durable_id, batch_id, ev.kind, ev.source_id, ev.channel_source,
       None if not ev.observed_at else ev.observed_at,
-      psycopg2.extras.Json(ev.detail)))
+      psycopg2.extras.Json(ev.detail), observation_hash))
         return durable_id
 
     # -- decisions ------------------------------------------------------------

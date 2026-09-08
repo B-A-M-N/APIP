@@ -882,6 +882,50 @@ RETURNING leader_id
         return self.db.query_one(
             "SELECT * FROM indicators WHERE indicator_id=%s", (indicator_id,))
 
+    def all_indicator_values(self) -> list[dict]:
+        """The full (indicator_id, value, tenant_id) population — the
+        behavioral attachment frontier needs to match detections against
+        EVERY known value, not a recent page."""
+        return self.db.query(
+            "SELECT indicator_id, value, tenant_id FROM indicators")
+
+    def attach_evidence_fields(self, *, indicator_id: str, kind: str,
+                               source_id: str,
+                               observed_at: str | None,
+                               detail: dict) -> bool:
+        """Persist one behavioral detection as durable evidence under the
+        governed local-behavioral principal (audit #22). Idempotent through
+        the observation identity (audit P1 #16): re-emitting the same
+        detection is a no-op. Returns True when a NEW evidence row landed.
+        The indicator's last_seen advances — the detection IS a sighting."""
+        # deterministic observation identity; batch_id is fixed for the
+        # live feed (its provenance is the controller, not a batch)
+        observation_hash = hashlib.sha256(
+            f"{kind}|{source_id}||{observed_at or ''}|"
+            f"{sorted((detail or {}).items())}|behavioral-live".encode()
+        ).hexdigest()
+        with self.db.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+INSERT INTO evidence (indicator_id, batch_id, kind, source_id, channel_source,
+                      observed_at, detail, observation_hash)
+VALUES (%s,NULL,%s,%s,'',%s,%s,%s)
+ON CONFLICT (indicator_id, observation_hash) DO NOTHING
+RETURNING evidence_id
+""", (indicator_id, kind, source_id,
+       None if not observed_at else observed_at,
+       psycopg2.extras.Json(detail), observation_hash))
+                landed = cur.fetchone() is not None
+                if landed:
+                    # the detection IS a sighting: advance last_seen when
+                    # this observation is newer than the recorded one
+                    if observed_at:
+                        cur.execute("""
+UPDATE indicators SET last_seen = %s
+WHERE indicator_id=%s AND last_seen < %s
+""", (observed_at, indicator_id, observed_at))
+        return landed
+
     def set_indicator_tenant(self, indicator_id: str, tenant_id: str | None,
                              actor: str) -> bool:
         row = self.db.query_one(

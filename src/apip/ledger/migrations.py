@@ -467,6 +467,17 @@ CREATE UNIQUE INDEX uq_approvals_per_decision
     ON decision_approvals (decision_id, decision_seq);
 CREATE INDEX idx_approvals_decision ON decision_approvals(decision_id, created_at DESC);
 """),
+    (15, "behavioral live evidence (audit #17-#22): server-derived rows", """
+-- Behavioral detections attach OUTSIDE an ingest batch: their provenance
+-- is the controller itself (the governed local-behavioral principal,
+-- audit #22), not a source-submitted batch. batch_id becomes nullable;
+-- observation_hash becomes NOT NULL — every behavioral row still carries
+-- its deterministic observation identity (audit P1 #16).
+ALTER TABLE evidence ALTER COLUMN batch_id DROP NOT NULL;
+ALTER TABLE evidence ALTER COLUMN observation_hash SET NOT NULL;
+CREATE INDEX idx_evidence_behavioral ON evidence (source_id)
+    WHERE batch_id IS NULL;
+"""),
 ]
 
 

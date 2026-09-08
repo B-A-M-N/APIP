@@ -29,13 +29,15 @@ _CLOCK_SKEW = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
 # anything else fails closed rather than shipping an inert knob.
 _SUPPORTED_RANDOMIZATION_MECHANISMS = frozenset({"ttl_jitter", "rate_ceiling"})
 
-# Behavioral families IMPLEMENTED by the runtime (apip.telemetry.behavioral).
-IMPLEMENTED_FAMILIES = frozenset({"beacon_periodicity", "first_seen_novelty"})
-# Explicitly UNIMPLEMENTED: a policy may name them (the gate stays honest),
-# and the runtime records them as pending rather than pretending to detect.
-PENDING_FAMILIES = frozenset({"dga_likelihood", "dns_tunneling", "fastflux",
-                              "volume_anomaly", "tls_metadata_mismatch",
-                              "sync_first_contact"})
+# Behavioral families come from ONE source of truth: the detector runtime
+# (apip.telemetry.behavioral, audit #23). All eight docs/23 families are
+# implemented as bounded deterministic detectors; PENDING_FAMILIES is empty
+# so an operator requesting a family is never told it exists while detecting
+# nothing.
+from apip.telemetry.behavioral import (  # noqa: E402
+    IMPLEMENTED_FAMILIES,
+    PENDING_FAMILIES,
+)
 
 _LADDER_ORDER = ["L1", "L2", "L4", "L5"]
 

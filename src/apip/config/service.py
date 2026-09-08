@@ -73,6 +73,17 @@ class ControllerConfig:
     default_action_ttl_s: int = 3600
     # Maximum TTL the controller will honor (seconds) — hard ceiling.
     max_action_ttl_s: int = 86400
+    # Behavioral telemetry (audit #17): a Suricata EVE JSON file to tail as
+    # the live behavioral datasource. Empty = no live telemetry source (the
+    # detectors stay inert; health says so honestly). When set, the
+    # controller runs the checkpointed EVE reader on its lifecycle and
+    # attaches emitted detections to ingested indicators each reconcile
+    # pass.
+    suricata_eve_path: str = ""
+    # Behavioral families the live feed may detect (audit #23's twin: the
+    # live feed's enabled set must mirror the policy's, not silently exceed
+    # it). Empty = derive from the active policy at start.
+    behavioral_enabled_families: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -180,6 +191,11 @@ def load_config(path: str | Path | None = None) -> ServiceConfig:
         verify_interval_s=float(_get(raw, "controller.verify_interval_s", 300.0)),
         default_action_ttl_s=int(_get(raw, "controller.default_action_ttl_s", 3600)),
         max_action_ttl_s=int(_get(raw, "controller.max_action_ttl_s", 86400)),
+        suricata_eve_path=str(_get(raw, "controller.suricata_eve_path", "")),
+        behavioral_enabled_families=tuple(
+            str(f) for f in
+            (_get(raw, "controller.behavioral_enabled_families", None)
+             or ())),
     )
     adapter = AdapterConfig(
         rpz_mode=str(_get(raw, "adapter.rpz_mode", "SHADOW")).upper(),

@@ -309,6 +309,16 @@ def _current_epoch(policy: Policy) -> str:
     return "0"
 
 
+def _family_of_kind(kind: str) -> str | None:
+    """`behavioral_<family>` -> `<family>`; None for non-behavioral kinds
+    or a `behavioral_` kind that names no detector family (which is a
+    provenance problem, not a policy-gated family)."""
+    if not kind.startswith(BEHAVIORAL_PREFIX):
+        return None
+    fam = kind[len(BEHAVIORAL_PREFIX):]
+    return fam or None
+
+
 def _behavioral_families(indicator: Indicator, registry) -> set[str]:
     fams: set[str] = set()
     for ev in indicator.evidence:
@@ -474,18 +484,36 @@ def select_rung(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip: 
     return rung, action, reasons, selector, rand_records
 
 
-def _decision_bearing_evidence(indicator: Indicator, registry) -> Indicator:
+def _decision_bearing_evidence(indicator: Indicator, registry,
+                               policy: Policy | None = None
+                               ) -> tuple[Indicator, tuple[str, ...]]:
     """Reference P0-4: strip non-authoritative records BEFORE dedup/cap/score
-    so their quantity/order/size can never touch the decision."""
-    kept = [
-        ev for ev in indicator.evidence
-        if registry.effective_class(ev.source_id) not in ZERO_WEIGHT_CLASSES
-    ]
+    so their quantity/order/size can never touch the decision.
+
+    Audit #23: behavioral evidence of a family the effective policy has NOT
+    enabled is likewise non-decision-bearing — an operator disabling a
+    family in policy must not have scoring silently consume it when it
+    enters the ledger. Returns the bounded indicator plus the disabled
+    family kinds dropped (surfaced as reason codes)."""
+    kept = []
+    dropped_disabled: list[str] = []
+    for ev in indicator.evidence:
+        if registry.effective_class(ev.source_id) in ZERO_WEIGHT_CLASSES:
+            continue
+        if (policy is not None and ev.kind.startswith(BEHAVIORAL_PREFIX)
+                and _family_of_kind(ev.kind) is not None
+                and policy.enabled_behavioral_families
+                and _family_of_kind(ev.kind)
+                not in policy.enabled_behavioral_families):
+            dropped_disabled.append(ev.kind)
+            continue
+        kept.append(ev)
     if len(kept) == len(indicator.evidence):
-        return indicator
-    return Indicator(
+        return indicator, ()
+    return (Indicator(
         id=indicator.id, type=indicator.type, value=indicator.value,
-        sources=indicator.sources, evidence=tuple(kept), tags=indicator.tags)
+        sources=indicator.sources, evidence=tuple(kept), tags=indicator.tags),
+        tuple(dropped_disabled))
 
 
 def _bounded_evidence(indicator: Indicator, policy: Policy) -> tuple[Indicator, int]:
@@ -556,9 +584,12 @@ def evaluate(indicator: Indicator, policy: Policy,
     protocol_class = context.get("protocol_class")
     registry = policy.source_registry
 
-    indicator = _decision_bearing_evidence(indicator, registry)
+    indicator, disabled_fams = _decision_bearing_evidence(
+        indicator, registry, policy)
     indicator, dup_dropped = dedup_evidence(indicator, registry)
     reasons_base = {f"evidence_deduplicated:{dup_dropped}"} if dup_dropped else set()
+    for fam in sorted(set(disabled_fams)):
+        reasons_base.add(f"behavioral_family_disabled_by_policy:{fam}")
     indicator, ev_dropped = _bounded_evidence(indicator, policy)
 
     classifier = make_recency_classifier(policy)

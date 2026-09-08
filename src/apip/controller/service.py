@@ -11,6 +11,7 @@ written to the ledger, and a crashed pass loses nothing.
 """
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 import uuid
@@ -195,6 +196,17 @@ class Controller:
         self._leader_id = "controller--" + uuid.uuid4().hex[:12]
         self._lease_s = int(2 * max(1, self.config.controller.reconcile_interval_s))
         self._lease_lock = threading.Lock()
+        # audit #17: the live behavioral frontier. The feed is always owned
+        # (health honestly reports an inert feed when no datasource is
+        # configured); the EVE reader exists only when configured.
+        from apip.telemetry.feed import LiveBehavioralFeed
+        families = self.config.controller.behavioral_enabled_families or None
+        self.behavioral_feed = LiveBehavioralFeed(enabled_families=families)
+        self.eve_source = None
+        if self.config.controller.suricata_eve_path:
+            from apip.telemetry.sources.suricata_eve import SuricataEveSource
+            self.eve_source = SuricataEveSource(
+                self.behavioral_feed, self.config.controller.suricata_eve_path)
 
     def _acquire_or_renew_lease(self) -> bool:
         """Refresh the worker lease atomically; True only for the live leader.
@@ -233,6 +245,30 @@ class Controller:
             probe = getattr(adapter, "probe_startup", None)
             if callable(probe):
                 probe()
+        # audit #22: the local behavioral feed's evidence identity is a
+        # GOVERNED, server-derived principal — registered at startup so
+        # detections written to the ledger never land under an unregistered
+        # id (zero silent authority). Deterministic local detectors only:
+        # allowed_kinds pins exactly the behavioral_* families the runtime
+        # implements.
+        from apip.telemetry.behavioral import (
+            LOCAL_BEHAVIORAL_SOURCE_ID, BEACON_KIND, NOVELTY_KIND,
+            DGA_KIND, TUNNEL_KIND, FASTFLUX_KIND, VOLUME_KIND, TLS_KIND,
+            SYNC_KIND,
+        )
+        self.ledger.register_source(
+            source_id=LOCAL_BEHAVIORAL_SOURCE_ID, source_class="local",
+            independent=False,
+            auto_enforcement_allowed=False,
+            key_hash=hashlib.sha256(
+                b"server-derived:local-behavioral").hexdigest(),
+            actor=CONTROLLER_ACTOR,
+            allowed_kinds=(BEACON_KIND, NOVELTY_KIND, DGA_KIND, TUNNEL_KIND,
+                           FASTFLUX_KIND, VOLUME_KIND, TLS_KIND, SYNC_KIND),
+            provenance_note=(
+                "server-derived local behavioral detectors (deterministic, "
+                "AI-free); no external key — not independently corroborative "
+                "by construction"))
         self.ledger.audit(CONTROLLER_ACTOR, "controller.start", "", {})
         self.state.started_at = datetime.now(timezone.utc)
         self._refresh_policy_state()
@@ -245,11 +281,16 @@ class Controller:
             t = threading.Thread(target=target, name=f"apip-{name}", daemon=True)
             t.start()
             self._threads.append(t)
+        # audit #17: the EVE datasource runs under the controller lifecycle
+        if self.eve_source is not None:
+            self.eve_source.start_thread()
         self.ledger.audit(CONTROLLER_ACTOR, "controller.workers_started",
                           "", {"interval_s": interval})
 
     def stop(self) -> None:
         self._stop.set()
+        if self.eve_source is not None:
+            self.eve_source.stop()
         for t in self._threads:
             t.join(timeout=10)
         try:
@@ -975,6 +1016,49 @@ class Controller:
         older_than = now - timedelta(seconds=self.config.controller.verify_interval_s)
         for action in self.ledger.actions_needing_verification(older_than):
             self._verify_action(action)
+        # 3. behavioral attachment (audit #17/#19/#20): the leader folds the
+        #    live feed's retained detections onto KNOWN indicators only —
+        #    a detection for a value nobody ingested stays dormant in the
+        #    feed's bounded pending cache (no authority from thin air).
+        #    Evidence lands under the governed local-behavioral principal
+        #    (audit #22) through the normal observation-identity path, and
+        #    the indicator is RE-DECIDED so fresh behavioral facts can move
+        #    a decision — policy gates (incl. enabled families, audit #23)
+        #    apply exactly as to any other evidence.
+        self._attach_behavioral_evidence(now)
+
+    def _attach_behavioral_evidence(self, now) -> None:
+        feed = self.behavioral_feed
+        known: dict[str, str] = {}
+        for row in self.ledger.all_indicator_values():
+            known[row["value"]] = row["indicator_id"]
+        if not known and not feed.pending_unknown:
+            return
+        records = feed.attach_to_indicators(known,
+                                            now_epoch=int(now.timestamp()))
+        attached = 0
+        for rec in records:
+            ind_id = rec.get("indicator_id")
+            if not ind_id:
+                continue
+            try:
+                durable = self.ledger.attach_evidence_fields(
+                    indicator_id=ind_id, kind=rec["kind"],
+                    source_id=rec["source_id"],
+                    observed_at=rec.get("observed_at"),
+                    detail=rec.get("detail") or {})
+            except Exception:      # noqa: BLE001 — one bad record must not
+                continue           # stop the sweep; counted upstream
+            if durable:
+                attached += 1
+                self.ledger.audit(CONTROLLER_ACTOR,
+                                  "behavioral.evidence_attached",
+                                  ind_id, {"kind": rec["kind"],
+                                           "target": rec.get("target")})
+                self.pipeline.decide_indicator(
+                    ind_id, CONTROLLER_ACTOR,
+                    tenant_id=(self.ledger.get_indicator(ind_id) or {})
+                    .get("tenant_id"))
 
     def _verify_action(self, action: dict) -> None:
         action_id = action["action_id"]
@@ -1079,10 +1163,25 @@ class Controller:
             pipeline_ok = False
         adapter_health = self.adapter.health()
         adapters_health = self.adapters_status()
-        return self.state.snapshot(
+        snap = self.state.snapshot(
             db_health=db_health, ledger=self.ledger if db_health.get("status") == "up" else None,
             adapter_health=adapter_health, adapters_health=adapters_health,
             registry_rows=registry_rows, pipeline_ok=pipeline_ok)
+        # audit #17: the live behavioral frontier is a health surface — an
+        # inert feed (no datasource) says so; a configured source reports
+        # its own lag/drop counters.
+        snap["behavioral"] = self.behavioral_status()
+        return snap
+
+    def behavioral_status(self) -> dict:
+        feed = self.behavioral_feed.health()
+        feed["source"] = (self.eve_source.stats()
+                          if self.eve_source is not None else
+                          {"configured": False,
+                           "note": "no telemetry datasource configured "
+                                   "(controller.suricata_eve_path empty); "
+                                   "live detectors are inert"})
+        return feed
 
     def adapters_status(self) -> list[dict]:
         """Health for every configured enforcement adapter (defense in depth —

@@ -46,6 +46,13 @@ VOLUME_KIND = "behavioral_volume_anomaly"
 TLS_KIND = "behavioral_tls_metadata_mismatch"
 SYNC_KIND = "behavioral_sync_first_contact"
 
+# Audit #22: the ONE governed identity behavioral detections are attributed
+# to. The controller registers it at startup as a server-derived LOCAL
+# evidence principal (local class, auto-enforcement allowed, deterministic
+# detectors only) — detections are never written under an unregistered id
+# that would silently carry zero authority.
+LOCAL_BEHAVIORAL_SOURCE_ID = "local-behavioral"
+
 # Plausible beacon intervals (integer seconds): between 10s and 1h.
 MIN_MEDIAN_GAP_S = 10
 MAX_MEDIAN_GAP_S = 3600
@@ -132,7 +139,7 @@ class Detection:
         detail.update(self.extra)
         return {
             "kind": self.kind,
-            "source_id": "local-behavioral",
+            "source_id": LOCAL_BEHAVIORAL_SOURCE_ID,
             "observed_at": self.observed_at,
             "detail": detail,
         }

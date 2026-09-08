@@ -19,16 +19,25 @@ from pathlib import Path
 import click
 import httpx
 
-DEFAULT_BASE = "http://127.0.0.1:8510"
+from apip.config.service import DEFAULT_API_PORT
+
+# Audit #30: derived from the server's own default port so the documented
+# `apip serve` + `apip status` defaults can never disagree again.
+DEFAULT_BASE = f"http://127.0.0.1:{DEFAULT_API_PORT}"
 
 
 class Client:
-    def __init__(self, base: str | None = None, operator_token: str | None = None):
+    def __init__(self, base: str | None = None, operator_token: str | None = None,
+                 source_key: str | None = None):
         self.base = (base or os.environ.get("APIP_BASE", DEFAULT_BASE)).rstrip("/")
         self.token = operator_token or os.environ.get("APIP_OPERATOR_TOKEN", "")
+        headers = {"Authorization":
+                   f"Bearer {self.token}"} if self.token else {}
+        if source_key or os.environ.get("APIP_SOURCE_KEY"):
+            headers["x-apip-source-key"] = (source_key
+                                            or os.environ.get("APIP_SOURCE_KEY", ""))
         self._h = httpx.Client(base_url=self.base, timeout=30.0,
-                               headers={"Authorization":
-                                         f"Bearer {self.token}"} if self.token else {})
+                               headers=headers)
 
     def _request(self, method: str, path: str, **kw) -> dict:
         r = self._h.request(method, path, **kw)
@@ -51,9 +60,12 @@ class Client:
     def post(self, path: str, **kw) -> dict:
         return self._request("POST", path, **kw)
 
+    def delete(self, path: str, **kw) -> dict:
+        return self._request("DELETE", path, **kw)
 
-def _client(*, base=None, token=None) -> Client:
-    return Client(base=base, operator_token=token)
+
+def _client(*, base=None, token=None, source_key=None) -> Client:
+    return Client(base=base, operator_token=token, source_key=source_key)
 
 
 def _table(rows: list[dict], cols: list[str]) -> None:
@@ -74,6 +86,7 @@ def _table(rows: list[dict], cols: list[str]) -> None:
 @click.option("--base", envvar="APIP_BASE", default=None, help="controller API base URL")
 @click.option("--token", envvar="APIP_OPERATOR_TOKEN", default=None,
               help="operator bearer token (prefer env)")
+@click.version_option(package_name="apip-beta", prog_name="apip")
 @click.pass_context
 def cli(ctx: click.Context, base: str | None, token: str | None) -> None:
     """APIP operator CLI. Deterministic, AI-free defensive control plane."""
@@ -87,11 +100,14 @@ def cli(ctx: click.Context, base: str | None, token: str | None) -> None:
 @cli.command()
 @click.pass_context
 def status(ctx: click.Context) -> None:
-    """Overall controller + subsystem health."""
+    """Overall controller + subsystem health (authenticated rich snapshot).
+
+    Reads GET /status (operator token required); the unauthenticated
+    /health is a bare liveness word with no component detail by design."""
     api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
-    h = api.get("/health")
+    h = api.get("/status")
     if not isinstance(h.get("components"), dict):
-        click.echo(click.style("unknown health shape: " + str(h), fg="yellow"))
+        click.echo(click.style("unknown status shape: " + str(h), fg="yellow"))
         return
     components = h["components"]
     click.echo(f"APIP {h.get('api_version','?')}")
@@ -174,27 +190,41 @@ def source_disable(ctx: click.Context, source_id: str) -> None:
               help="source class: local|curated|community|annotation")
 @click.option("--independent/--no-independent", default=False,
               help="source is independent for corroboration counting")
-@click.option("--no-auto-enforce", is_flag=True, default=False,
-              help="this source's evidence may not drive auto-enforcement")
+@click.option("--auto-enforce", is_flag=True, default=False,
+              help="OPT-IN: this source's evidence may drive auto-enforcement "
+                   "(audit #34: default is observation-only)")
 @click.option("--upstream", default=None,
               help="upstream source ids this channel proven to carry (comma-sep)")
 @click.option("--provenance-note", default="", help="free-text provenance")
 @click.pass_context
 def source_register(ctx: click.Context, source_id: str, source_class: str,
-                    independent: bool, no_auto_enforce: bool,
+                    independent: bool, auto_enforce: bool,
                     upstream: str | None, provenance_note: str) -> None:
     """Register an ingest source. Prints the one-time source secret key —
-    store it now (it is not retrievable again)."""
+    store it now (it is not retrievable again). New sources are
+    observation-only unless --auto-enforce is passed."""
     api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
     r = api.post("/sources/register", json={
         "source_id": source_id,
         "source_class": source_class,
         "independent": independent,
-        "auto_enforcement_allowed": not no_auto_enforce,
+        "auto_enforcement_allowed": auto_enforce,
         "upstream": upstream,
         "provenance_note": provenance_note,
     })
     click.echo(f"registered {r['source_id']}")
+    click.echo(f"  source_key (store securely): {r['source_key']}")
+    click.echo(f"  {r.get('note','')}")
+
+
+@source.command("rotate")
+@click.argument("source_id")
+@click.pass_context
+def source_rotate(ctx: click.Context, source_id: str) -> None:
+    """Rotate a source's credential (prints the new one-time secret key)."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    r = api.post(f"/sources/{source_id}/rotate")
+    click.echo(f"rotated credential for {r['source_id']}")
     click.echo(f"  source_key (store securely): {r['source_key']}")
     click.echo(f"  {r.get('note','')}")
 
@@ -246,7 +276,7 @@ def indicator_list(ctx: click.Context, limit: int) -> None:
     """List indicators."""
     api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
     rows = api.get("/indicators", params={"limit": limit}).get("indicators", [])
-    _table(rows, ["indicator_id", "type", "value", "sources", "created_at"])
+    _table(rows, ["indicator_id", "itype", "value", "first_seen", "last_seen"])
 
 
 @indicator.command("show")
@@ -284,7 +314,8 @@ def decision_list(ctx: click.Context, limit: int, disposition: str | None) -> No
     if disposition:
         params["disposition"] = disposition
     rows = api.get("/decisions", params=params).get("decisions", [])
-    _table(rows, ["decision_id", "disposition", "score_m", "action", "indicator_id", "created_at"])
+    _table(rows, ["decision_id", "disposition", "maliciousness", "action",
+                  "indicator_id", "created_at"])
 
 
 @decision.command("show")
@@ -298,10 +329,12 @@ def decision_show(ctx: click.Context, decision_id: str) -> None:
     click.echo(f"decision {d.get('decision_id')}")
     click.echo(f"  indicator: {d.get('indicator_id')}")
     click.echo(f"  disposition: {d.get('disposition')}")
-    click.echo(f"  score_m: {d.get('score_m')}  action: {d.get('action')}")
+    click.echo(f"  maliciousness: {d.get('maliciousness')}  "
+               f"action_safety: {d.get('action_safety')}  action: {d.get('action')}")
     click.echo(f"  reason_codes: {d.get('reason_codes')}")
-    click.echo(f"  policy: {d.get('policy_version')}@{d.get('policy_revision')} "
-               f"content_sha256={d.get('content_sha256')}")
+    click.echo(f"  seq: {d.get('seq')}  content_hash: {d.get('content_hash')}")
+    click.echo(f"  policy: {d.get('policy_version')} "
+               f"content_sha256={d.get('policy_content_sha256')}")
     click.echo("evidence:")
     for ev in data.get("evidence", []):
         click.echo(f"  - {ev.get('kind')} source={ev.get('source_id')} obs={ev.get('observed_at')}")
@@ -316,11 +349,12 @@ def decision_explain(ctx: click.Context, decision_id: str) -> None:
     data = api.get(f"/decisions/{decision_id}")
     d = data.get("decision", {})
     click.echo(f"Why APIP reaches {d.get('disposition')} for {d.get('indicator_id')}:")
-    click.echo(f"  composite score m={d.get('score_m')}")
+    click.echo(f"  composite maliciousness m={d.get('maliciousness')} "
+               f"action_safety s={d.get('action_safety')}")
     click.echo(f"  reason codes: {', '.join(d.get('reason_codes') or [])}")
     click.echo(f"  action: {d.get('action')} (ttl_seconds={d.get('ttl_seconds')})")
-    click.echo(f"  authorized by policy {d.get('policy_version')}@{d.get('policy_revision')} "
-               f"({d.get('content_sha256')})")
+    click.echo(f"  authorized by policy {d.get('policy_version')} "
+               f"({d.get('policy_content_sha256')})")
     click.echo("evidence contributing:")
     for ev in data.get("evidence", []):
         kind, sid = ev.get("kind"), ev.get("source_id")
@@ -331,8 +365,9 @@ def decision_explain(ctx: click.Context, decision_id: str) -> None:
 
 @decision.command("approve")
 @click.argument("decision_id")
+@click.option("--reason", default="", help="why this approval was granted")
 @click.pass_context
-def decision_approve(ctx: click.Context, decision_id: str) -> None:
+def decision_approve(ctx: click.Context, decision_id: str, reason: str) -> None:
     """Compile a PROPOSE_OPERATOR_APPROVAL decision into action(s).
 
     The decision is rebuilt from ledger state (never re-decided), re-checked
@@ -340,10 +375,44 @@ def decision_approve(ctx: click.Context, decision_id: str) -> None:
     adapter. Audited with the operator identity.
     """
     api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
-    r = api.post(f"/decisions/{decision_id}/approve")
+    r = api.post(f"/decisions/{decision_id}/approve",
+                 json={"reason": reason} if reason else None)
+    if not r.get("compiled"):
+        click.echo("DECISION VALID / MATERIALIZATION UNAVAILABLE "
+                   "(audit #29): no configured adapter compiles this "
+                   "decision; nothing was approved into execution.")
+        for g in (r.get("materialization") or {}).get("gaps", []):
+            click.echo(f"  gap: {g}")
+        return
     click.echo(f"approved {decision_id} -> {len(r.get('action_ids', []))} action(s)")
     for aid in r.get("action_ids", []):
         click.echo(f"  {aid}")
+
+
+@decision.command("reject")
+@click.argument("decision_id")
+@click.option("--reason", default="operator_rejected",
+              help="recorded rejection reason (audit trail)")
+@click.pass_context
+def decision_reject(ctx: click.Context, decision_id: str, reason: str) -> None:
+    """Durably reject a proposal: this decision instance can NEVER be
+    approved afterwards."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    r = api.post(f"/decisions/{decision_id}/reject",
+                 json={"reason": reason})
+    click.echo(f"rejected {decision_id} ({r.get('state', 'rejected')})")
+
+
+@decision.command("approvals")
+@click.option("--limit", default=50, type=int)
+@click.pass_context
+def decision_approvals(ctx: click.Context, limit: int) -> None:
+    """Approval history: who approved what, when, citing which exact
+    decision instance."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    rows = api.get("/approvals", params={"limit": limit}).get("approvals", [])
+    _table(rows, ["approval_id", "decision_id", "decision_seq", "actor",
+                  "created_at", "reason"])
 
 
 @decision.command("replay")
@@ -564,6 +633,94 @@ def adapter_status(ctx: click.Context, name: str) -> None:
         click.echo(f"{k:<22} {v}")
 
 
+@adapter.command("capabilities")
+@click.pass_context
+def adapter_capabilities(ctx: click.Context) -> None:
+    """The TRUTHFUL capability matrix (audit #29): what each adapter can
+    actually materialize — action types, indicator types, selector shapes,
+    maximum posture, and whether enforcement is independently verifiable."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    for row in api.get("/adapters").get("adapters", []):
+        name = row.get("name", "?")
+        click.echo(f"{name}:")
+        for k in ("action_types", "indicator_types", "selector_shapes",
+                  "max_posture", "independent_verify"):
+            if k in row:
+                click.echo(f"  {k}: {row[k]}")
+
+
+# -- tenant overlays ------------------------------------------------------
+
+@cli.group("tenant")
+def tenant() -> None:
+    """Per-tenant policy overlays (stage/show/remove/history)."""
+
+
+@tenant.command("stage")
+@click.argument("tenant_id")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False))
+@click.pass_context
+def tenant_stage(ctx: click.Context, tenant_id: str, path: str) -> None:
+    """Stage a stricter-than-global overlay for one tenant (deterministic
+    monotonic merge; the effective policy is never more permissive than
+    the global)."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    r = api.post(f"/tenants/{tenant_id}/overlay",
+                 json={"text": Path(path).read_text()})
+    for p in r.get("problems", []):
+        click.echo(f"  PROBLEM: {p}")
+    if r.get("accepted"):
+        click.echo(f"staged overlay for {tenant_id}")
+    else:
+        raise click.ClickException("overlay did not validate; not staged")
+
+
+@tenant.command("show")
+@click.argument("tenant_id")
+@click.pass_context
+def tenant_show(ctx: click.Context, tenant_id: str) -> None:
+    """Show one tenant's staged overlay."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    r = api.get(f"/tenants/{tenant_id}/overlay")
+    click.echo(f"tenant {tenant_id}: {r.get('overlay', {})}")
+
+
+@tenant.command("list")
+@click.pass_context
+def tenant_list(ctx: click.Context) -> None:
+    """List all staged tenant overlays."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    _table(api.get("/tenants/overlays").get("overlays", []),
+           ["tenant_id", "overlay_sha256", "created_by", "created_at"])
+
+
+@tenant.command("remove")
+@click.argument("tenant_id")
+@click.pass_context
+def tenant_remove(ctx: click.Context, tenant_id: str) -> None:
+    """Remove a tenant's overlay (the tenant falls back to the global
+    policy exactly)."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    api.delete(f"/tenants/{tenant_id}/overlay")
+    click.echo(f"overlay removed for {tenant_id}")
+
+
+# -- batch status ---------------------------------------------------------
+
+@cli.command("batch")
+@click.argument("batch_id")
+@click.option("--source-key", default=None, help="source secret key (batch status is source-private)")
+@click.pass_context
+def batch_status(ctx: click.Context, batch_id: str, source_key: str | None) -> None:
+    """Batch processing status (processing / complete / failed + counts)."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"],
+                  source_key=source_key)
+    r = api.get(f"/ingest/{batch_id}")
+    for k in ("batch_id", "status", "indicator_count", "demoted_records",
+              "received_at", "completed_at", "failure"):
+        click.echo(f"{k:<18} {r.get(k, '')}")
+
+
 # -- audit -------------------------------------------------------------
 
 @cli.command("audit")
@@ -573,7 +730,7 @@ def audit(ctx: click.Context, limit: int) -> None:
     """Show the append-only audit trail."""
     api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
     rows = api.get("/audit", params={"limit": limit}).get("audit", [])
-    _table(rows, ["seq", "created_at", "actor", "event_type", "subject", "detail"])
+    _table(rows, ["event_id", "at", "actor", "event_type", "subject", "detail"])
 
 
 # -- lifecycle ---------------------------------------------------------------

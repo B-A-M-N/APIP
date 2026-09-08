@@ -51,26 +51,29 @@ def _encode_name(labels: list[str]) -> bytes:
     return b"".join(bytes([len(l)]) + l.encode() for l in labels) + b"\x00"
 
 
-MONITOR_ONLY_MARKER = "APIP MONITOR-ONLY RPZ (OBSERVE)"
+LIVE_CNAME_DOT = "IN CNAME ."
 
 
 def _owned(zone_text: str, qname: str) -> bool:
-    """True when the APIP RPZ zone contains an `IN CNAME .` rule for qname."""
+    """True when the zone contains a LIVE NXDOMAIN policy rule
+    (``<qname> IN CNAME .``) for qname.
+
+    Only the live policy action bites. A shadow artifact carries
+    ``IN CNAME rpz-passthru.`` (BIND's continue-normal-resolution action) and
+    must NEVER produce NXDOMAIN here — matching real BIND: even if an
+    operator mistakenly attached the shadow zone to response-policy,
+    rpz-passthru leaves answers unchanged. (This harness is not BIND; the
+    release gate proving real resolver compatibility is the named/BIND
+    acceptance.)"""
     needle = qname.rstrip(".")
     for line in zone_text.splitlines():
         stripped = line.split(";", 1)[0].strip()
-        owner = stripped.split()[0] if stripped else ""
-        body = " ".join(stripped.split()[1:])
-        if owner.rstrip(".") == needle \
-                and "CNAME" in body and body.rstrip().endswith("."):
+        parts = stripped.split()
+        if len(parts) < 4 or parts[0].rstrip(".") != needle:
+            continue
+        if parts[1] == "IN" and parts[2] == "CNAME" and parts[3] == ".":
             return True
     return False
-
-
-def _is_monitor_only(zone_text: str) -> bool:
-    """A zone is monitor-only (SHADOW/OBSERVE) when its header carries the
-    APIP monitor-only marker — a real enforcement resolver would NOT load it."""
-    return MONITOR_ONLY_MARKER in zone_text
 
 
 def _respond(packet: bytes, zone_text: str, baseline_a: str | None,
@@ -88,14 +91,12 @@ def _respond(packet: bytes, zone_text: str, baseline_a: str | None,
     answer = b""
     rcode = NOERROR
     ancount = 0
-    # A monitor-only (SHADOW/OBSERVE) zone is NOT consumed for policy answers
-    # by a real enforcement resolver (no live change), so the owned rule is
-    # skipped and the name resolves to its normal baseline. An ENFORCE zone IS
-    # consumed (NXDOMAIN for the exact owner); honor_zone decides whether we
-    # even read the zone for policy answers (the acceptance's lab resolver sets
-    # it False so only ENFORCE zones bite).
-    owned = _owned(zone_text, qname) and not (
-        _is_monitor_only(zone_text) and not honor_zone)
+    # Only the LIVE policy action (``IN CNAME .``) is consumed for policy
+    # answers. A shadow artifact's rpz-passthru rules never bite — see
+    # _owned(). honor_zone retains the harness switch for whether the zone is
+    # read at all (the acceptance's SHADOW leg points the harness at the
+    # shadow artifact path, which carries no live rules).
+    owned = _owned(zone_text, qname) if honor_zone else False
     if owned:
         rcode = NXDOMAIN
     elif qname.endswith(".invalid"):

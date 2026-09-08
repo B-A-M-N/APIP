@@ -28,6 +28,10 @@ event is rejected (P1-23) — never folded.
 """
 from __future__ import annotations
 
+import time
+
+from collections import deque
+
 from apip.telemetry.behavioral import (
     BeaconDetector,
     Detection,
@@ -41,6 +45,13 @@ from apip.telemetry.behavioral import (
     IMPLEMENTED_FAMILIES,
 )
 
+# Audit #20/#21: the feed's own resource envelope. Detections awaiting
+# attachment live in a bounded pending structure; a blocked persistence
+# path can degrade the feed, never grow it without bound.
+DEFAULT_MAX_PENDING_DETECTIONS = 10_000
+DEFAULT_PENDING_TTL_S = 900
+DEFAULT_MAX_RETAINED_DETECTIONS = 10_000
+
 
 class LiveBehavioralFeed:
     """Own the enabled detector instances and route typed observations.
@@ -50,7 +61,10 @@ class LiveBehavioralFeed:
     run says so honestly).
     """
 
-    def __init__(self, enabled_families: tuple[str, ...] | None = None):
+    def __init__(self, enabled_families: tuple[str, ...] | None = None,
+                 max_pending_detections: int = DEFAULT_MAX_PENDING_DETECTIONS,
+                 pending_ttl_s: int = DEFAULT_PENDING_TTL_S,
+                 max_retained_detections: int = DEFAULT_MAX_RETAINED_DETECTIONS):
         enabled = set(enabled_families) if enabled_families is not None \
             else set(IMPLEMENTED_FAMILIES)
         self.pending = sorted(enabled - IMPLEMENTED_FAMILIES)
@@ -68,8 +82,29 @@ class LiveBehavioralFeed:
         self.sync = SyncFirstContactDetector() \
             if "sync_first_contact" in enabled else None
 
-        self.detections: list[Detection] = []
+        # Audit #21: bounded, not an unbounded list. `_detections` is a
+        # bounded deque holding detections not yet claimed by a persistence
+        # caller; overflow deterministically drops the OLDEST (counted).
+        self._detections: deque[Detection] = deque(
+            maxlen=max(1, int(max_retained_detections)))
+        self.dropped_detections = 0
+        self.detections_emitted = 0
+        # Audit #20: a detection whose target is NOT (yet) a known indicator
+        # stays DORMANT in a bounded pending cache keyed by target with a
+        # TTL — when the indicator is later ingested, `attach_to_indicators`
+        # picks the detection up. It is never silently discarded.
+        self._pending_unknown: dict[str, deque[tuple[Detection, int]]] = {}
+        self._max_pending = max(1, int(max_pending_detections))
+        self._pending_ttl_s = max(1, int(pending_ttl_s))
+        self.pending_expired = 0
+        self.pending_overflow_dropped = 0
         self.rejected_epoch_mismatch = 0
+
+    @property
+    def pending_unknown(self) -> int:
+        """Audit #20: distinct targets currently parked in the dormant
+        pending cache (live count, never stale)."""
+        return len(self._pending_unknown)
 
     # -- typed intake ---------------------------------------------------------
 
@@ -84,8 +119,11 @@ class LiveBehavioralFeed:
 
     def on_dns_query(self, src: str, domain: str, qtype: str | None,
                      ts_iso: str, epoch_s: int) -> list[Detection]:
-        """A DNS query for a domain. Feeds DGA + tunnel + novelty + sync;
-        the first occurrence drives per-domain structure detectors."""
+        """A DNS query for a domain. Feeds DGA + tunnel + novelty + sync AND
+        the beacon detector (audit #18: a DNS contact between ``src`` and
+        ``domain`` IS a beacon observation — the beacon window is keyed on
+        the (src, dst) contact pair); the first occurrence drives per-domain
+        structure detectors."""
         if not self._check_epoch(ts_iso, epoch_s):
             return []
         out: list[Detection] = []
@@ -96,10 +134,12 @@ class LiveBehavioralFeed:
                   self.novelty.observe(src, domain, ts_iso, epoch_s)
                   if self.novelty else None,
                   self.sync.observe(src, domain, ts_iso, epoch_s)
-                  if self.sync else None):
+                  if self.sync else None,
+                  self.beacon.observe(src, domain, ts_iso, epoch_s)
+                  if self.beacon else None):
             if d is not None:
                 out.append(d)
-        self.detections.extend(out)
+        self._retain(out)
         return out
 
     def on_dns_answer(self, domain: str, answer: str, ttl: int,
@@ -110,7 +150,7 @@ class LiveBehavioralFeed:
         d = self.fastflux.observe(domain, answer, ttl, ts_iso, epoch_s) \
             if self.fastflux else None
         out = [d] if d is not None else []
-        self.detections.extend(out)
+        self._retain(out)
         return out
 
     def on_flow(self, host: str, dst: str, out_bytes: int, in_bytes: int,
@@ -121,7 +161,7 @@ class LiveBehavioralFeed:
         d = self.volume.observe(host, dst, out_bytes, in_bytes, ts_iso, epoch_s) \
             if self.volume else None
         out = [d] if d is not None else []
-        self.detections.extend(out)
+        self._retain(out)
         return out
 
     def on_tls(self, client: str, dst: str, sni: str | None,
@@ -133,31 +173,96 @@ class LiveBehavioralFeed:
         d = self.tls.observe(client, dst, sni, cert_covers_sni, is_ip_https,
                              has_sni, ts_iso, epoch_s) if self.tls else None
         out = [d] if d is not None else []
-        self.detections.extend(out)
+        self._retain(out)
         return out
+
+    # -- bounded retention -------------------------------------------------------
+
+    def _retain(self, dets: list[Detection]) -> None:
+        """Audit #21: deterministic bounded retention. Overflow drops the
+        OLDEST unclaimed detection (counted) — a blocked persistence path
+        degrades coverage; it can never grow memory without bound."""
+        for d in dets:
+            self.detections_emitted += 1
+            if len(self._detections) == self._detections.maxlen:
+                self.dropped_detections += 1
+            self._detections.append(d)
+
+    def _pending_put(self, det: Detection, now_epoch: int) -> None:
+        """Audit #20: an unknown-target detection waits, bounded, for its
+        indicator to appear. TTL expiry and depth overflow are counted."""
+        q = self._pending_unknown.setdefault(det.dst, deque())
+        if len(q) >= 64:
+            q.popleft()
+            self.pending_overflow_dropped += 1
+        q.append((det, now_epoch))
+
+    def _pending_gc(self, now_epoch: int) -> None:
+        if not self._pending_unknown:
+            return
+        deadline = now_epoch - self._pending_ttl_s
+        empty: list[str] = []
+        for target, q in self._pending_unknown.items():
+            while q and q[0][1] < deadline:
+                q.popleft()
+                self.pending_expired += 1
+            if not q:
+                empty.append(target)
+        for t in empty:
+            del self._pending_unknown[t]
 
     # -- evidence frontier -----------------------------------------------------
 
-    def attach_to_indicators(self, known: dict[str, str]) -> list[dict]:
+    def attach_to_indicators(self, known: dict[str, str],
+                             now_epoch: int | None = None) -> list[dict]:
         """Fold detections that reference a KNOWN indicator value into
-        evidence-bearing records.
+        evidence-bearing attachment records.
 
         ``known`` maps indicator value -> indicator id (e.g. the ledger's
         current indicator population). A detection whose ``dst`` (domain/IP)
         matches a known indicator is emitted as a ``behavioral_*`` evidence
-        record; anything else is dropped (the detection stays dormant —
-        no new authority is invented). Returns the evidence records (the
-        caller persists them), ordered deterministically by kind.
+        record; anything else stays DORMANT in the bounded pending cache
+        (audit #20 — never silently discarded) and is picked up by a later
+        call once its indicator is ingested.
+
+        Audit #19: each record carries the RESOLVED indicator identity —
+        ``indicator_id`` and ``target`` alongside the evidence fields — so
+        a persistence caller never has to guess which indicator a record
+        was resolved against. Ordered deterministically by (kind, target).
         """
-        out = []
-        for det in self.detections:
-            target = det.dst
-            ind_id = known.get(target)
+        if now_epoch is None:
+            from apip.telemetry.behavioral import _epoch_of_iso
+            now_epoch = int(time.time())
+        self._pending_gc(now_epoch)
+        out: list[dict] = []
+        for det in self._drain_pending_matches(known):
+            ind_id = known.get(det.dst)
             if ind_id is None:
+                # TTL measures DORMANCY (how long it has waited), not the
+                # observation's own age — an old detection freshly parked
+                # gets a full TTL from now.
+                self._pending_put(det, now_epoch)
                 continue
-            out.append(det.as_evidence_fields())
-        self.detections = []
+            rec = det.as_evidence_fields()
+            rec["indicator_id"] = ind_id
+            rec["target"] = det.dst
+            out.append(rec)
+        out.sort(key=lambda r: (r["kind"], r["target"]))
         return out
+
+    def _drain_pending_matches(self, known: dict[str, str]) -> list[Detection]:
+        """Pop every retained detection; those matching a known indicator
+        become attachment records now, the rest re-enter the pending cache
+        in ``attach_to_indicators``."""
+        dets = list(self._detections)
+        self._detections.clear()
+        # also retry dormant pending detections whose indicator has since
+        # arrived (audit #20's point)
+        for target in list(self._pending_unknown):
+            if target in known:
+                q = self._pending_unknown.pop(target)
+                dets.extend(d for d, _ in q)
+        return dets
 
     def health(self) -> dict:
         dets = [d for d in (self.beacon, self.novelty, self.dga, self.tunnel,
@@ -168,4 +273,11 @@ class LiveBehavioralFeed:
             "pending_families_requested": self.pending,
             "detectors": [d.health() for d in dets],
             "rejected_epoch_mismatch": self.rejected_epoch_mismatch,
+            # audit #20/#21 envelopes
+            "detections_retained": len(self._detections),
+            "detections_emitted": self.detections_emitted,
+            "dropped_detections": self.dropped_detections,
+            "pending_unknown_targets": self.pending_unknown,
+            "pending_expired": self.pending_expired,
+            "pending_overflow_dropped": self.pending_overflow_dropped,
         }

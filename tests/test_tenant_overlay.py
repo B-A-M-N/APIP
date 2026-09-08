@@ -22,6 +22,8 @@ import tomllib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import pg  # noqa: E402  (shared Postgres test endpoints)
+
 from apip.decision.layer import merge_policy_overlay  # noqa: E402
 from apip.decision.loader import load_policy_text  # noqa: E402
 from apip.decision.policy import Policy  # noqa: E402
@@ -207,8 +209,7 @@ allowlist = [ { value = "untrusted.corp.test", owner = "tenant", ticket = "t-x" 
 
 def _can_connect() -> bool:
     try:
-        SOCKET_DIR = "/var/run/postgresql"
-        conn = psycopg2.connect(host=SOCKET_DIR, dbname="postgres", connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
         conn.close()
         return True
     except psycopg2.Error:
@@ -228,7 +229,7 @@ def test_tenant_overlay_drives_a_tighter_decision():
     from apip.domain.models import Evidence, Indicator  # noqa: PLC0415
 
     dburi = "apip_tn_" + uuid.uuid4().hex[:12]
-    conn = psycopg2.connect(host="/var/run/postgresql", dbname="postgres", connect_timeout=3)
+    conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = conn.cursor()
     try:
@@ -238,8 +239,8 @@ def test_tenant_overlay_drives_a_tighter_decision():
 
     cfg = replace(
         load_config(None),
-        db=DatabaseConfig(host="/var/run/postgresql", dbname=dburi,
-                          user=os.environ.get("USER", "bamn")),
+        db=DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=dburi,
+                          user=pg.USER),
         adapter=replace(AdapterConfig(rpz_mode="SHADOW", zone_dir="/tmp/apip_tn_rpz"),
                         authorized_domains=("corp.test",)),
     )
@@ -265,12 +266,12 @@ def test_tenant_overlay_drives_a_tighter_decision():
                                         independent=True, key_hash="x", actor="test",
                                         auto_enforcement_allowed=True, enabled=True)
 
-            def _seed(ind_id, tenant_id):
+            def _seed(ind_id, tenant_id) -> str:
                 ctrl.ledger.record_batch(batch_id=f"b-{ind_id}", source_id="feeda",
                                          raw_sha256=f"s-{ind_id}", indicator_count=1, demoted=0,
                                          channel="t", actor="test")
                 ind = Indicator(
-                    id=ind_id, type="fqdn", value="evil.corp.test",
+                    id=ind_id, type="fqdn", value=f"{ind_id}.evil.corp.test",
                     sources=("feeda", "feedb"),
                     evidence=(Evidence(kind="curated_source", source_id="feeda",
                                        source_class="curated",
@@ -282,16 +283,19 @@ def test_tenant_overlay_drives_a_tighter_decision():
                                        source_class="curated",
                                        observed_at="2026-09-03T00:00:00Z", independent=True)),
                     tags=("c2",))
-                ctrl.ledger.upsert_indicator(ind, f"b-{ind_id}", tenant_id=tenant_id)
+                durable = ctrl.ledger.upsert_indicator(ind, f"b-{ind_id}",
+                                                       tenant_id=tenant_id)
                 from datetime import datetime, timedelta, timezone
                 # bump observed_at into recency window relative to run clock
                 recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
                 ctrl.db.execute(
-                    "UPDATE evidence SET observed_at=%s WHERE indicator_id=%s", (recent, ind_id))
+                    "UPDATE evidence SET observed_at=%s WHERE indicator_id=%s",
+                    (recent, durable))
+                return durable
 
             # global tenant: same evidence, no overlay
-            _seed("ind--global", None)
-            gres = ctrl.pipeline.decide_indicator("ind--global", actor="test")
+            gdurable = _seed("ind--global", None)
+            gres = ctrl.pipeline.decide_indicator(gdurable, actor="test")
             assert gres is not None
             g_m = gres["decision"].maliciousness
 
@@ -310,8 +314,9 @@ fqdn_auto_m = 100
                 tenant_id="tenant-hot", raw_text=overlay_raw,
                 overlay_sha256=hashlib.sha256(overlay_raw.encode()).hexdigest(),
                 created_by="test")
-            _seed("ind--tenant", "tenant-hot")
-            tres = ctrl.pipeline.decide_indicator("ind--tenant", actor="test", tenant_id="tenant-hot")
+            tdurable = _seed("ind--tenant", "tenant-hot")
+            tres = ctrl.pipeline.decide_indicator(tdurable, actor="test",
+                                                  tenant_id="tenant-hot")
             assert tres is not None
             t_m = tres["decision"].maliciousness
             # both share the same maliciousness score (same evidence/policy weights)
@@ -320,12 +325,19 @@ fqdn_auto_m = 100
             # is stricter: disposition must be no-more-permissive than global's.
             # (given fqdn_auto_m=100 and a score < 100, tenant lands NO_ACTION /
             # OBSERVE where global may still act)
-            assert tres["decision"].disposition in ("NO_ACTION", "OBSERVE") or True
+            # audit #39: the product claim must be FALSIFIABLE — the tenant
+            # decision is strictly observed-or-nothing here; if the overlay
+            # ever stops tightening, this fails.
+            assert tres["decision"].disposition in ("NO_ACTION", "OBSERVE"), \
+                (tres["decision"].disposition, gres["decision"].disposition)
+            assert gres["decision"].disposition in ("NO_ACTION", "OBSERVE",
+                                                    "AUTO_ENFORCE",
+                                                    "PROPOSE_OPERATOR_APPROVAL")
         finally:
             ctrl.stop()
     finally:
         db.close()
-        conn = psycopg2.connect(host="/var/run/postgresql", dbname="postgres", connect_timeout=3)
+        conn = psycopg2.connect(**pg.dsn_kwargs("postgres"))
         conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
         cur = conn.cursor()
         try:

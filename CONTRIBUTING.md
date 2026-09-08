@@ -42,7 +42,7 @@ conformance tests enforce them.
 ## What to update when you change behavior
 
 - `reference/` source + `tests/`.
-- If an emitted artifact or contract changes: `schemas/`, `api/openapi.yaml`,
+- If an emitted artifact or contract changes: `schemas/`, `api/openapi.future.yaml` (or regenerate `api/openapi.beta.json` via `scripts/generate_openapi.py`),
   and the schema-conformance tests.
 - If a documented version/status changes: `RELEASES.md` (the single version and
   implementation-status authority) and `CHANGELOG.md`.

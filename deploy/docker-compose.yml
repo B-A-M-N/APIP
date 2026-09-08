@@ -7,7 +7,9 @@
 # posture is usable with no resolver wiring at all.
 #
 # Quick start:
-#   cp .env.example .env   # then fill in generated secrets
+#   cp deploy/.env.example .env  # then fill in generated secrets
+#   mkdir config && cp deploy/config/apip.toml.example config/apip.toml
+#                                # then EDIT scope/domains for YOUR deployment
 #   docker compose up -d
 #   docker compose exec apip apip migrate
 #   docker compose exec apip apip status
@@ -44,9 +46,20 @@ services:
       APIP_SECRET_KEY: ${APIP_SECRET_KEY:?set APIP_SECRET_KEY in .env}
     volumes:
       - rpz:/var/lib/apip/rpz
+      # Audit #31: the operator's OWN configuration, read-only. The image's
+      # built-in /etc/apip/apip.toml is the example (demo scope, sentinel
+      # values); an operator deployment mounts its real config over it.
+      # Create ./config/apip.toml before `docker compose up` (see
+      # deploy/config/apip.toml.example).
+      - ./config/apip.toml:/etc/apip/apip.toml:ro
+    # P1 #38: loopback-only publish by default. Remote operator access goes
+    # through a TLS-terminating reverse proxy the operator runs — the API
+    # itself is bearer-token over plain HTTP and must not cross a network
+    # in the clear.
     ports:
-      - "8510:8510"
-    command: ["apip", "serve"]
+      - "127.0.0.1:8510:8510"
+    # ENTRYPOINT is `apip`; the compose command is only the subcommand.
+    command: ["serve", "--config", "/etc/apip/apip.toml"]
 
 volumes:
   pgdata:

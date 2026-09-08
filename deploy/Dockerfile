@@ -21,7 +21,9 @@ RUN mkdir -p /etc/apip /var/lib/apip/rpz \
 VOLUME ["/var/lib/apip/rpz"]
 EXPOSE 8510
 
+# Liveness only: the unauthenticated /health endpoint (never the rich
+# authenticated status, which would disclose topology to a health prober).
 HEALTHCHECK --interval=10s --timeout=5s --retries=6 \
-  CMD apip status --base http://127.0.0.1:8510 || exit 1
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8510/health', timeout=4).status == 200 else 1)" || exit 1
 
 ENTRYPOINT ["apip"]

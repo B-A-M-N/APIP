@@ -7,6 +7,7 @@ marked PROD:.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
@@ -62,6 +63,18 @@ class ActionSelector:
         return {k: v for k, v in asdict(self).items() if v is not None}
 
 
+def _demotion_content_hash(d: "Decision") -> str:
+    """Deterministic content hash over the DEMOTED fields — byte-for-byte
+    the same construction as the engine's
+    ``_content_hash("OBSERVE", "observe", "L0", 0, None, None, version)``
+    (repr serialization, unit-separator join) so a demoted record is
+    self-consistent without importing the engine (models stay
+    dependency-free)."""
+    payload = "\x1f".join(repr(p) for p in (
+        "OBSERVE", "observe", "L0", 0, None, None, d.policy_version))
+    return "hash--" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+
+
 @dataclass(frozen=True)
 class Decision:
     """A deterministic decision record. Immutable once persisted (append-only
@@ -86,6 +99,34 @@ class Decision:
     attribution_refs: tuple[str, ...] = ()   # docs/30: display-only, never a decision input
     # P1-10: action-instance content hash over the FULL parameterized output.
     content_hash: str = ""
+
+    def with_budget_demotion(self) -> "Decision":
+        """Demote this decision to OBSERVE under a blast-radius budget
+        (docs/04 §8): the action class is dropped, rung downgraded to L0,
+        TTL zeroed, and the demotion recorded with a named reason
+        (blast_radius_budget_exceeded). Deterministic: same decision in,
+        same demoted decision out; content_hash recomputed over the DEMOTED
+        fields so an observer never conflates this observe instance with
+        the enforcement one that was dropped."""
+        demoted_hash = _demotion_content_hash(self)
+        return Decision(
+            id=self.id + "-demoted",
+            indicator_id=self.indicator_id,
+            maliciousness=self.maliciousness,
+            action_safety=self.action_safety,
+            disposition="OBSERVE",
+            action="observe",
+            rung="L0",
+            scope=self.scope,
+            ttl_seconds=0,
+            policy_version=self.policy_version,
+            reason_codes=tuple(sorted(set(self.reason_codes)
+                                      | {"blast_radius_budget_exceeded"})),
+            explanation=self.explanation,
+            selector=None,
+            nominal_ttl_seconds=self.nominal_ttl_seconds,
+            content_hash=demoted_hash,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         d = {

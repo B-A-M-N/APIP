@@ -38,7 +38,7 @@ class FamilyEnumConsistencyTests(unittest.TestCase):
         self.assertEqual(set(enum), CANONICAL_FAMILIES)
 
     def test_openapi_enum(self):
-        text = _read("api", "openapi.yaml")
+        text = _read("api", "openapi.future.yaml")
         m = re.search(r"family: \{type: string, enum: \[([^\]]+)\]\}", text)
         self.assertIsNotNone(m, "openapi BehaviorEvent.family enum not found")
         families = {f.strip() for f in m.group(1).split(",")}

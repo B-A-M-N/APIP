@@ -378,7 +378,7 @@ class SchemaKeywordSupportTests(unittest.TestCase):
         # the two contracts can't quietly drift apart again)
         try:
             import yaml as _yaml
-            oa = _yaml.safe_load((PKG / "api" / "openapi.yaml").read_text())
+            oa = _yaml.safe_load((PKG / "api" / "openapi.future.yaml").read_text())
             oa_enum = set(oa["components"]["schemas"]["Indicator"]
                             ["properties"]["type"]["enum"])
         except ImportError:
@@ -405,7 +405,7 @@ class SchemaKeywordSupportTests(unittest.TestCase):
         )["properties"]["status"]["enum"]
         try:
             import yaml as _yaml
-            oa = _yaml.safe_load((PKG / "api" / "openapi.yaml").read_text())
+            oa = _yaml.safe_load((PKG / "api" / "openapi.future.yaml").read_text())
             oa_status = oa["components"]["schemas"]["Receipt"] \
                 ["properties"]["status"]["enum"]
         except ImportError:

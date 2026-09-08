@@ -25,6 +25,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Identity sentinels that can never become registered sources (review P0 #9):
+# "unregistered" IS the zero-authority class — registering it (e.g. as
+# curated) would let deliberately demoted evidence resolve through the
+# registry as authoritative. Refused at API, ledger, and DB CHECK layers.
+RESERVED_SOURCE_IDS = frozenset({"unregistered"})
+
 
 @dataclass(frozen=True)
 class SourceProfile:
@@ -57,6 +63,18 @@ class SourceRegistry:
             SourceProfile(source_id=source_id, source_class="unregistered",
                           independent=False, auto_enforcement_allowed=False),
         )
+
+    def effective_class(self, source_id: str) -> str:
+        """The class a source contributes to DECISIONS (review P1 #30):
+        disabling a source QUARANTINES its authority immediately — a
+        disabled source resolves as "unregistered" (zero scoring weight,
+        zero corroboration) while its history stays intact. A disabled
+        incident-response source must not keep vouching for evidence in
+        replays and later decisions."""
+        p = self.profile(source_id)
+        if not p.enabled:
+            return "unregistered"
+        return p.source_class
 
     def class_of(self, source_id: str) -> str:
         return self.profile(source_id).source_class

@@ -153,12 +153,16 @@ def strong_evidence(source: str = "local-sensor", *,
 
 
 def _candidate(owner: str = "evil.operator.test", *, fragment=None,
-               selector=None) -> dict:
+               selector=None, mode: str = "ENFORCE") -> dict:
+    """A dispatch-shaped candidate. ``mode`` is the PERSISTED action mode the
+    controller records at creation — the adapter honors it (min with the
+    adapter's own maximum), so tests pass it exactly as dispatch would."""
     owner_n = owner.rstrip(".")
     return {
         "adapter": "rpz",
+        "mode": mode,
         "rule_id": f"owner:{owner_n}",
-        "fragment": fragment or f"{owner_n}. IN CNAME . ; test",
+        "fragment": fragment or f"{owner_n} IN CNAME . ; test",
         "selector": selector or {
             "scope_type": "destination_global",
             "destination": owner_n,

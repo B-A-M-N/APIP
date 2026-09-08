@@ -7,6 +7,69 @@ spec revision is tracked separately — see `RELEASES.md` for the version model.
 
 ## [Unreleased]
 
+### 48-finding rereview remediation (P0 #1–#21, P1 #22–#41, P1/P2 #42–#48)
+
+The full rereview verdict was "APIP is not public-beta stable yet"; this
+release implements every finding. Highlights (commits `94e5910`..HEAD):
+
+- **P0 safety core:** action posture is immutable and enforced at the adapter
+  boundary (effective posture = min(action mode, adapter maximum)); SHADOW is
+  structurally non-enforcing (separate shadow artifact, never attached to the
+  live response-policy chain / ruleset); RPZ rewritten to real BIND
+  policy-zone semantics and proven against real `named`
+  (`lab/bind_gate.py`); Suricata ENFORCE withdrawn from beta (IDS/export
+  surface, truthfully refused); SIDs allocated durably (no restart reuse);
+  RPZ physical rules are co-owned with refcount semantics; actions are
+  re-authorized at dispatch time and revocation never depends on current
+  scope.
+- **P0 identity/ingest:** source identity reserved at every layer (incl. a
+  DB CHECK); observable identity is SERVER-DERIVED from canonical
+  (itype, value) with submitted ids kept as provenance; ingest is a
+  resumable unit of work (processing/complete/failed); the blast-radius
+  budget is enforced per batch with deterministic demotion; duplicate
+  actions from unchanged decisions are refused at the database.
+- **P0 credentials/approvals/provenance:** keyed source credentials
+  (`apipk_<key_id>.<secret>`, one indexed row + one PBKDF2 verify),
+  optional deployment-secret pepper (versioned scheme); durable one-shot
+  approvals (`decision_approvals`); every action cites the exact immutable
+  decision instance (composite FK); policy promotion enforces the governed
+  posture ladder; one-active-policy is a DB invariant; operator revoke vs
+  worker expiry serialize on one CAS claim.
+- **P1 product surface:** loopback-only Compose publish + `.dockerignore`;
+  env layering (defaults → TOML → `APIP_*`); CLI/API contract aligned;
+  `/health`,`/ready` bare + authenticated `/status` with explicit degraded
+  reasons; DB pool survives a Postgres restart (connection-level recovery,
+  proven against a real killed-backend outage); adapter artifact-boundary
+  config validation; reload command takes a no-shell argv form; acceptance
+  gains `--require-postgres` release mode and a two-level evidence model.
+- **P1/P2 release honesty:** product CI lanes (pytest against required
+  Postgres, pyright, no-AI invariant, deprecation-warning lane, wheel +
+  clean-venv CLI, Compose smoke, real-BIND gate); dependency pins to the
+  tested-at lines; `api/openapi.yaml` renamed `openapi.future.yaml` and the
+  real contract generated as `api/openapi.beta.json` with a drift test;
+  placeholder pyproject URL and false `Typing :: Typed` classifier removed;
+  SECURITY.md rewritten (private reporting via GitHub security advisories,
+  real scope/supported versions); release/version docs state the product
+  version truth (`0.1.0b1`).
+
+### Release-verification artifact audit (v2.3, 2026-09-03)
+
+- **MANIFEST.json regenerated against the git tree.** The v2.2 snapshot never
+  covered the product package (`src/apip/`), `deploy/`, or `lab/acceptance.py`,
+  and 43 of its 88 hashed files had drifted from the tree, while
+  `BUILD_VERIFICATION.txt` asserted "all hashes match this tree." The manifest
+  now pins **166 files** — every tracked path except `MANIFEST.json` itself
+  (self-excluded) — with SHA-256 verified to match on all 166.
+- **BUILD_VERIFICATION.txt corrected.** Its `python -m unittest discover -s
+  tests -v: PASS (187 tests)` claim was stale on two axes: the product suite is
+  pytest-run (that unittest invocation discovers 0 tests at the repo root) and
+  stands at 190, while the reference `unittest` suite it describes is 264.
+  Header bumped to v2.3; true reproductions for both suites documented; a
+  copy-paste MANIFEST verifier added.
+- **RELEASES.md version authority aligned to v2.3.** Spec-revision matrix and
+  the `BUILD_VERIFICATION.txt` cross-reference updated; only these
+  verification-record artifacts changed — no production or test code.
+
 ### Audit zero-trust hardening pass (P0–P2 residuals, 2026-09-02)
 
 - **Evidence/source authority boundary rebuilt (P0-1/2/3):** source identity is

@@ -48,10 +48,12 @@ def _rpz(tmp_path, mode="ENFORCE", authorized=("corp.com",), server="", reload="
         verify_query_server=server))
 
 
-def _rpz_candidate(owner="evil.corp.com", fragment=None):
+def _rpz_candidate(owner="evil.corp.com", fragment=None, mode="ENFORCE"):
+    """Dispatch-shaped candidate carrying the persisted action mode."""
     return {
+        "mode": mode,
         "rule_id": f"owner:{owner}",
-        "fragment": fragment or f"{owner}. IN CNAME . ; ok",
+        "fragment": fragment or f"{owner} IN CNAME . ; ok",
         "selector": {"scope_type": "destination_global",
                      "destination": owner, "exact_fqdn": owner},
     }
@@ -72,7 +74,8 @@ def test_rpz_enforce_verify_fails_closed_without_resolver(tmp_path):
     success on a zone-file write alone — it fails closed."""
     ad = _rpz(tmp_path, authorized=("corp.com",), server="")
     # zone-file presence alone must NOT be reported as verified in ENFORCE
-    (tmp_path / "corp.zone").write_text("evil.corp.com. IN CNAME . ; ok\n",
+    # (owner written in the current relative policy-zone encoding)
+    (tmp_path / "corp.zone").write_text("evil.corp.com IN CNAME . ; ok\n",
                                         encoding="utf-8")
     v = ad.verify(_rpz_candidate("evil.corp.com"))
     assert v["ok"] is False
@@ -83,10 +86,12 @@ def test_rpz_enforce_verify_fails_closed_without_resolver(tmp_path):
 # Suricata: ruleset injection + scope re-check + fqdn http.host dead-end
 # ---------------------------------------------------------------------------
 
-def _sur(tmp_path, mode="ENFORCE", prefixes=("10.0.0.0/8",), reload=""):
+def _sur(tmp_path, mode="SHADOW", prefixes=("10.0.0.0/8",), reload=""):
+    """The beta Suricata surface is IDS/export only — ENFORCE is refused at
+    construction, so tests construct SHADOW (the maximum beta posture)."""
     return SuricataAdapter(AdapterConfig(
         suricata_mode=mode, suricata_rules_dir=str(tmp_path),
-        suricata_rules_file="rules", reload_command="",
+        suricata_rules_file="rules", suricata_reload_command="",
         suricata_authorized_prefixes=tuple(prefixes)))
 
 
@@ -94,7 +99,7 @@ def test_suricata_validate_rejects_multiline_ruleset_injection(tmp_path):
     ad = _sur(tmp_path)
     injected = {
         "rule_id": "sid:9100001",
-        "fragment": ('drop ip $HOME_NET any -> 10.1.1.1 any '
+        "fragment": ('alert ip $HOME_NET any -> 10.1.1.1 any '
                      '(msg:"APIP x"; metadata:apip_decision d; sid:9100001; rev:1;)\n'
                      'alert ip any any -> any any (metadata:apip_decision EVIL; '
                      'sid:999999; rev:1;)'),
@@ -125,7 +130,7 @@ def test_suricata_validate_catches_exactness_mismatch(tmp_path):
     ad = _sur(tmp_path)
     mismatch = {
         "rule_id": "sid:9100003",
-        "fragment": 'drop ip $HOME_NET any -> 10.2.2.2 any '
+        "fragment": 'alert ip $HOME_NET any -> 10.2.2.2 any '
                     '(msg:"APIP x"; metadata:apip_decision d; sid:9100003; rev:1;)',
         "selector": {"scope_type": "destination_global",
                      "destination": "10.1.1.1", "exact_ip": "10.1.1.1"},
@@ -486,10 +491,13 @@ def test_api_promote_bad_revision_is_400(api_harness):
 
 
 def test_api_policy_stage_invalid_mode_is_400(api_harness):
+    """P1 #34: the closed mode set is enforced by the strict request model —
+    an invalid mode (or empty text) is a 422/400 validation refusal, never a
+    stored row."""
     tc, _ = api_harness
     h = {"Authorization": "Bearer test-token"}
     r = tc.post("/policy/stage", json={"text": "", "mode": "BOGUS"}, headers=h)
-    assert r.status_code == 400
+    assert r.status_code in (400, 422)
 
 
 def test_api_health_does_not_disclose_topology(api_harness):

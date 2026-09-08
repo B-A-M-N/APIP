@@ -236,7 +236,290 @@ CREATE INDEX IF NOT EXISTS idx_indicators_tenant ON indicators(tenant_id);
 -- constraint that lacked this state.
 ALTER TABLE actions DROP CONSTRAINT IF EXISTS actions_state_check;
 ALTER TABLE actions ADD CONSTRAINT actions_state_check CHECK (state IN
-    ('pending','dispatching','applied','verified','failed','expired','revoked','drifted'));
+    ('pending','dispatching','applied','verified','failed','expired','revoked','drifted',
+     'cancelled_policy_changed'));
+"""),
+    (6, "single active policy invariant", """
+-- Exactly one active policy row is a database invariant, not an operator
+-- convention (review P0 #19): promote_policy retires the globally active row
+-- regardless of version before activating the new one, and this partial
+-- unique index makes any second 'active' row impossible even under a race.
+-- First, retire any duplicate actives an earlier version-conditional retire
+-- may have left behind, keeping the row policy_current points at.
+UPDATE policy_versions SET status='retired'
+WHERE status='active'
+  AND policy_version <> (SELECT policy_version FROM policy_current WHERE singleton);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_policy_versions_one_active
+    ON policy_versions ((1)) WHERE status='active';
+"""),
+    (7, "source identity reservation + server-derived observables + batch status", """
+-- P0 #9: reserved identity sentinels can never be registered. A CHECK
+-- constraint closes the authority escape at the database layer (the API and
+-- ledger guards re-refuse it earlier with better errors).
+ALTER TABLE sources DROP CONSTRAINT IF EXISTS sources_id_reserved_check;
+ALTER TABLE sources ADD CONSTRAINT sources_id_reserved_check
+    CHECK (source_id <> '' AND lower(source_id) <> 'unregistered');
+
+-- P0 #10: canonical observable identity is SERVER-DERIVED from
+-- (itype, canonical value), not the source-submitted id. The submitted id
+-- survives only as provenance (source_object_id). Two sources assigning
+-- different ids to the same observable now merge; one source reusing
+-- another's id for a DIFFERENT observable can never attach to it.
+ALTER TABLE indicators ADD COLUMN IF NOT EXISTS source_object_id TEXT;
+-- normalize existing rows to the canonical value form before deduping
+UPDATE indicators SET value = lower(rtrim(value, '.'))
+    WHERE itype = 'fqdn' AND (value <> lower(rtrim(value, '.')));
+-- merge duplicates (keep the OLDEST indicator_id per canonical observable;
+-- children of dropped duplicates are re-pointed first so no history is lost)
+UPDATE evidence e SET indicator_id = keep.keep_id
+FROM (
+    SELECT DISTINCT ON (itype, value) itype, value, indicator_id AS keep_id
+    FROM indicators ORDER BY itype, value, first_seen ASC
+) keep
+JOIN indicators dup
+    ON dup.itype = keep.itype AND dup.value = keep.value
+WHERE e.indicator_id = dup.indicator_id
+  AND dup.indicator_id <> keep.keep_id;
+UPDATE indicator_source_refs r SET indicator_id = keep.keep_id
+FROM (
+    SELECT DISTINCT ON (itype, value) itype, value, indicator_id AS keep_id
+    FROM indicators ORDER BY itype, value, first_seen ASC
+) keep
+JOIN indicators dup
+    ON dup.itype = keep.itype AND dup.value = keep.value
+WHERE r.indicator_id = dup.indicator_id
+  AND dup.indicator_id <> keep.keep_id
+  AND NOT EXISTS (SELECT 1 FROM indicator_source_refs x
+                  WHERE x.indicator_id = keep.keep_id
+                    AND x.source_id = r.source_id);
+DELETE FROM indicator_source_refs WHERE indicator_id NOT IN
+    (SELECT indicator_id FROM indicators);
+DELETE FROM evidence WHERE indicator_id NOT IN
+    (SELECT indicator_id FROM indicators);
+DELETE FROM decisions WHERE indicator_id NOT IN
+    (SELECT indicator_id FROM indicators);
+DELETE FROM indicators a USING indicators b
+    WHERE a.itype = b.itype AND a.value = b.value
+      AND a.first_seen > b.first_seen;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_indicators_canonical
+    ON indicators (itype, value);
+
+-- P0 #11: batch processing status — only 'complete' batches are replay
+-- no-ops; a crash mid-ingest leaves 'processing' and the retry resumes.
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS status TEXT
+    NOT NULL DEFAULT 'complete'
+    CHECK (status IN ('processing', 'complete', 'failed'));
+"""),
+    (8, "action provenance + per-decision action idempotency", """
+-- P0 #17: an action must prove exactly WHICH immutable decision row
+-- authorized it. record_decision now returns the inserted seq and every
+-- action row carries it. Backfill historical rows to the latest instance
+-- of their decision (the newest seq), then pin the relationship with a
+-- composite FK against decisions(decision_id, seq).
+UPDATE actions a SET decision_seq = sub.seq
+FROM (
+    SELECT DISTINCT ON (a2.action_id) a2.action_id, d.seq
+    FROM actions a2
+    JOIN decisions d ON d.decision_id = a2.decision_id
+    ORDER BY a2.action_id, d.seq DESC
+) sub
+WHERE a.action_id = sub.action_id AND a.decision_seq = 0;
+ALTER TABLE actions DROP CONSTRAINT IF EXISTS fk_actions_decision_instance;
+ALTER TABLE actions ADD CONSTRAINT fk_actions_decision_instance
+    FOREIGN KEY (decision_id, decision_seq)
+    REFERENCES decisions (decision_id, seq);
+
+-- P0 #12: one decision INSTANCE authorizes each (adapter, rule) at most
+-- once — duplicate actions from a re-evaluated identical decision are
+-- refused at the database, not by Python control flow. Old duplicates are
+-- removed first (keep the earliest created row per logical action).
+DELETE FROM actions a USING actions b
+WHERE a.decision_id = b.decision_id
+  AND a.decision_seq = b.decision_seq
+  AND a.adapter = b.adapter
+  AND a.rule_id = b.rule_id
+  AND a.created_at > b.created_at;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_actions_per_decision
+    ON actions (decision_id, decision_seq, adapter, rule_id);
+"""),
+    (9, "indexed source credential lookup (key_id)", """
+-- P0 #14: the source key carries its PUBLIC key_id
+-- (apipk_<key_id>.<secret>), so channel auth is ONE indexed row + ONE
+-- PBKDF2 verification — never a scan of every source's hash (an
+-- unauthenticated attacker could otherwise drive O(sources x 240k
+-- iterations) per request). Legacy rows (key_id NULL) keep working until
+-- their keys are rotated.
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS key_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sources_key_id
+    ON sources (key_id) WHERE key_id IS NOT NULL;
+"""),
+    (13, "evidence observation identity (audit P1 #16)", """
+-- A failed/resumed batch re-runs upsert_indicator(); the indicator itself
+-- is idempotent but its evidence rows were re-INSERTed blindly — duplicate
+-- provenance growth. Every evidence record gets a deterministic
+-- observation identity (hash of the full observation tuple); a resumed
+-- batch re-inserting the same observation is a no-op at the database.
+ALTER TABLE evidence ADD COLUMN IF NOT EXISTS observation_hash TEXT;
+UPDATE evidence SET observation_hash = md5(
+    coalesce(indicator_id,'') || '|' || coalesce(kind,'') || '|' ||
+    coalesce(source_id,'') || '|' || coalesce(channel_source,'') || '|' ||
+    coalesce(observed_at::text,'') || '|' || coalesce(detail::text,''))
+WHERE observation_hash IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_evidence_observation
+    ON evidence (indicator_id, observation_hash);
+"""),
+    (14, "decoupled ingest queue (audit P1 #15)", """
+-- POST /ingest durably ACCEPTS a batch (raw payload persisted) and a
+-- bounded worker drains it — one HTTP request no longer runs the whole
+-- pipeline (parse -> evaluate -> compile) inline. 'queued' is the accepted-
+-- not-yet-claimed state; the existing resume semantics cover a crash in
+-- any state.
+DO $$ DECLARE c TEXT;
+BEGIN
+    SELECT conname INTO c FROM pg_constraint
+    WHERE conrelid = 'ingest_batches'::regclass AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%status%';
+    IF c IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE ingest_batches DROP CONSTRAINT %I', c);
+    END IF;
+END $$;
+ALTER TABLE ingest_batches ADD CONSTRAINT ingest_batches_status_check
+    CHECK (status IN ('queued', 'processing', 'complete', 'failed'));
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS raw_payload BYTEA;
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+ALTER TABLE ingest_batches ADD COLUMN IF NOT EXISTS failure TEXT;
+CREATE INDEX IF NOT EXISTS idx_batches_queue
+    ON ingest_batches (received_at) WHERE status = 'queued';
+"""),
+    (12, "tenant identity and credential scoping (audit P0 #8)", """
+-- Tenant identity becomes first-class and credential-authorized:
+--   1. a source credential declares the tenant ids it may submit for
+--      (allowed_tenants); an empty set is a GLOBAL source — it may NOT
+--      claim a tenant. The free-form x-apip-tenant header alone grants
+--      nothing: the presented credential gates every tenant claim
+--      (cross-tenant submission is a 403 at the API).
+--   2. tenant is part of durable observable identity: the same FQDN
+--      observed by tenants A and B maps to DISTINCT indicator rows, so
+--      evidence populations, decisions and actions stay partitioned.
+--      Pre-existing rows keep their (global) identity; the legacy unique
+--      name index is replaced by (tenant_id, itype, canonical value).
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS allowed_tenants TEXT[]
+    NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_sources_allowed_tenants
+    ON sources USING gin (allowed_tenants);
+-- The legacy (itype, value) uniqueness enforced GLOBAL observable identity;
+-- tenant-partitioned identity requires the tenant in the key. The old
+-- constraint is dropped; uniqueness now comes from the deterministic
+-- server-derived primary key (observable_id hashes the tenant).
+ALTER TABLE indicators DROP CONSTRAINT IF EXISTS uq_indicators_canonical;
+DROP INDEX IF EXISTS uq_indicators_canonical;
+"""),
+    (11, "desired-state reconciliation intent", """
+-- Audit P0 #4: the durable record must never forget whether the operation
+-- in progress was APPLY or REMOVE. Previously both used state='dispatching',
+-- so a crash during a removal claim could be recovered by unclaim_action()
+-- to 'pending' — and the dispatch worker would RE-APPLY the control the
+-- operator revoked. Now every action carries a desired_state:
+--   PRESENT  the control should exist (created at dispatch, crash-recovery
+--            converges by (re)applying);
+--   ABSENT   the control must not exist (set by revoke/expiry/policy
+--            invalidation BEFORE touching infrastructure; crash-recovery
+--            converges by removing).
+-- Removal runs in the distinct 'removing' phase; only 'dispatching' (an
+-- APPLY claim) is ever returned to 'pending'.
+ALTER TABLE actions ADD COLUMN IF NOT EXISTS desired_state TEXT NOT NULL
+    DEFAULT 'PRESENT' CHECK (desired_state IN ('PRESENT','ABSENT'));
+ALTER TABLE actions DROP CONSTRAINT IF EXISTS actions_state_check;
+ALTER TABLE actions ADD CONSTRAINT actions_state_check CHECK (state IN
+    ('pending','dispatching','removing','applied','verified','failed','expired',
+     'revoked','drifted','cancelled_policy_changed'));
+CREATE INDEX IF NOT EXISTS idx_actions_desired ON actions(desired_state, state);
+-- An action claimed for removal and orphaned by a crash must stay claimed
+-- for REMOVAL: anything in 'removing' has desired_state ABSENT by invariant.
+UPDATE actions SET desired_state='ABSENT' WHERE state='removing';
+"""),
+    (10, "durable approval state machine", """
+-- P0 #16: an operator approval is DURABLE STATE, not just an audit event.
+-- Each approval cites the EXACT immutable decision instance
+-- (decision_id, seq) and pins the policy revision/content hash that
+-- authorized it. One approval instance per decision instance:
+-- uq_approvals_per_decision makes a decision awaiting approval impossible
+-- to approve twice (a second attempt is refused at the database, not by
+-- API control flow). Rejection likewise terminates the proposal.
+CREATE TABLE decision_approvals (
+    approval_id     TEXT PRIMARY KEY,
+    decision_id     TEXT NOT NULL,
+    decision_seq    BIGINT NOT NULL,
+    outcome         TEXT NOT NULL CHECK (outcome IN ('approved','rejected')),
+    actor           TEXT NOT NULL,
+    reason          TEXT NOT NULL DEFAULT '',
+    policy_version  TEXT NOT NULL,
+    policy_content_sha256 TEXT NOT NULL,
+    action_ids      TEXT[] NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at      TIMESTAMPTZ,
+    FOREIGN KEY (decision_id, decision_seq)
+        REFERENCES decisions (decision_id, seq)
+);
+CREATE UNIQUE INDEX uq_approvals_per_decision
+    ON decision_approvals (decision_id, decision_seq);
+CREATE INDEX idx_approvals_decision ON decision_approvals(decision_id, created_at DESC);
+"""),
+    (15, "behavioral live evidence (audit #17-#22): server-derived rows", """
+-- Behavioral detections attach OUTSIDE an ingest batch: their provenance
+-- is the controller itself (the governed local-behavioral principal,
+-- audit #22), not a source-submitted batch. batch_id becomes nullable;
+-- observation_hash becomes NOT NULL — every behavioral row still carries
+-- its deterministic observation identity (audit P1 #16).
+ALTER TABLE evidence ALTER COLUMN batch_id DROP NOT NULL;
+ALTER TABLE evidence ALTER COLUMN observation_hash SET NOT NULL;
+CREATE INDEX idx_evidence_behavioral ON evidence (source_id)
+    WHERE batch_id IS NULL;
+"""),
+    (16, "tamper-evident audit chain (audit #38)", """
+-- Audit #38: make security-state audit records HARDER to alter. The
+-- application layer was already append-oriented; this adds database-level
+-- defense in depth WITHOUT requiring a separate runtime DB role (which an
+-- operator should still deploy for provider-grade assurance):
+--
+--   prev_hash + row_hash chain each event to its predecessor. Editing or
+--   deleting a historical row breaks the chain at that point and every
+--   later row fails re-verification — silent history rewrites become
+--   DETECTABLE, not merely discouraged. The chain is maintained by
+--   triggers so no application code path can skip it.
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS prev_hash TEXT;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS row_hash TEXT;
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE OR REPLACE FUNCTION apip_audit_chain_fn() RETURNS trigger AS $$
+DECLARE
+  prev TEXT;
+BEGIN
+  SELECT row_hash INTO prev FROM audit_events
+  ORDER BY event_id DESC LIMIT 1;
+  NEW.prev_hash := prev;
+  NEW.row_hash := encode(digest(
+      concat(NEW.event_id, '|', NEW.at, '|', NEW.actor, '|',
+             NEW.event_type, '|', NEW.subject, '|',
+             COALESCE(NEW.detail::text, '{}'), '|', COALESCE(prev, '')),
+      'sha256'), 'hex');
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS apip_audit_chain ON audit_events;
+CREATE TRIGGER apip_audit_chain
+    BEFORE INSERT ON audit_events
+    FOR EACH ROW EXECUTE FUNCTION apip_audit_chain_fn();
+
+-- Block silent mutation of history at the DB permission layer: the
+-- application connects as a role that may only INSERT/SELECT audit rows.
+-- (The migration runner's role is intentionally more privileged; a
+-- deployment that separates them satisfies audit #38's stronger form.)
+REVOKE UPDATE, DELETE ON audit_events FROM PUBLIC;
 """),
 ]
 

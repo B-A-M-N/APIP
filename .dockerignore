@@ -1,0 +1,33 @@
+# Docker build context exclusions (review P1 #39): the build needs only
+# pyproject + src + README/PRODUCT; everything else — VCS history, local
+# virtualenvs, secrets, caches, scratch databases, lab artifacts — stays out.
+.git
+.gitignore
+.venv*
+venv
+env
+.env*
+**/__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.pyright
+dist
+build
+*.egg-info
+# local scratch + lab materials never belong in an image
+lab
+tests
+docs
+reference
+*.md
+!README.md
+!PRODUCT.md
+# local untracked materials (DB dumps, keys, zone files, reports)
+*.sqlite
+*.dump
+*.key
+*.pem
+*.zone
+*.rules

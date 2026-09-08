@@ -403,6 +403,8 @@ def test_diff_shared_infra_blocks_l5():
         ],
         sources=["curated-a", "curated-b"])
     result = _assert_equivalent(case)
-    # wildcard-free fqdn cannot reach L5 anyway; the shared penalty must
-    # appear identically in both engines
-    assert any("shared" in r or r == "shared_cdn" for r in result["reason_codes"]) or True
+    # the shared_cdn evidence kind must carry through as a reason code in
+    # BOTH engines — the demotion is the product claim under test
+    # (audit #39: falsifiable assertions)
+    assert "shared_cdn" in result["reason_codes"], \
+        result["reason_codes"]

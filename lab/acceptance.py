@@ -86,6 +86,7 @@ import psycopg2  # noqa: E402
 import psycopg2.extensions  # noqa: E402
 
 from apip.config.service import AdapterConfig, DatabaseConfig, load_config  # noqa: E402
+from apip.ledger.repo import Ledger  # noqa: E402
 from apip.domain.models import (  # noqa: E402
     ActionSelector, Decision, Evidence, Indicator,
 )
@@ -129,18 +130,19 @@ def _propose(ctrl, *, did: str, ind_id: str, value: str,
                            source_class="local",
                            observed_at=_utc(minutes_ago=20), independent=True),),
         tags=("c2",))
-    ctrl.ledger.upsert_indicator(ind, batch_id)
+    durable = ctrl.ledger.upsert_indicator(ind, batch_id)
     sel = ActionSelector(scope_type="destination_global", destination=value)
     d = Decision(
-        id=did, indicator_id=ind.id, maliciousness=97, action_safety=90,
+        id=did, indicator_id=durable, maliciousness=97, action_safety=90,
         disposition="PROPOSE_OPERATOR_APPROVAL", action="dns_nxdomain", rung="L4",
         scope=ctrl.current_policy().scope, ttl_seconds=3600,
         policy_version=ctrl.current_policy().version,
         reason_codes=("proposed",), explanation="acceptance proposal",
         selector=sel,
         content_hash="hash-" + hashlib.sha256(did.encode()).hexdigest())
-    ctrl.ledger.record_decision(d, indicator_id=ind.id, batch_id=batch_id,
+    ctrl.ledger.record_decision(d, indicator_id=durable, batch_id=batch_id,
                                 policy_content_sha256="sha", actor=ACTOR)
+    return durable
 
 
 # --------------------------------------------------------------------------- #
@@ -235,8 +237,9 @@ def drop_scratch(name: str, socket_dir: str = SOCKET_DIR) -> None:
 # lab resolver server (lab/resolver.py imported for the real UDP answers)
 # --------------------------------------------------------------------------- #
 class _ResolverThread:
-    """Run lab/resolver.py's serve() in a background thread honoring only
-    ENFORCE zones (monitor-only SHADOW zones are NOT consumed)."""
+    """Run lab/resolver.py's serve() in a background thread. Only the LIVE
+    ``IN CNAME .`` policy action bites; the shadow artifact's rpz-passthru
+    rules are answered as baseline no matter what file the harness reads."""
 
     def __init__(self, zone_path: str):
         self._zone_path = zone_path
@@ -244,9 +247,11 @@ class _ResolverThread:
 
     def start(self) -> None:
         from lab.resolver import serve  # noqa: PLC0415
+        # honor_zone=True: _owned() only bites on the LIVE ``IN CNAME .``
+        # policy action, so shadow artifacts are inert by construction.
         self._thread = threading.Thread(
             target=serve, args=(RESOLVER_BIND, RESOLVER_PORT, self._zone_path,
-                                BASELINE_NAME, False), daemon=True)
+                                BASELINE_NAME, True), daemon=True)
         self._thread.start()
         time.sleep(0.3)
 
@@ -353,15 +358,15 @@ def _shadow_leg(ctrl, zone_dir: str) -> tuple[str, str, str]:
     channel = IngestChannel(source_id=SOURCE,
                             allowed_source_ids=frozenset({SOURCE}))
     pb = parse_indicator_payload(json.dumps(payload).encode(), channel)
-    for ind in pb.indicators:
-        ctrl.ledger.upsert_indicator(ind, "batch--acep-shadow")
+    assert pb.indicators, "shadow-leg payload must parse to >=1 indicator"
+    durable = ctrl.ledger.upsert_indicator(pb.indicators[0], "batch--acep-shadow")
     print(f"      ingested {C2_NAME}; evidence recorded")
 
     _step(5, "APIP generates a deterministic decision")
-    res = ctrl.pipeline.decide_indicator("indicator--acceptance-c2", actor=ACTOR)
+    res = ctrl.pipeline.decide_indicator(durable, actor=ACTOR)
     assert res and res["recorded"]
     # determinism: same evidence + policy -> same content hash (no recompute)
-    again = ctrl.pipeline.decide_indicator("indicator--acceptance-c2", actor=ACTOR)
+    again = ctrl.pipeline.decide_indicator(durable, actor=ACTOR)
     decision = res["decision"]
     print(f"      deterministic {decision.disposition} "
           f"(M={decision.maliciousness}, action={decision.action}); "
@@ -382,20 +387,25 @@ def _shadow_leg(ctrl, zone_dir: str) -> tuple[str, str, str]:
     assert action["adapter"] == "rpz", action["adapter"]
     print(f"      action {action_id} pending (adapter=rpz, mode={action['mode']})")
 
-    _step(8, "adapter validates the candidate (SHADOW monitor-only zone)")
-    zone = Path(zone_dir) / f"{ZONE_NAME}.zone"
-    assert zone.exists()
-    text = zone.read_text()
-    assert C2_NAME in text and "MONITOR-ONLY" in text
+    _step(8, "adapter validates the candidate (SHADOW -> shadow artifact only)")
+    shadow_zone = Path(zone_dir) / f"{ZONE_NAME}.shadow.zone"
+    live_zone = Path(zone_dir) / f"{ZONE_NAME}.zone"
+    assert shadow_zone.exists(), "SHADOW must publish its own shadow artifact"
+    assert not live_zone.exists(), \
+        "SHADOW must never create the resolver-consumed live artifact"
+    text = shadow_zone.read_text()
+    assert C2_NAME in text and "rpz-passthru" in text and "CNAME ." not in text, \
+        "shadow artifact must carry rpz-passthru (spec no-op), never CNAME ."
     # no fabricated receipt: dispatch recorded observed infra state
     receipts = ctrl.ledger.list_receipts(action_id)
     assert receipts and "observed" in receipts[0]
-    print(f"      applied; receipt carries observed infra; monitor-only zone written")
+    print(f"      applied; receipt carries observed infra; "
+          f"rpz-passthru shadow artifact written (no live artifact)")
 
-    _step(9, "SHADOW: no live resolver behavior change (monitor-only zone)")
+    _step(9, "SHADOW: no live resolver behavior change (shadow artifact only)")
     res9 = _loopback_dns("shadow-baseline", C2_NAME, 0, addresses=["10.99.0.9"])
     print(f"      {C2_NAME!r} still NOERROR {res9['addresses']} "
-          f"(monitor-only zone not consumed)")
+          f"(shadow artifact not consumed; even if attached, rpz-passthru is a no-op)")
 
     return "decision--acep-shadow", "indicator--acceptance-c2", action_id
 
@@ -418,16 +428,17 @@ def _enforce_leg(ctrl, zone_dir: str, shadow_action_id: str) -> None:
     action_id = _approve_and_dispatch(ctrl, "decision--acep-enforce")
     zone = Path(zone_dir) / f"{ZONE_NAME}.zone"
     text = zone.read_text()
-    assert C2_NAME in text and "MONITOR-ONLY" not in text
+    assert C2_NAME in text and "CNAME ." in text and "rpz-passthru" not in text, \
+        "ENFORCE artifact carries the live NXDOMAIN policy action"
     action = ctrl.ledger.get_action(action_id)
-    # create_action_from_decision tags an operator-approved PROPOSE decision's
-    # action mode "SHADOW"; the ADAPTER posture (ENFORCE here) is what governs
-    # whether a live zone is written and live-verified. Step 12 proves the live
-    # dimension through a real DNS query.
+    # The PERSISTED action mode is authoritative (review P0 #1): an
+    # operator-approved PROPOSE under an ENFORCE policy persists ENFORCE,
+    # which is what makes the live zone + NXDOMAIN contract honest. The
+    # adapter's ENFORCE posture is the cap that permits it.
+    assert action["mode"] == "ENFORCE", action["mode"]
     assert ctrl._adapter_for(action).max_mode() == "ENFORCE"
-    assert action["mode"] in ("SHADOW", "ENFORCE"), action["mode"]
-    print(f"      ENFORCE rule written; monitor-only marker cleared "
-          f"(adapter posture=ENFORCE)")
+    print(f"      ENFORCE rule written; persisted action mode=ENFORCE "
+          f"(policy-derived, adapter-capped)")
 
     _step(12, "APIP independently verifies the resolver state")
     verify = ctrl._adapter_for(action).verify(
@@ -449,7 +460,9 @@ def _enforce_leg(ctrl, zone_dir: str, shadow_action_id: str) -> None:
     print(f"      real UDP query for {C2_NAME!r} -> rcode={res13['rcode']} (NXDOMAIN)")
 
     _step(14, "ledger shows decision, policy, evidence, adapter receipt, verification")
-    evidence = ctrl.ledger.indicator_evidence("indicator--acep-enforce")
+    # server-derived identity (P0 #10): evidence lives under the DURABLE id
+    enforce_durable = Ledger.observable_id("fqdn", C2_NAME)
+    evidence = ctrl.ledger.indicator_evidence(enforce_durable)
     assert len(evidence) >= 1
     receipts = ctrl.ledger.list_receipts(action_id)
     assert any(r["status"] == "verified" for r in receipts)
@@ -469,7 +482,7 @@ def _enforce_leg(ctrl, zone_dir: str, shadow_action_id: str) -> None:
     gone = ctrl._adapter_for(action).verify(
         {"rule_id": action["rule_id"], "fragment": action["fragment"],
          "mode": action["mode"], "selector": action["selector"]})
-    assert not gone.get("ok")
+    assert not gone.get("ok"), f"verify after removal still ok: {gone}"
     print(f"      removal verified ({gone.get('error')})")
 
     _step(18, "real query proves baseline restored")
@@ -481,7 +494,7 @@ def _enforce_leg(ctrl, zone_dir: str, shadow_action_id: str) -> None:
              ind_id="indicator--acep-ttl", value=TTL_NAME,
              batch_id="batch--acep-ttl")
     ttl_action_id = _approve_and_dispatch(ctrl, "decision--acep-ttl")
-    assert f"{TTL_NAME}." in zone.read_text()
+    assert f"{TTL_NAME} IN CNAME ." in zone.read_text()
     _loopback_dns("ttl-nxdomain", TTL_NAME, 3)
     # force the action past its expiry and drive the controlled removal path
     ctrl.db.execute("UPDATE actions SET expires_at=%s WHERE action_id=%s",
@@ -504,13 +517,25 @@ def main() -> int:
                     help="Postgres unix-socket dir (default %(default)s)")
     ap.add_argument("--no-db-check", action="store_true",
                     help="run even if no Postgres is reachable (will fail fast)")
+    ap.add_argument("--require-postgres", action="store_true",
+                    help="RELEASE mode (review P1 #40): no skip. When no "
+                         "Postgres is reachable, exit non-zero instead of "
+                         "printing SKIP. CI and the release checklist always "
+                         "invoke this mode — acceptance evidence may never be "
+                         "an empty set of skipped steps.")
     args = ap.parse_args()
     socket_dir = args.socket_dir
 
-    if not can_connect(socket_dir) and not args.no_db_check:
-        print(f"SKIP: no reachable Postgres on socket dir {socket_dir!r}; "
-              "the always-on baseline stays green without a database.", flush=True)
-        return 0
+    if not can_connect(socket_dir):
+        if args.require_postgres:
+            print(f"FAIL: --require-postgres set but no reachable Postgres on "
+                  f"socket dir {socket_dir!r}; release acceptance may not "
+                  f"skip.", flush=True)
+            return 2
+        if not args.no_db_check:
+            print(f"SKIP: no reachable Postgres on socket dir {socket_dir!r}; "
+                  "the always-on baseline stays green without a database.", flush=True)
+            return 0
 
     from apip.controller.service import Controller  # noqa: PLC0415
     from apip.ledger.db import Database  # noqa: PLC0415
@@ -541,12 +566,14 @@ def main() -> int:
             c.start()
             return c
 
-        # step 1 start (SHADOW posture, its own monitor-only zone dir)
+        # step 1 start (SHADOW posture, its own shadow-only zone dir)
         ctrl = _make_controller("SHADOW", shadow_zone_dir)
-        # A real lab resolver serves the whole run, pointing at the ACTIVE
-        # zone dir each leg; honor_zone=False models that a real enforcement
-        # resolver does NOT consume the monitor-only SHADOW zone.
-        resolver = _ResolverThread(str(Path(shadow_zone_dir) / f"{ZONE_NAME}.zone"))
+        # The lab resolver serves the whole run, pointing at the ACTIVE zone
+        # dir each leg. The SHADOW leg points it at the shadow ARTIFACT
+        # itself: the shadow artifact carries only rpz-passthru rules, so
+        # even a resolver pointed straight at it cannot produce an
+        # enforcement answer (the structural no-op guarantee, exercised).
+        resolver = _ResolverThread(str(Path(shadow_zone_dir) / f"{ZONE_NAME}.shadow.zone"))
         resolver.start()
         decision_id, ind_id, shadow_action_id = _shadow_leg(ctrl, shadow_zone_dir)
 

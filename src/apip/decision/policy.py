@@ -258,6 +258,40 @@ def _allowlisted(value: str, policy: Policy) -> tuple[bool, str]:
     return False, ""
 
 
+def policy_allows_presence(value: str, itype: str, mode: str,
+                           policy: Policy) -> str | None:
+    """Re-authorization predicate for an ALREADY-ACTIVE control (audit
+    P0 #5): returns None when the CURRENT policy still permits this
+    control's presence, else the reason it no longer does. Deliberately
+    mirrors the evaluate() gates that would decide the control's fate
+    today — an active control is an installed instance of a policy
+    decision, so the policy that no longer issues the decision no longer
+    justifies the control:
+
+      - the mode gate: a persisted ENFORCE posture under a policy that
+        no longer permits ENFORCE is stale (a demotion never blocks a
+        weaker control);
+      - the allowlist gate (absolute precedence): a now-allowlisted
+        target must not stay interdicted;
+      - the scope gate: a target that left the authorized scope.
+
+    Re-running full evaluate() is NOT wanted here: score inputs (evidence
+    recency) drift with time and would churn controls for reasons
+    unrelated to the operator's policy promotion. Only the three
+    STABLE authorization gates are re-checked."""
+    if policy.mode == "OFF":
+        return "posture_not_permitted: current policy mode is OFF"
+    if mode == "ENFORCE" and policy.mode != "ENFORCE":
+        return (f"posture_not_permitted: persisted ENFORCE under "
+                f"current policy mode {policy.mode}")
+    hit, hit_reason = _allowlisted(value, policy)
+    if hit and policy.allowlist_precedence:
+        return f"allowlisted_under_current_policy: {hit_reason}"
+    if not in_scope(value, itype, policy):
+        return (f"target_out_of_scope_under_current_policy: {value}")
+    return None
+
+
 def _current_epoch(policy: Policy) -> str:
     """Effective randomization epoch (reference P1-8): explicit epoch, else
     derived from the policy clock bucketed by rotation interval, else "0"."""
@@ -275,10 +309,20 @@ def _current_epoch(policy: Policy) -> str:
     return "0"
 
 
+def _family_of_kind(kind: str) -> str | None:
+    """`behavioral_<family>` -> `<family>`; None for non-behavioral kinds
+    or a `behavioral_` kind that names no detector family (which is a
+    provenance problem, not a policy-gated family)."""
+    if not kind.startswith(BEHAVIORAL_PREFIX):
+        return None
+    fam = kind[len(BEHAVIORAL_PREFIX):]
+    return fam or None
+
+
 def _behavioral_families(indicator: Indicator, registry) -> set[str]:
     fams: set[str] = set()
     for ev in indicator.evidence:
-        if ev.kind.startswith(BEHAVIORAL_PREFIX) and registry.class_of(ev.source_id) == "local":
+        if ev.kind.startswith(BEHAVIORAL_PREFIX) and registry.effective_class(ev.source_id) == "local":
             fams.add(ev.kind)
     return fams
 
@@ -440,18 +484,36 @@ def select_rung(indicator: Indicator, policy: Policy, m: int, s_ctx: int, s_ip: 
     return rung, action, reasons, selector, rand_records
 
 
-def _decision_bearing_evidence(indicator: Indicator, registry) -> Indicator:
+def _decision_bearing_evidence(indicator: Indicator, registry,
+                               policy: Policy | None = None
+                               ) -> tuple[Indicator, tuple[str, ...]]:
     """Reference P0-4: strip non-authoritative records BEFORE dedup/cap/score
-    so their quantity/order/size can never touch the decision."""
-    kept = [
-        ev for ev in indicator.evidence
-        if registry.class_of(ev.source_id) not in ZERO_WEIGHT_CLASSES
-    ]
+    so their quantity/order/size can never touch the decision.
+
+    Audit #23: behavioral evidence of a family the effective policy has NOT
+    enabled is likewise non-decision-bearing — an operator disabling a
+    family in policy must not have scoring silently consume it when it
+    enters the ledger. Returns the bounded indicator plus the disabled
+    family kinds dropped (surfaced as reason codes)."""
+    kept = []
+    dropped_disabled: list[str] = []
+    for ev in indicator.evidence:
+        if registry.effective_class(ev.source_id) in ZERO_WEIGHT_CLASSES:
+            continue
+        if (policy is not None and ev.kind.startswith(BEHAVIORAL_PREFIX)
+                and _family_of_kind(ev.kind) is not None
+                and policy.enabled_behavioral_families
+                and _family_of_kind(ev.kind)
+                not in policy.enabled_behavioral_families):
+            dropped_disabled.append(ev.kind)
+            continue
+        kept.append(ev)
     if len(kept) == len(indicator.evidence):
-        return indicator
-    return Indicator(
+        return indicator, ()
+    return (Indicator(
         id=indicator.id, type=indicator.type, value=indicator.value,
-        sources=indicator.sources, evidence=tuple(kept), tags=indicator.tags)
+        sources=indicator.sources, evidence=tuple(kept), tags=indicator.tags),
+        tuple(dropped_disabled))
 
 
 def _bounded_evidence(indicator: Indicator, policy: Policy) -> tuple[Indicator, int]:
@@ -522,9 +584,12 @@ def evaluate(indicator: Indicator, policy: Policy,
     protocol_class = context.get("protocol_class")
     registry = policy.source_registry
 
-    indicator = _decision_bearing_evidence(indicator, registry)
+    indicator, disabled_fams = _decision_bearing_evidence(
+        indicator, registry, policy)
     indicator, dup_dropped = dedup_evidence(indicator, registry)
     reasons_base = {f"evidence_deduplicated:{dup_dropped}"} if dup_dropped else set()
+    for fam in sorted(set(disabled_fams)):
+        reasons_base.add(f"behavioral_family_disabled_by_policy:{fam}")
     indicator, ev_dropped = _bounded_evidence(indicator, policy)
 
     classifier = make_recency_classifier(policy)
@@ -577,7 +642,7 @@ def evaluate(indicator: Indicator, policy: Policy,
     external_qualified, _ = _external_corroboration(indicator, registry, classifier)
 
     shared = any(ev.kind in SHARED_INFRA_KINDS
-                 and registry.class_of(ev.source_id) not in NON_AUTHORITATIVE_CLASSES
+                 and registry.effective_class(ev.source_id) not in NON_AUTHORITATIVE_CLASSES
                  for ev in indicator.evidence)
     infra_state = "shared" if shared else ("dedicated" if has_dedicated else "unknown")
 
@@ -612,10 +677,19 @@ def evaluate(indicator: Indicator, policy: Policy,
             rung = "L4"
             reasons = tuple(sorted(set(reasons) | {"wildcard_requires_approval"}))
         elif indicator.type == "cidr":
+            # audit #28: CIDR is a DEAD PRODUCT BRANCH — no configured
+            # adapter can express a CIDR deny (compile refuses prefixes;
+            # capability registry marks it materializable=false,
+            # reason=no_supported_adapter). The decision records the
+            # observation honestly as OBSERVE with the gap named; it never
+            # reaches a proposal path inviting an approval that would
+            # compile to zero actions.
             action = "firewall_deny"
-            disposition = "PROPOSE_OPERATOR_APPROVAL" if policy.mode == "ENFORCE" else "SHADOW_ACTION"
+            disposition = "OBSERVE"
             rung = "NONE"
-            reasons = tuple(sorted(set(reasons) | {"prefix_requires_approval"}))
+            reasons = tuple(sorted(set(reasons) | {
+                "prefix_requires_approval",
+                "materialization_unavailable:no_supported_adapter"}))
         else:
             rung, action, ladder_reasons, selector, rand_records = select_rung(
                 indicator, policy, m, s_ctx, s_ip, behavioral_fams,

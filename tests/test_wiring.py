@@ -193,7 +193,7 @@ class _FakeController:
     def adapter(self):
         return _FakeAdapter("rpz")
 
-    def approve_decision(self, decision_id, actor):
+    def approve_decision(self, decision_id, actor, reason=""):
         self.approve_calls.append((decision_id, actor))
         if decision_id == "decision--uncompilable":
             return {"decision_id": decision_id, "action_ids": [], "compiled": False}

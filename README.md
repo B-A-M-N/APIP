@@ -82,7 +82,7 @@ The **Attribution Lab** (`lab/`, see its README) demonstrates the `docs/30` requ
 - `docs/28_AI_ERA_ATTACK_POSTURE.md` — no-AI design invariant; deterministic counters to AI-era attack properties; automation abuse resistance.
 - `docs/29_DETERMINISTIC_RANDOMIZATION.md` — seeded randomization of defensive parameters within policy bounds; replay-preserving moving-target defense.
 - `docs/30_REQUESTER_ATTRIBUTION_AND_FINGERPRINTING.md` — deterministic challenge-based requester fingerprinting for campaign correlation; never an enforcement input.
-- `api/openapi.yaml` — draft control-plane REST contract.
+- `api/openapi.future.yaml` — forward-design control-plane contract (NOT implemented; the contract the beta product actually serves is `api/openapi.beta.json`, generated from the FastAPI app).
 - `sources.json` — machine-readable research source inventory.
 - `schemas/` — JSON schemas for indicators, decisions, and receipts.
 - `examples/` — safe sample configuration and synthetic indicators using reserved/test namespaces.
@@ -90,33 +90,43 @@ The **Attribution Lab** (`lab/`, see its README) demonstrates the `docs/30` requ
 
 ## Design in one diagram
 
+**Implementation state is marked on every node** (audit #39 classification
+standard: a capability counts as implemented only with the full
+observation → decision → actuator → independent-verification → rollback
+loop): ✅ beta-supported, 🟡 partially real, ❌ future design (no actuator).
+The beta's genuinely enforcing path is the DNS RPZ adapter.
+
 ```mermaid
 flowchart LR
-    A[Threat feeds / TAXII / local sensors] --> B[Normalizer]
-    T[Chokepoint telemetry<br/>DNS / flow / proxy / IDS] --> BD[Behavioral detection suite<br/>docs/23 — evidence only]
-    BD --> C[Evidence graph + dedup]
+    A[Threat feeds / TAXII / local sensors ✅] --> B[Normalizer ✅]
+    T[Chokepoint telemetry<br/>DNS / flow / IDS ✅ EVE tail] --> BD[Behavioral detection suite<br/>docs/23 — evidence only ✅ deterministic detectors]
+    BD --> C[Evidence graph + dedup ✅]
     B --> C
-    C --> D[Confidence & safety scoring]
-    D --> E[Policy engine]
-    E --> R[Rung selection<br/>L0-L7 ladder + demotions<br/>docs/25]
-    R --> F[Decision ledger]
-    F --> G[OpenC2-like enforcement intent<br/>+ randomized params docs/29]
-    G --> H1[DNS RPZ adapter<br/>L4 domain block]
-    G --> H2[Firewall / IPS adapter<br/>L2 rate-limit / L5 IP-deny / VP-1]
-    G --> H3[Proxy / WAF adapter<br/>L1 challenge / VP-2/VP-4]
-    G --> H5[NAC / host containment<br/>L6 quarantine]
-    G --> H4[Routing adapter<br/>L7 manual/high-risk]
-    H1 --> I[Authorized chokepoint]
-    H2 --> I
-    H3 --> I
-    H5 --> I
-    H4 --> I
-    I --> J[Many downstream protected systems<br/>incl. allow-first segments docs/26]
-    I --> K[Outcome telemetry]
+    C --> D[Confidence & safety scoring ✅]
+    D --> E[Policy engine ✅]
+    E --> R[Rung selection<br/>L0-L7 ladder + demotions<br/>docs/25 🟡 L1/L2/L5 have no actuator]
+    R --> F[Decision ledger ✅]
+    F --> G[OpenC2-like enforcement intent<br/>+ randomized params docs/29 ✅]
+    G --> H1["DNS RPZ adapter<br/>L4 exact-FQDN block ✅ (+ independent verify)"]
+    G --> H2["Firewall / IPS adapter<br/>L2 rate-limit / L5 IP-deny / VP-1 ❌ no actuator (Suricata exports IDS rules only)"]
+    G --> H3["Proxy / WAF adapter<br/>L1 challenge / VP-2/VP-4 ❌ no actuator"]
+    G --> H5["NAC / host containment<br/>L6 quarantine ❌ future"]
+    G --> H4["Routing adapter<br/>L7 manual/high-risk ❌ future"]
+    H1 --> I[Authorized chokepoint ✅ operator-managed resolver]
+    H2 -.-> I
+    H3 -.-> I
+    H5 -.-> I
+    H4 -.-> I
+    I --> J["Downstream protected systems<br/>allow-first segments docs/26 ❌ future"]
+    I --> K[Outcome telemetry ✅ verify + receipts]
     K --> C
     K --> F
     K --> BD
 ```
+
+Dashed edges are design intent with **no actuator today** — a decision that
+selects one of those rungs reports `decision valid / materialization
+unavailable` (never a proposal inviting approval).
 
 ## The v2 layer stack
 
@@ -170,18 +180,17 @@ The command writes:
 
 All example indicators use `.invalid` domains or TEST-NET IP space.
 
-Two budget knobs are enforced by the engine (overflow demotes/reverts with
+One budget knob is enforced by the engine (overflow demotes/reverts with
 named reason codes — never silently exceeds):
 
 - **Blast radius** (`max_new_auto_actions_per_batch`, docs/04 §8): one batch
   may propose at most that many AUTO_ENFORCE/SHADOW actions.
-- **L1 client impact** (`max_challenged_transaction_fraction_per_hour`,
-  docs/25): at most that fraction of the tenant's interactive transactions
-  may be *challenged* per hour; the overflow alarms and auto-reverts to L0.
-  The fraction's denominator is measured volume, supplied via
-  `[measurement].interactive_transactions_per_hour` or the CLI
-  `--transactions-per-hour` flag (flag wins). Fail closed: a set fraction
-  with no measurement reverts every challenge.
+
+The L1 challenge-fraction knobs (`max_challenged_transaction_fraction_per_hour`,
+`[measurement].interactive_transactions_per_hour`) are **rejected at policy
+load**: no proxy-challenge actuator exists to pace, so carrying them would be
+inert security configuration (audit #25 implement-or-reject rule). They may
+return when the L1 actuator ships.
 
 ## Standards and guidance anchors
 

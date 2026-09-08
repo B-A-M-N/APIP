@@ -139,7 +139,9 @@ attacked with a second battery of proofs-of-concept (sibling-reseller
 corroboration forgery, dedup evasion via timestamp jitter, expiry-boundary
 probing, unicode/invisible-character id injection, scope-escape entries,
 /32-vs-host allowlist mismatch, P5 bypass attempts). All 179 tests pass
-(v2.2 follow-up: 187 with the docs/25 client-impact budget closures),
+(v2.2 follow-up: 264 with the docs/25 client-impact budget closures and the
+v2.3 product/reference additions — the earlier "187" count was stale after
+the adversarial audits added tests),
 including 40+ new regression tests pinning every fix
 (`reference/tests/test_independent_audit.py`,
 `reference/tests/test_schema_conformance.py`).
@@ -172,3 +174,28 @@ operator-supplied measurement rather than live proxy telemetry, and a live
 deployment would additionally track the budget across batches within the
 hour; the vestigial scalar thresholds (`fqdn_auto_m` etc.) are retained for
 policy compatibility but superseded by rung floors.
+
+---
+
+## v2.3 follow-on (2026-09-03): release-verification-artifact audit
+
+A production-stable beta release audit re-ran the shipped verification
+artifacts (not just the docs) and found two that had silently drifted out of
+sync with the tree while their surrounding prose claimed live integrity:
+
+- **MANIFEST.json** was a v2.2-dated snapshot (2026-09-02) that never covered
+  the product package (`src/apip/`), `deploy/`, or `lab/acceptance.py`, and by
+  v2.3 had 43 of its 88 hashed files changed — yet `BUILD_VERIFICATION.txt`
+  asserted "all hashes match this tree." Regenerated it against the git tree:
+  **166 files**, SHA-256 over every tracked path except `MANIFEST.json` itself
+  (self-excluded); independently re-verified, all 166 match.
+- **BUILD_VERIFICATION.txt** cited `python -m unittest discover -s tests -v:
+  PASS (187 tests)`, but the product suite is pytest-run (that exact unittest
+  invocation discovers **0** tests at the repo root), stands at **190**
+  (product) / **264** (reference `unittest`). Corrected the count and
+  documented true reproductions for both suites; header moved to v2.3 and a
+  copy-paste MANIFEST verifier added.
+
+No production or test code changed in this pass — only the verification-record
+artifacts, so all 190 product tests, 264 reference tests, and the 20/20
+real-DNS acceptance loop remain green (re-confirmed after the edits).

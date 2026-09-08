@@ -29,13 +29,15 @@ _CLOCK_SKEW = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
 # anything else fails closed rather than shipping an inert knob.
 _SUPPORTED_RANDOMIZATION_MECHANISMS = frozenset({"ttl_jitter", "rate_ceiling"})
 
-# Behavioral families IMPLEMENTED by the runtime (apip.telemetry.behavioral).
-IMPLEMENTED_FAMILIES = frozenset({"beacon_periodicity", "first_seen_novelty"})
-# Explicitly UNIMPLEMENTED: a policy may name them (the gate stays honest),
-# and the runtime records them as pending rather than pretending to detect.
-PENDING_FAMILIES = frozenset({"dga_likelihood", "dns_tunneling", "fastflux",
-                              "volume_anomaly", "tls_metadata_mismatch",
-                              "sync_first_contact"})
+# Behavioral families come from ONE source of truth: the detector runtime
+# (apip.telemetry.behavioral, audit #23). All eight docs/23 families are
+# implemented as bounded deterministic detectors; PENDING_FAMILIES is empty
+# so an operator requesting a family is never told it exists while detecting
+# nothing.
+from apip.telemetry.behavioral import (  # noqa: E402
+    IMPLEMENTED_FAMILIES,
+    PENDING_FAMILIES,
+)
 
 _LADDER_ORDER = ["L1", "L2", "L4", "L5"]
 
@@ -44,10 +46,33 @@ _LADDER_ORDER = ["L1", "L2", "L4", "L5"]
 _P1_32_UNIMPLEMENTED_NESTED = {
     "limits": ("max_actions_per_bundle",
                "max_auto_actions_per_tenant_window",
-               "max_segment_denied_volume_alarm_per_hour"),
+               "max_segment_denied_volume_alarm_per_hour",
+               # audit knobs-implement-or-reject: the challenge-fraction
+               # limit gates L1 proxy challenges — and L1 has NO product
+               # actuator (audit #25, NOT MATERIALIZABLE). A knob that
+               # paces a non-existent actuator is inert configuration in a
+               # security product; rejected at load like the other
+               # unimplemented fields.
+               "max_challenged_transaction_fraction_per_hour"),
     "safety": ("require_expiry",),
 }
-_P1_32_UNIMPLEMENTED_SECTIONS = ("segments",)
+_P1_32_UNIMPLEMENTED_NESTED_sections_measurement = (
+    # audit knobs-implement-or-reject: measurement.interactive_transactions_
+    # per_hour feeds the same unimplemented L1 challenge budget; rejected.
+    "measurement",
+)
+# keep the helper name used below; the section list itself drives rejection
+_P1_32_UNIMPLEMENTED_SECTIONS = (
+    "segments",) + _P1_32_UNIMPLEMENTED_NESTED_sections_measurement
+
+# Legacy reference-parity thresholds (audit knobs-implement-or-reject):
+# loaded for differential-oracle parity with the reference loader (which
+# requires the keys), but action selection is governed SOLELY by the
+# [thresholds.rungs.*] floors and observe_m. They are NOT authoritative in
+# this runtime; a policy that omits them still loads (they default to 0),
+# and any future product use must come with an implementation, not this
+# comment. Documented here so the honest answer to "does ip_deny_m do
+# anything?" is: no — rung_floors["L5"] does.
 
 
 class PolicyValidationError(ValueError):
@@ -217,15 +242,10 @@ def validate_policy(raw: dict) -> list[str]:
     if _cap is not None and (not isinstance(_cap, int) or isinstance(_cap, bool)
                              or not (1 <= _cap <= 1024)):
         problems.append("limits.max_evidence_per_indicator must be an integer in [1,1024]")
-    cf = limits.get("max_challenged_transaction_fraction_per_hour")
-    if cf is not None and (isinstance(cf, bool) or not isinstance(cf, (int, float))
-                           or not (0 < float(cf) <= 1)):
-        problems.append(
-            "limits.max_challenged_transaction_fraction_per_hour must be a number in (0, 1] when set")
-    mi = (raw.get("measurement") or {}).get("interactive_transactions_per_hour")
-    if mi is not None and (not isinstance(mi, int) or isinstance(mi, bool) or mi < 0):
-        problems.append(
-            "measurement.interactive_transactions_per_hour must be a non-negative integer when set")
+    # audit knobs-implement-or-reject: max_challenged_transaction_fraction_
+    # per_hour and measurement.* are REJECTED below (unimplemented L1
+    # challenge budget) — their former per-field validation is gone with
+    # the knob itself.
     for pos, e in enumerate(raw.get("allowlist") or []):
         if not str(e.get("owner", "")).strip() or not str(e.get("ticket", "")).strip():
             problems.append(f"allowlist entry #{pos} must carry owner and ticket "
@@ -265,10 +285,13 @@ def validate_policy(raw: dict) -> list[str]:
                     "does not implement it; remove it or fail closed")
     for _section in _P1_32_UNIMPLEMENTED_SECTIONS:
         if raw.get(_section):
+            why = ("allow-first segment policies are not implemented"
+                   if _section == "segments" else
+                   "the L1 challenge budget it feeds is not implemented "
+                   "(no proxy_challenge actuator exists; audit #25)")
             problems.append(
                 f"unsupported policy section '{_section}': the runtime "
-                "does not implement allow-first segment policies; remove it or "
-                "fail closed")
+                f"does not implement it ({why}); remove it or fail closed")
     return problems
 
 

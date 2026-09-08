@@ -1,9 +1,15 @@
-APIP specification package verification — v2.2
-Date: 2026-09-02
+APIP specification package verification — v2.3
+Date: 2026-09-03
 
 Reference scaffold:
 - ./verify.sh: PASS (runs everything below, in order)
-- python -m unittest discover -s tests -v: PASS (187 tests)
+- cd reference && python -m unittest discover -s tests -v:
+  PASS (264 tests on 2026-09-03; count is the live suite — the v2.1.1/v2.2
+  adversarial audits added tests, so any earlier "187" is stale).
+  NOTE the product package (src/apip) is pytest-run: the same command from
+  the repo root discovers 0 tests (unittest does not collect pytest fixtures);
+  the reproduction for the product suite is
+  .venv-apip/bin/python -m pytest tests/  -> 190 passed.
 - no-AI conformance gate (docs/28): PASS (CI-enforced, see tests/
   test_no_ai_conformance.py — dependency allowlist, AI package ban list,
   inference-call-shape scan, ApipRng-only entropy, sockets-blocked run)
@@ -77,8 +83,15 @@ Data/interface validation:
   and JSON examples
 - OpenAPI YAML parse: PASS (PyYAML)
 - examples/policy.toml TOML parse: PASS
-- MANIFEST.json: 88 files hashed; verify with the snippet in that file's
-  directory (all hashes match this tree)
+- MANIFEST.json: 174 files hashed (manifest_version 5, regenerated
+  2026-09-07 after the 48-finding remediation — every tracked file except
+  MANIFEST.json itself, which is self-excluded); re-verified SHA-256 over
+  all 174 paths, all match this tree. Verify with:
+    python3 -c "import json,hashlib as h;m=json.load(open('MANIFEST.json'));\
+b=[f['path'] for f in m['files'] if h.sha256(open(f['path'],'rb').read()).hexdigest()!=f['sha256']];\
+print('DRIFT' if b else f'OK {len(m[\"files\"])} files')"
+  (the earlier "88 files" figure was a v2.2 snapshot that had drifted as the
+  product package, deploy/, and the lab driver were added in v2.3.)
 
 No-AI conformance (docs/28) — CI-ENFORCED via tests/test_no_ai_conformance.py,
 run inside verify.sh:

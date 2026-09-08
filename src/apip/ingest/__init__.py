@@ -40,7 +40,12 @@ MAX_EVIDENCE_PER_INDICATOR = 1_024
 MAX_SOURCES_PER_INDICATOR = 64
 MAX_TAGS_PER_INDICATOR = 64
 MAX_EVIDENCE_KIND_LEN = 128
-MAX_INDICATOR_FILE_BYTES = 512 * 1024 * 1024
+# ABSOLUTE safety ceiling (not configurable): no ingest payload may ever
+# exceed this, whatever the service config says (review P1 #28 — one
+# service-level configurable limit, one non-negotiable bound).
+ABSOLUTE_MAX_INGEST_BYTES = 512 * 1024 * 1024
+# Back-compat alias (older callers/tests).
+MAX_INDICATOR_FILE_BYTES = ABSOLUTE_MAX_INGEST_BYTES
 
 # Fields that are CLAIMS about authority or score — stripped from evidence
 # detail and never allowed to influence anything (docs/04).
@@ -67,6 +72,12 @@ class IngestChannel:
     """
     source_id: str
     allowed_source_ids: frozenset[str] = frozenset()
+    # Evidence kinds this channel's source may assert (P1 #29): empty = all
+    # allowed; anything else is DEMOTED to unregistered (zero scoring
+    # authority) rather than silently scored — the registry's documented
+    # boundary ("evidence kinds outside a source's allowed classes are
+    # demoted to unregistered").
+    allowed_kinds: frozenset[str] = frozenset()
 
     def resolve_source(self, asserted: str) -> str:
         """Resolve a payload source_id to its authoritative value."""
@@ -105,7 +116,8 @@ def _resolve_channel_source(channel: IngestChannel, asserted: str,
     return resolved
 
 
-def parse_indicator_payload(data: bytes, channel: IngestChannel) -> IngestBatch:
+def parse_indicator_payload(data: bytes, channel: IngestChannel,
+                            max_bytes: int = ABSOLUTE_MAX_INGEST_BYTES) -> IngestBatch:
     """Parse + normalize + channel-bind an indicator JSON payload.
 
     Raises IngestError (loudly) on structurally invalid input. Evidence
@@ -114,9 +126,10 @@ def parse_indicator_payload(data: bytes, channel: IngestChannel) -> IngestBatch:
     """
     raw_sha = raw_digest(data)
     bid = batch_id_for(channel.source_id, raw_sha)
-    if len(data) > MAX_INDICATOR_FILE_BYTES:
+    limit = min(max_bytes, ABSOLUTE_MAX_INGEST_BYTES)
+    if len(data) > limit:
         raise IngestError(
-            f"payload too large: {len(data)} bytes exceeds {MAX_INDICATOR_FILE_BYTES}")
+            f"payload too large: {len(data)} bytes exceeds {limit}")
     try:
         raw = json.loads(data)
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -177,6 +190,7 @@ def parse_indicator_payload(data: bytes, channel: IngestChannel) -> IngestBatch:
                 f"{MAX_EVIDENCE_PER_INDICATOR} records")
         evidence: list[Evidence] = []
         demote_counter = [0]
+        kind_disallowed = bool(channel.allowed_kinds)
         for ev in raw_evidence:
             if not isinstance(ev, dict):
                 raise IngestError(f"indicator {ind_id}: evidence record must be an object")
@@ -193,6 +207,13 @@ def parse_indicator_payload(data: bytes, channel: IngestChannel) -> IngestBatch:
             except UnsafeIdentifier as e:
                 raise IngestError(f"indicator {ind_id}: {e}") from e
             resolved = _resolve_channel_source(channel, ev_source, ind_id, demote_counter)
+            # P1 #29: an evidence kind outside the submitting source's
+            # allowed classes is demoted to unregistered (zero authority) —
+            # the kind boundary gates INGEST scoring, not silently ignored.
+            if kind_disallowed and ev_kind not in channel.allowed_kinds:
+                if resolved != _UNREGISTERED:
+                    demote_counter[0] += 1
+                resolved = _UNREGISTERED
             observed_at = str(ev.get("observed_at", obj.get("last_seen", "")) or "")
             if observed_at and not is_iso_utc(observed_at):
                 raise IngestError(

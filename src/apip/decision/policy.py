@@ -258,6 +258,40 @@ def _allowlisted(value: str, policy: Policy) -> tuple[bool, str]:
     return False, ""
 
 
+def policy_allows_presence(value: str, itype: str, mode: str,
+                           policy: Policy) -> str | None:
+    """Re-authorization predicate for an ALREADY-ACTIVE control (audit
+    P0 #5): returns None when the CURRENT policy still permits this
+    control's presence, else the reason it no longer does. Deliberately
+    mirrors the evaluate() gates that would decide the control's fate
+    today — an active control is an installed instance of a policy
+    decision, so the policy that no longer issues the decision no longer
+    justifies the control:
+
+      - the mode gate: a persisted ENFORCE posture under a policy that
+        no longer permits ENFORCE is stale (a demotion never blocks a
+        weaker control);
+      - the allowlist gate (absolute precedence): a now-allowlisted
+        target must not stay interdicted;
+      - the scope gate: a target that left the authorized scope.
+
+    Re-running full evaluate() is NOT wanted here: score inputs (evidence
+    recency) drift with time and would churn controls for reasons
+    unrelated to the operator's policy promotion. Only the three
+    STABLE authorization gates are re-checked."""
+    if policy.mode == "OFF":
+        return "posture_not_permitted: current policy mode is OFF"
+    if mode == "ENFORCE" and policy.mode != "ENFORCE":
+        return (f"posture_not_permitted: persisted ENFORCE under "
+                f"current policy mode {policy.mode}")
+    hit, hit_reason = _allowlisted(value, policy)
+    if hit and policy.allowlist_precedence:
+        return f"allowlisted_under_current_policy: {hit_reason}"
+    if not in_scope(value, itype, policy):
+        return (f"target_out_of_scope_under_current_policy: {value}")
+    return None
+
+
 def _current_epoch(policy: Policy) -> str:
     """Effective randomization epoch (reference P1-8): explicit epoch, else
     derived from the policy clock bucketed by rotation interval, else "0"."""

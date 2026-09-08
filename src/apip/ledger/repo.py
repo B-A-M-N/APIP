@@ -523,6 +523,17 @@ SELECT * FROM actions WHERE state IN ('applied','verified','drifted')
 ORDER BY created_at LIMIT %s
 """, (older_than, limit))
 
+    def actions_active_state(self, limit: int = 1000) -> list[dict]:
+        """All non-terminal, infra-bearing actions (audit P0 #5): the
+        policy-promotion reconciliation set. Every row here physically
+        exists (or is about to) at an actuator, so each must re-justify
+        its presence under the CURRENT effective policy. Full rows — the
+        controlled removal path reads fragment/selector/mode."""
+        return self.db.query("""
+SELECT * FROM actions WHERE state IN ('applied','verified','drifted')
+ORDER BY created_at LIMIT %s
+""", (limit,))
+
     def active_action_count(self) -> int:
         row = self.db.query_one(
             "SELECT count(*) AS n FROM actions WHERE state IN ('pending','applied','verified','drifted')")

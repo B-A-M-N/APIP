@@ -228,6 +228,10 @@ def _controller_for(name: str, zone_dir: str):
 
 def _seed_pending_action(led: Ledger, db, tag: str) -> str:
     ind = f"{tag}.recovery.operator.test"
+    # cite the ACTIVE policy revision's content hash (audit P0 #6: dispatch
+    # verifies the decision's policy binding before applying)
+    active = led.current_policy_row()
+    policy_sha = active["content_sha256"] if active else "sha"
     db.execute(
         "INSERT INTO indicators (indicator_id, itype, value) VALUES (%s, "
         "'fqdn', %s) ON CONFLICT DO NOTHING", (f"indicator--{tag}", ind))
@@ -237,8 +241,8 @@ INSERT INTO decisions (decision_id, seq, indicator_id, batch_id, maliciousness,
     policy_version, policy_content_sha256, reason_codes, explanation,
     content_hash)
 VALUES (%s, 1, %s, NULL, 95, 95, 'AUTO_ENFORCE', 'dns_nxdomain', 'L5', '*',
-        600, 'recovery', 'sha', '{}', 'recovery', 'h--' || %s)
-""", (f"decision--{tag}", f"indicator--{tag}", tag))
+        600, 'recovery', %s, '{}', 'recovery', 'h--' || %s)
+""", (f"decision--{tag}", f"indicator--{tag}", policy_sha, tag))
     db.execute("""
 INSERT INTO actions (action_id, decision_id, decision_seq, indicator_id, adapter,
     action_type, mode, selector, rule_id, fragment, fragment_hash, bundle_id,

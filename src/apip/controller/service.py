@@ -25,6 +25,7 @@ from apip.config.service import ServiceConfig
 from apip.controller.engine import DecisionPipeline, now_iso_utc
 from apip.decision.policy import in_scope
 from apip.decision.policy import Policy
+from apip.decision.policy import policy_allows_presence
 from apip.domain.models import ActionSelector, Decision
 from apip.ingest import IngestBatch
 from apip.ledger.db import Database, DatabaseUnavailable
@@ -419,15 +420,15 @@ class Controller:
             results["resumed"] = True
 
         granted = 0
-        # the blast-radius budget is the batch's EFFECTIVE policy knob:
-        # the tenant's tighten-only merge when an overlay governs, else the
-        # global policy (batch-level cap; per-indicator tenant overrides
-        # arrive with the per-indicator tenant plumbing).
-        budget = None
-        if tenant_id is not None:
-            t_policy = self.effective_policy_for(tenant_id)
-            budget = (t_policy.max_new_auto_actions_per_batch
-                      if t_policy else None)
+        # the blast-radius budget is the batch's EFFECTIVE policy knob,
+        # taken UNCONDITIONALLY (audit P0 #7): the tenant's tighten-only
+        # merge when an overlay governs, else the global policy. The cap
+        # previously applied only on the tenant path, so every shipped
+        # example policy's safety control was silently absent for global
+        # ingestion — the mainline path.
+        eff = self.effective_policy_for(tenant_id)
+        budget = (eff.max_new_auto_actions_per_batch
+                  if eff is not None else None)
         try:
             decide = DecisionPipeline(self.ledger)
             for ind in batch.indicators:
@@ -500,6 +501,18 @@ class Controller:
             raise LookupError(
                 f"indicator {row['indicator_id']} for decision {decision_id} missing")
         decision = decision_from_row(row)
+        # audit P0 #6: the proposal was produced under SOME policy revision;
+        # approve only under the CURRENT one. A semantic policy change
+        # invalidates pending proposals — they must be regenerated (the
+        # safer of the two allowed rules) rather than re-validated.
+        active_row = self.ledger.current_policy_row()
+        bound = row.get("policy_content_sha256")
+        current = active_row["content_sha256"] if active_row else None
+        if bound and current and bound != current:
+            raise ValueError(
+                f"decision {decision_id} was proposed under a different "
+                f"policy revision (content {bound[:12]}…; active "
+                f"{current[:12]}…); re-propose under the current policy")
         # claim the approval FIRST (atomic at the database): a concurrent
         # duplicate approve can never double-compile actions. If action
         # compilation then fails, the approval stands (durable operator
@@ -642,18 +655,25 @@ class Controller:
                 continue
             self._dispatch_one(action)
 
-    def _stale_authorization(self, action: dict) -> str | None:
-        """None when the action may still be applied; a reason string when
-        its creation-time authorization no longer holds under the CURRENT
-        effective policy (review P0 #7). Checks, in order:
+    def _stale_authorization(self, action: dict, *,
+                             require_current_revision: bool = True) -> str | None:
+        """None when the action may still be applied (or may remain
+        applied); a reason string when its authorization no longer holds
+        under the CURRENT effective policy (review P0 #7, audit P0 #5/#6).
+        Checks, in order:
           1. an effective policy still exists;
-          2. the target is still in the policy's authorized scope;
-          3. the persisted posture is still permitted — a policy demotion
-             never blocks (weaker is fine); a persisted ENFORCE under a
-             non-ENFORCE current policy is stale;
-          4. a PROPOSE-origin action's decision is still awaiting an operator
-             decision that happened (approval remains valid) — i.e. the
-             decision was not re-proposed/rejected meanwhile.
+          2. (require_current_revision — the DISPATCH path, audit P0 #6)
+             the persisted policy-content hash still matches the current
+             effective authorization revision: a pending action authorized
+             by an OLDER revision does not survive a policy promotion —
+             it must be regenerated under the new policy. The periodic
+             RECONCILE of already-applied controls deliberately does NOT
+             bind to the hash (a promotion would churn every control
+             regardless of semantics); it re-checks semantics only;
+          3. the shared presence predicate (audit P0 #5): posture gate,
+             allowlist gate, scope gate — exactly the evaluate() gates
+             that decide whether the policy would still issue this
+             control today.
         """
         ind_row = self.ledger.get_indicator(action["indicator_id"])
         if ind_row is None:
@@ -662,16 +682,23 @@ class Controller:
         policy = self.effective_policy_for(tenant_id)
         if policy is None:
             return "no_active_policy"
-        if not in_scope(ind_row["value"], ind_row["itype"], policy):
-            return ("target_out_of_scope_under_current_policy: "
-                    f"{ind_row['value']}")
-        if action["mode"] == "ENFORCE" and policy.mode != "ENFORCE":
-            return (f"posture_not_permitted: persisted ENFORCE under "
-                    f"current policy mode {policy.mode}")
-        if action.get("state") and action["decision_id"]:
-            dec = self.ledger.get_decision(action["decision_id"])
-            if dec is None:
+        if require_current_revision:
+            revision_row = self.ledger.current_policy_row()
+            decision = (self.ledger.get_decision(action["decision_id"])
+                        if action.get("decision_id") else None)
+            if decision is None:
                 return "authorizing_decision_missing"
+            bound = decision.get("policy_content_sha256")
+            current = revision_row["content_sha256"] if revision_row else None
+            if bound and current and bound != current:
+                return ("policy_revision_changed: decision was authorized "
+                        f"by policy content {bound[:12]}…; the active "
+                        f"revision is {current[:12]}… (audit P0 #6: "
+                        "regenerate under the current policy)")
+        reason = policy_allows_presence(ind_row["value"], ind_row["itype"],
+                                        action["mode"], policy)
+        if reason:
+            return reason
         return None
 
     def _dispatch_one(self, action: dict) -> None:
@@ -779,6 +806,29 @@ class Controller:
                 self._remove_action(action, CONTROLLER_ACTOR,
                                     "desired_absent_reconcile",
                                     terminal_state="revoked", revoked_by=None)
+        # 0c. policy-promotion reconciliation (audit P0 #5): an already-
+        #     applied/verified control is re-authorized against the CURRENT
+        #     effective policy. Verification alone would happily keep an
+        #     obsolete control healthy — backwards. A stale control commits
+        #     durable desired ABSENT and leaves through the SAME reconciler
+        #     path as expiry/revoke.
+        for action in self.ledger.actions_active_state():
+            cancel = self._stale_authorization(
+                action, require_current_revision=False)
+            if not cancel:
+                continue
+            if self.ledger.request_removal(
+                    action["action_id"],
+                    ("applied", "verified", "drifted")):
+                self.ledger.audit(CONTROLLER_ACTOR,
+                                  "action.policy_reconcile_invalidated",
+                                  action["action_id"], {"reason": cancel})
+                result = self._remove_action(
+                    action, CONTROLLER_ACTOR,
+                    f"policy_reconcile: {cancel}",
+                    terminal_state="revoked", revoked_by=None)
+                if result["state"] == "drifted":
+                    self.ledger.retry_removal(action["action_id"])
         # 1. expiry sweep: TTL reached -> remove via controlled path.
         # Commit the ABSENT intent FIRST (audit P0 #4), then remove: a crash
         # anywhere after the intent commit converges to removal, never apply.

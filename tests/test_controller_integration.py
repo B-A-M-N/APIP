@@ -149,8 +149,13 @@ def _record_approval_decision(ctrl, decision_id: str, value: str) -> None:
         scope=ctrl.current_policy().scope, ttl_seconds=3600, policy_version="beta",
         reason_codes=("proposed",), explanation="integration approval",
         selector=sel, content_hash="hash--" + hashlib.sha256(decision_id.encode()).hexdigest())
-    ctrl.ledger.record_decision(d, indicator_id=durable, batch_id=batch,
-                                policy_content_sha256="sha", actor="operator")
+    # the decision is bound to the ACTIVE policy revision's content hash
+    # (audit P0 #6: approval/dispatch verify this binding)
+    active = ctrl.ledger.current_policy_row()
+    ctrl.ledger.record_decision(
+        d, indicator_id=durable, batch_id=batch,
+        policy_content_sha256=(active["content_sha256"] if active else "sha"),
+        actor="operator")
 
 
 def test_approve_compiles_and_applies_action(controller):

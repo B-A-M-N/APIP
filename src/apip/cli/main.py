@@ -19,16 +19,25 @@ from pathlib import Path
 import click
 import httpx
 
-DEFAULT_BASE = "http://127.0.0.1:8510"
+from apip.config.service import DEFAULT_API_PORT
+
+# Audit #30: derived from the server's own default port so the documented
+# `apip serve` + `apip status` defaults can never disagree again.
+DEFAULT_BASE = f"http://127.0.0.1:{DEFAULT_API_PORT}"
 
 
 class Client:
-    def __init__(self, base: str | None = None, operator_token: str | None = None):
+    def __init__(self, base: str | None = None, operator_token: str | None = None,
+                 source_key: str | None = None):
         self.base = (base or os.environ.get("APIP_BASE", DEFAULT_BASE)).rstrip("/")
         self.token = operator_token or os.environ.get("APIP_OPERATOR_TOKEN", "")
+        headers = {"Authorization":
+                   f"Bearer {self.token}"} if self.token else {}
+        if source_key or os.environ.get("APIP_SOURCE_KEY"):
+            headers["x-apip-source-key"] = (source_key
+                                            or os.environ.get("APIP_SOURCE_KEY", ""))
         self._h = httpx.Client(base_url=self.base, timeout=30.0,
-                               headers={"Authorization":
-                                         f"Bearer {self.token}"} if self.token else {})
+                               headers=headers)
 
     def _request(self, method: str, path: str, **kw) -> dict:
         r = self._h.request(method, path, **kw)
@@ -51,9 +60,12 @@ class Client:
     def post(self, path: str, **kw) -> dict:
         return self._request("POST", path, **kw)
 
+    def delete(self, path: str, **kw) -> dict:
+        return self._request("DELETE", path, **kw)
 
-def _client(*, base=None, token=None) -> Client:
-    return Client(base=base, operator_token=token)
+
+def _client(*, base=None, token=None, source_key=None) -> Client:
+    return Client(base=base, operator_token=token, source_key=source_key)
 
 
 def _table(rows: list[dict], cols: list[str]) -> None:
@@ -178,23 +190,25 @@ def source_disable(ctx: click.Context, source_id: str) -> None:
               help="source class: local|curated|community|annotation")
 @click.option("--independent/--no-independent", default=False,
               help="source is independent for corroboration counting")
-@click.option("--no-auto-enforce", is_flag=True, default=False,
-              help="this source's evidence may not drive auto-enforcement")
+@click.option("--auto-enforce", is_flag=True, default=False,
+              help="OPT-IN: this source's evidence may drive auto-enforcement "
+                   "(audit #34: default is observation-only)")
 @click.option("--upstream", default=None,
               help="upstream source ids this channel proven to carry (comma-sep)")
 @click.option("--provenance-note", default="", help="free-text provenance")
 @click.pass_context
 def source_register(ctx: click.Context, source_id: str, source_class: str,
-                    independent: bool, no_auto_enforce: bool,
+                    independent: bool, auto_enforce: bool,
                     upstream: str | None, provenance_note: str) -> None:
     """Register an ingest source. Prints the one-time source secret key —
-    store it now (it is not retrievable again)."""
+    store it now (it is not retrievable again). New sources are
+    observation-only unless --auto-enforce is passed."""
     api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
     r = api.post("/sources/register", json={
         "source_id": source_id,
         "source_class": source_class,
         "independent": independent,
-        "auto_enforcement_allowed": not no_auto_enforce,
+        "auto_enforcement_allowed": auto_enforce,
         "upstream": upstream,
         "provenance_note": provenance_note,
     })
@@ -351,8 +365,9 @@ def decision_explain(ctx: click.Context, decision_id: str) -> None:
 
 @decision.command("approve")
 @click.argument("decision_id")
+@click.option("--reason", default="", help="why this approval was granted")
 @click.pass_context
-def decision_approve(ctx: click.Context, decision_id: str) -> None:
+def decision_approve(ctx: click.Context, decision_id: str, reason: str) -> None:
     """Compile a PROPOSE_OPERATOR_APPROVAL decision into action(s).
 
     The decision is rebuilt from ledger state (never re-decided), re-checked
@@ -360,10 +375,44 @@ def decision_approve(ctx: click.Context, decision_id: str) -> None:
     adapter. Audited with the operator identity.
     """
     api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
-    r = api.post(f"/decisions/{decision_id}/approve")
+    r = api.post(f"/decisions/{decision_id}/approve",
+                 json={"reason": reason} if reason else None)
+    if not r.get("compiled"):
+        click.echo("DECISION VALID / MATERIALIZATION UNAVAILABLE "
+                   "(audit #29): no configured adapter compiles this "
+                   "decision; nothing was approved into execution.")
+        for g in (r.get("materialization") or {}).get("gaps", []):
+            click.echo(f"  gap: {g}")
+        return
     click.echo(f"approved {decision_id} -> {len(r.get('action_ids', []))} action(s)")
     for aid in r.get("action_ids", []):
         click.echo(f"  {aid}")
+
+
+@decision.command("reject")
+@click.argument("decision_id")
+@click.option("--reason", default="operator_rejected",
+              help="recorded rejection reason (audit trail)")
+@click.pass_context
+def decision_reject(ctx: click.Context, decision_id: str, reason: str) -> None:
+    """Durably reject a proposal: this decision instance can NEVER be
+    approved afterwards."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    r = api.post(f"/decisions/{decision_id}/reject",
+                 json={"reason": reason})
+    click.echo(f"rejected {decision_id} ({r.get('state', 'rejected')})")
+
+
+@decision.command("approvals")
+@click.option("--limit", default=50, type=int)
+@click.pass_context
+def decision_approvals(ctx: click.Context, limit: int) -> None:
+    """Approval history: who approved what, when, citing which exact
+    decision instance."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    rows = api.get("/approvals", params={"limit": limit}).get("approvals", [])
+    _table(rows, ["approval_id", "decision_id", "decision_seq", "actor",
+                  "created_at", "reason"])
 
 
 @decision.command("replay")
@@ -582,6 +631,94 @@ def adapter_status(ctx: click.Context, name: str) -> None:
     h = api.get(f"/adapters/{name}").get("adapter", {})
     for k, v in h.items():
         click.echo(f"{k:<22} {v}")
+
+
+@adapter.command("capabilities")
+@click.pass_context
+def adapter_capabilities(ctx: click.Context) -> None:
+    """The TRUTHFUL capability matrix (audit #29): what each adapter can
+    actually materialize — action types, indicator types, selector shapes,
+    maximum posture, and whether enforcement is independently verifiable."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    for row in api.get("/adapters").get("adapters", []):
+        name = row.get("name", "?")
+        click.echo(f"{name}:")
+        for k in ("action_types", "indicator_types", "selector_shapes",
+                  "max_posture", "independent_verify"):
+            if k in row:
+                click.echo(f"  {k}: {row[k]}")
+
+
+# -- tenant overlays ------------------------------------------------------
+
+@cli.group("tenant")
+def tenant() -> None:
+    """Per-tenant policy overlays (stage/show/remove/history)."""
+
+
+@tenant.command("stage")
+@click.argument("tenant_id")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False))
+@click.pass_context
+def tenant_stage(ctx: click.Context, tenant_id: str, path: str) -> None:
+    """Stage a stricter-than-global overlay for one tenant (deterministic
+    monotonic merge; the effective policy is never more permissive than
+    the global)."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    r = api.post(f"/tenants/{tenant_id}/overlay",
+                 json={"text": Path(path).read_text()})
+    for p in r.get("problems", []):
+        click.echo(f"  PROBLEM: {p}")
+    if r.get("accepted"):
+        click.echo(f"staged overlay for {tenant_id}")
+    else:
+        raise click.ClickException("overlay did not validate; not staged")
+
+
+@tenant.command("show")
+@click.argument("tenant_id")
+@click.pass_context
+def tenant_show(ctx: click.Context, tenant_id: str) -> None:
+    """Show one tenant's staged overlay."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    r = api.get(f"/tenants/{tenant_id}/overlay")
+    click.echo(f"tenant {tenant_id}: {r.get('overlay', {})}")
+
+
+@tenant.command("list")
+@click.pass_context
+def tenant_list(ctx: click.Context) -> None:
+    """List all staged tenant overlays."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    _table(api.get("/tenants/overlays").get("overlays", []),
+           ["tenant_id", "overlay_sha256", "created_by", "created_at"])
+
+
+@tenant.command("remove")
+@click.argument("tenant_id")
+@click.pass_context
+def tenant_remove(ctx: click.Context, tenant_id: str) -> None:
+    """Remove a tenant's overlay (the tenant falls back to the global
+    policy exactly)."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"])
+    api.delete(f"/tenants/{tenant_id}/overlay")
+    click.echo(f"overlay removed for {tenant_id}")
+
+
+# -- batch status ---------------------------------------------------------
+
+@cli.command("batch")
+@click.argument("batch_id")
+@click.option("--source-key", default=None, help="source secret key (batch status is source-private)")
+@click.pass_context
+def batch_status(ctx: click.Context, batch_id: str, source_key: str | None) -> None:
+    """Batch processing status (processing / complete / failed + counts)."""
+    api = _client(base=ctx.obj["base"], token=ctx.obj["token"],
+                  source_key=source_key)
+    r = api.get(f"/ingest/{batch_id}")
+    for k in ("batch_id", "status", "indicator_count", "demoted_records",
+              "received_at", "completed_at", "failure"):
+        click.echo(f"{k:<18} {r.get(k, '')}")
 
 
 # -- audit -------------------------------------------------------------

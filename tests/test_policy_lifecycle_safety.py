@@ -142,7 +142,10 @@ def env():
         controller=replace(ControllerConfig(), reconcile_interval_s=0.2,
                            verify_interval_s=3600),
         adapter=replace(
+            # audit #31: an ENFORCE posture with the UNEDITED example zone
+            # name is refused at startup — fixtures use operator-owned values
             AdapterConfig(rpz_mode="ENFORCE", zone_dir=zone_dir,
+                          zone_name="apip.lifecycle.test",
                           reload_command="true",
                           verify_query_server="127.0.0.1",
                           verify_query_port=5333),

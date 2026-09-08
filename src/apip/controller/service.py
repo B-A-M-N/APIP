@@ -93,6 +93,9 @@ class ControllerState:
         self.is_leader: bool = False
         self.leader_id: str | None = None
         self.lease_s: int | None = None
+        # Audit #36: the lease has been observed expired/unclaimable while
+        # NO other leader is known — distinct from a healthy follower role.
+        self.lease_stale: bool = False
         self.lock = threading.Lock()
 
     def snapshot(self, *, db_health: dict, ledger: Ledger | None,
@@ -118,9 +121,15 @@ class ControllerState:
                 degraded.append(f"actions_drifted:{drifted}")
             if failed:
                 degraded.append(f"actions_failed:{failed}")
-            # a failed/stale reconciliation pass degrades readiness
+            # a failed/stale reconciliation pass degrades readiness — but
+            # ONLY for the leader. A healthy FOLLOWER correctly lost the
+            # lease; that is its ROLE, not a failure (audit #36: HA
+            # follower health was conflated with failed reconciliation).
             if self.last_reconcile_at is not None and not self.last_reconcile_ok:
-                degraded.append("reconciliation_failed")
+                if not (self.is_leader is False
+                        and self.last_reconcile_error
+                        == "follower (not lease leader)"):
+                    degraded.append("reconciliation_failed")
             # every configured adapter is surfaced; ANY unhealthy adapter degrades
             # the overall status (defense in depth: no silent single-adapter gap)
             for ah in (adapters_health or [adapter_health]):
@@ -171,6 +180,14 @@ class ControllerState:
                     "is_leader": self.is_leader,
                     "leader_id": self.leader_id,
                     "lease_s": self.lease_s,
+                    # Audit #36: ROLE is distinct from health. A standby is
+                    # "follower", not a failed controller; readiness can
+                    # distinguish control-plane mutation readiness (leader)
+                    # from API liveness (any role).
+                    "role": (
+                        "leader" if self.is_leader
+                        else ("lease_stale" if self.lease_stale
+                              else "follower")),
                 },
                 "degraded": degraded,
             }
@@ -219,6 +236,16 @@ class Controller:
             self.state.leader_id = self._leader_id
             self.state.lease_s = self._lease_s
             self.state.is_leader = holder
+            if not holder:
+                # Audit #36: distinguish a HEALTHY follower (another leader
+                # holds an unexpired lease) from a STALE lease (nobody is
+                # running the worker loops right now).
+                st = self.ledger.lease_state()
+                expires = st.get("expires_at") if st else None
+                self.state.lease_stale = bool(
+                    expires is not None and expires <= now)
+            else:
+                self.state.lease_stale = False
             return holder
 
     def _adapter_for(self, fragment: dict) -> EnforcementAdapter:
@@ -930,6 +957,8 @@ class Controller:
                 action_id=action_id, phase="apply", ok=result.get("ok", False),
                 detail=result, actor=CONTROLLER_ACTOR)
             if not result.get("ok"):
+                from apip.ops.metrics import inc
+                inc("apip_apply_failures_total")
                 self.ledger.set_action_state(
                     action_id, "failed", result.get("error", "apply_failed"),
                     CONTROLLER_ACTOR)
@@ -976,6 +1005,8 @@ class Controller:
                 verify_error = v.get("error", "verification_failed")
             except AdapterError as e:
                 verify_error = str(e)
+                from apip.ops.metrics import inc
+                inc("apip_verify_failures_total")
                 self.ledger.record_attempt(
                     action_id=action_id, phase="verify", ok=False,
                     detail={"error": verify_error}, actor=CONTROLLER_ACTOR)
@@ -983,6 +1014,8 @@ class Controller:
                 action_id, "applied", f"dispatched_unverified: {verify_error}",
                 CONTROLLER_ACTOR)
         except AdapterError as e:
+            from apip.ops.metrics import inc
+            inc("apip_apply_failures_total")
             self.ledger.record_attempt(action_id=action_id, phase="apply",
                                        ok=False, detail={"error": str(e)},
                                        actor=CONTROLLER_ACTOR)

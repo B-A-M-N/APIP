@@ -97,7 +97,10 @@ def controller():
         cfg = replace(
             load_config(None),
             db=DatabaseConfig(host=pg.HOST, port=pg.PORT, dbname=dburi, user=pg.USER),
-            adapter=replace(AdapterConfig(rpz_mode="SHADOW", zone_dir=zone),
+            # audit #31: an operator-owned zone name (the ENFORCE restart
+            # leg below inherits it; the sentinel example value is refused)
+            adapter=replace(AdapterConfig(rpz_mode="SHADOW", zone_dir=zone,
+                                          zone_name="apip.integration.test"),
                             authorized_domains=("operator.test",)),
         )
         db = Database(cfg.db.dsn_kwargs())
@@ -386,6 +389,8 @@ def test_persisted_mode_survives_posture_flip_restart(controller):
     # and zone dir: existing actions must not be upgraded.
     cfg_enf = replace(
         cfg,
+        # audit #31: operator-owned zone name — the unedited example value
+        # is refused at ENFORCE startup
         adapter=replace(cfg.adapter, rpz_mode="ENFORCE",
                         reload_command="true",
                         verify_query_server="127.0.0.1",

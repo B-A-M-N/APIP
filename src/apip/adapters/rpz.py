@@ -56,6 +56,7 @@ import datetime as _dt
 import hashlib
 import ipaddress
 import os
+import re
 import socket
 import stat
 import struct
@@ -72,6 +73,11 @@ from apip.domain.sanitize import rpz_comment_safe, validate_fqdn
 
 _SHADOW_ZONE_SUFFIX = ".shadow.zone"
 _LIVE_ZONE_SUFFIX = ".zone"
+
+# Audit #31: markers of an UNEDITED example config. Enabling ENFORCE while
+# these still stand means enforcing against the example's scope wall.
+_SENTINEL_MARKERS = re.compile(
+    r"(?:^|\.)(?:example\.operator\.net|apip\.shadow\.invalid)$", re.IGNORECASE)
 
 
 _SERIAL_MOD = 2**32   # SOA serials are 32-bit
@@ -201,6 +207,10 @@ class RpzAdapter:
         Resolver reachability itself is deliberately NOT a startup gate
         (a resolver may be transiently down when the controller boots);
         every verify path fails closed against an unreachable resolver.
+        Audit #31: known example/sentinel deployment values are refused in
+        ENFORCE — shipping an unedited example config into a live posture
+        means enforcing against the EXAMPLE's scope wall, not the
+        operator's.
         A probe failure refuses startup (fail closed to a posture that
         cannot silently lie)."""
         if self._mode != "ENFORCE":
@@ -214,6 +224,17 @@ class RpzAdapter:
             raise AdapterError(
                 "rpz ENFORCE mode requires " + ", ".join(missing) +
                 " (enforcement without reload+verify is unprovable)")
+        sentinels = [n for n, v in (
+            ("adapter.zone_name", self.config.zone_name),
+            ("adapter.authorized_domains",
+             (self.config.authorized_domains or ("",))[0]),
+        ) if v and _SENTINEL_MARKERS.search(str(v))]
+        if sentinels:
+            raise AdapterError(
+                "rpz ENFORCE mode refuses example/sentinel configuration "
+                "in " + ", ".join(sorted(set(sentinels))) +
+                " — replace the shipped example values with this "
+                "deployment's own scope before enabling enforcement")
         try:
             self._zone_dir.mkdir(parents=True, exist_ok=True)
             probe = self._zone_dir / ".apip-capability-probe"
@@ -829,4 +850,18 @@ class RpzAdapter:
         else:
             base["status"] = "degraded" if self._mode == "ENFORCE" else "ok"
             base["note"] = "zone file not yet created (no applies yet)"
+        # Audit #37: artifact generation as a metric surface — the serial
+        # IS the generation number; expose the active artifact's serial.
+        try:
+            with self._artifact_lock:
+                path = self._zone_path(self._mode == "ENFORCE")
+                if path.is_file():
+                    serial = _zone_serial(path.read_text(
+                        encoding="utf-8").splitlines())
+                else:
+                    serial = None
+            if serial is not None:
+                base["generation"] = serial
+        except Exception:      # noqa: BLE001 — health must not raise
+            pass
         return base

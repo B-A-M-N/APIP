@@ -16,6 +16,7 @@ import string
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from typing import Literal
 
@@ -69,7 +70,11 @@ class SourceRegistrationRequest(BaseModel):
     source_class: Literal["curated", "local", "community", "annotation",
                           "attribution"] = "local"
     independent: bool = False
-    auto_enforcement_allowed: bool = True
+    # Audit #34: a NEWLY registered intelligence principal does not get
+    # enforcement authority by omission. Auto-enforcement participation is
+    # an explicit operator opt-in (--auto-enforce / true in the payload);
+    # the default keeps a fresh feed observation-only.
+    auto_enforcement_allowed: bool = False
     upstream: str | None = Field(default=None, max_length=4096)
     allowed_kinds: list[str] = Field(default_factory=list, max_length=64)
     # audit P0 #8: the tenants this credential may submit for. Empty = a
@@ -108,16 +113,37 @@ def build_app(config: ServiceConfig,
     def _operator(authorization: str | None = Header(default=None)) -> dict:
         """Operator bearer-token auth for state-changing/read surfaces.
 
-        Uses the *injected* config's operator token (sourced from env/secret
-        at config build), never a re-read of os.environ at request time — so
-        an explicitly constructed ServiceConfig is honored. A config with no
-        token configured fails every operator call closed."""
-        expected = config.operator_token or ""
+        Uses the *injected* config's operator credentials (sourced from
+        env/secret at config build), never a re-read of os.environ at
+        request time — so an explicitly constructed ServiceConfig is
+        honored. A config with no token configured fails every operator
+        call closed.
+
+        Audit #33: when named principals are configured
+        (APIP_OPERATOR_TOKENS=actor_id:token,...), the token selects an
+        immutable actor id and EVERY audit event records which principal
+        acted. Without them the deployment is strictly single-operator and
+        the shared token acts as the documented "operator" identity."""
         supplied = _bearer_from(authorization)
+        principals = getattr(config, "operator_tokens", None) or {}
+        if principals:
+            for actor_id, expected in principals.items():
+                if constant_time_equals(expected, supplied):
+                    return {"actor": actor_id}
+            _auth_fail()
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED,
+                                "valid operator credential required")
+        expected = config.operator_token or ""
         if not expected or not constant_time_equals(expected, supplied):
+            _auth_fail()
             raise HTTPException(status.HTTP_401_UNAUTHORIZED,
                                 "valid APIP_OPERATOR_TOKEN required")
         return {"actor": "operator"}
+
+    def _auth_fail() -> None:
+        """Audit #37: every failed credential check is a counted event."""
+        from apip.ops.metrics import inc
+        inc("apip_source_auth_failures_total")
 
     INGEST_KEY_HEADER = "x-apip-source-key"
 
@@ -125,14 +151,17 @@ def build_app(config: ServiceConfig,
         """Channel-bound ingest auth: the presented SOURCE key selects the
         identity. Never trusts a payload-declared source_id."""
         if not x_apip_source_key:
+            _auth_fail()
             raise HTTPException(status.HTTP_401_UNAUTHORIZED,
                                 "x-apip-source-key required for ingest")
         row = controller.ledger.source_by_credential(
             x_apip_source_key, pepper=config.secret_key or "")
         if row is None:
+            _auth_fail()
             raise HTTPException(status.HTTP_401_UNAUTHORIZED,
                                 "unknown source key")
         if not row.get("enabled"):
+            _auth_fail()
             raise HTTPException(status.HTTP_403_FORBIDDEN,
                                 f"source {row['source_id']} disabled")
         return row
@@ -220,6 +249,8 @@ def build_app(config: ServiceConfig,
                 pass
         body = await request.body()
         if len(body) > max_ingest:
+            from apip.ops.metrics import inc
+            inc("apip_ingest_rejected_total")
             raise HTTPException(413,
                                 f"ingest body exceeds the "
                                 f"{max_ingest} byte limit")
@@ -234,6 +265,8 @@ def build_app(config: ServiceConfig,
             batch = parse_indicator_payload(body, channel,
                                             max_bytes=max_ingest)
         except IngestError as e:
+            from apip.ops.metrics import inc
+            inc("apip_ingest_rejected_total")
             raise HTTPException(400, str(e)) from e
         # The ONE durable ingest unit of work (review P0 #11/#12/#13):
         # begin 'processing' -> upsert/decide/act -> 'complete'. A replay of
@@ -356,6 +389,15 @@ def build_app(config: ServiceConfig,
         except DatabaseUnavailable:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
                                 "database unavailable")
+
+    @app.get("/metrics",
+             response_class=PlainTextResponse)
+    def metrics(_op: dict = Depends(_operator)) -> str:
+        """Prometheus text metrics (audit #37), AUTHENTICATED like /status —
+        metric labels carry adapter/tenant detail and must not be disclosed
+        to an unauthenticated prober."""
+        from apip.ops import metrics as ops_metrics
+        return ops_metrics.render(controller)
 
     # -- operator read surfaces --------------------------------------------------
 

@@ -478,6 +478,49 @@ ALTER TABLE evidence ALTER COLUMN observation_hash SET NOT NULL;
 CREATE INDEX idx_evidence_behavioral ON evidence (source_id)
     WHERE batch_id IS NULL;
 """),
+    (16, "tamper-evident audit chain (audit #38)", """
+-- Audit #38: make security-state audit records HARDER to alter. The
+-- application layer was already append-oriented; this adds database-level
+-- defense in depth WITHOUT requiring a separate runtime DB role (which an
+-- operator should still deploy for provider-grade assurance):
+--
+--   prev_hash + row_hash chain each event to its predecessor. Editing or
+--   deleting a historical row breaks the chain at that point and every
+--   later row fails re-verification — silent history rewrites become
+--   DETECTABLE, not merely discouraged. The chain is maintained by
+--   triggers so no application code path can skip it.
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS prev_hash TEXT;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS row_hash TEXT;
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE OR REPLACE FUNCTION apip_audit_chain_fn() RETURNS trigger AS $$
+DECLARE
+  prev TEXT;
+BEGIN
+  SELECT row_hash INTO prev FROM audit_events
+  ORDER BY event_id DESC LIMIT 1;
+  NEW.prev_hash := prev;
+  NEW.row_hash := encode(digest(
+      concat(NEW.event_id, '|', NEW.at, '|', NEW.actor, '|',
+             NEW.event_type, '|', NEW.subject, '|',
+             COALESCE(NEW.detail::text, '{}'), '|', COALESCE(prev, '')),
+      'sha256'), 'hex');
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS apip_audit_chain ON audit_events;
+CREATE TRIGGER apip_audit_chain
+    BEFORE INSERT ON audit_events
+    FOR EACH ROW EXECUTE FUNCTION apip_audit_chain_fn();
+
+-- Block silent mutation of history at the DB permission layer: the
+-- application connects as a role that may only INSERT/SELECT audit rows.
+-- (The migration runner's role is intentionally more privileged; a
+-- deployment that separates them satisfies audit #38's stronger form.)
+REVOKE UPDATE, DELETE ON audit_events FROM PUBLIC;
+"""),
 ]
 
 

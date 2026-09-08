@@ -27,7 +27,10 @@ class Ledger:
     # -- sources ------------------------------------------------------------
 
     def register_source(self, *, source_id: str, source_class: str, independent: bool,
-                        key_hash: str, actor: str, auto_enforcement_allowed: bool = True,
+                        key_hash: str, actor: str,
+                        # Audit #34: enforcement authority is an explicit
+                        # opt-in, never a registration default.
+                        auto_enforcement_allowed: bool = False,
                         upstream: str | None = None, enabled: bool = True,
                         allowed_kinds: tuple[str, ...] = (),
                         allowed_tenants: tuple[str, ...] = (),
@@ -985,3 +988,10 @@ ON CONFLICT (tenant_id) DO UPDATE SET
         rows = self.db.query(
             "SELECT state, count(*) AS n FROM actions GROUP BY state")
         return {r["state"]: int(r["n"]) for r in rows}
+
+    def decision_disposition_counts(self) -> dict:
+        """Decisions by disposition (audit #37 metrics surface)."""
+        rows = self.db.query(
+            "SELECT disposition, count(*) AS n FROM decisions "
+            "GROUP BY disposition")
+        return {r["disposition"]: int(r["n"]) for r in rows}

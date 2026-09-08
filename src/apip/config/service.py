@@ -20,11 +20,21 @@ from typing import Any
 from dataclasses import dataclass, field
 from pathlib import Path
 import os
+import string
 import tomllib
 
 
 class ConfigError(ValueError):
     pass
+
+
+def _safe_actor_id(value: str) -> bool:
+    """Operator actor ids land in audit rows and logs; keep them to the
+    same ASCII-only closed charset as source ids (no homoglyph look-alike
+    identities)."""
+    return bool(value) and all(
+        (c in string.ascii_letters or c in string.digits or c in "_-")
+        for c in value) and not value.isdigit()
 
 
 def _secret(env_key: str, what: str) -> str | None:
@@ -129,18 +139,30 @@ class AdapterConfig:
     suricata_authorized_prefixes: tuple[str, ...] = ()
 
 
+# Audit #30: ONE shared default API port for the server AND the CLI. The
+# documented bare-metal sequence `apip serve` then `apip status` must work
+# with defaults on both sides.
+DEFAULT_API_PORT = 8510
+
+
 @dataclass(frozen=True)
 class ServiceConfig:
     db: DatabaseConfig = field(default_factory=DatabaseConfig)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     adapter: AdapterConfig = field(default_factory=AdapterConfig)
     api_host: str = "127.0.0.1"
-    api_port: int = 8400
+    api_port: int = DEFAULT_API_PORT
     # Ingest caps (mirror the reference ingest boundary).
     # service-level ingest maximum (P1 #28); the parser enforces the
     # non-configurable ABSOLUTE ceiling (512 MiB) on top of this
     max_ingest_bytes: int = 10 * 1024 * 1024
     operator_token: str | None = None   # from env only
+    # Audit #33: NAMED operator principals. Mapping of immutable actor id ->
+    # bearer token. Empty = single-operator mode (the shared token acts as
+    # "operator", and the deployment is documented as strictly
+    # single-operator). Populated from APIP_OPERATOR_TOKENS as
+    # "actor_id:token" pairs separated by commas/whitespace.
+    operator_tokens: dict[str, str] = field(default_factory=dict)
     secret_key: str | None = None       # from env only
 
 
@@ -224,8 +246,8 @@ def load_config(path: str | Path | None = None) -> ServiceConfig:
         db=db, controller=controller, adapter=adapter,
         api_host=str(_env_layered(raw, "api.host", "APIP_API_HOST",
                                   "127.0.0.1")),
-        api_port=int(_env_layered(raw, "api.port", "APIP_API_PORT", 8400,
-                                  int)),
+        api_port=int(_env_layered(raw, "api.port", "APIP_API_PORT",
+                                  DEFAULT_API_PORT, int)),
         max_ingest_bytes=int(_env_layered(raw, "ingest.max_bytes",
                                           "APIP_INGEST_MAX_BYTES",
                                           10 * 1024 * 1024, int)),
@@ -263,6 +285,35 @@ def load_config(path: str | Path | None = None) -> ServiceConfig:
         operator_token=_secret("APIP_OPERATOR_TOKEN", "operator token"),
         secret_key=_secret("APIP_SECRET_KEY", "secret key"),
     )
+    # Audit #33: named operator principals. APIP_OPERATOR_TOKENS carries
+    # "actor_id:token" pairs (comma/whitespace separated), e.g.
+    #   APIP_OPERATOR_TOKENS="alice:hex1,bob:hex2"
+    # Actor ids are immutable audit identities: every audit event records
+    # WHICH principal acted, not just "operator". Tokens are never logged.
+    raw_tokens = os.environ.get("APIP_OPERATOR_TOKENS", "").strip()
+    if raw_tokens:
+        principals: dict[str, str] = {}
+        for pair in raw_tokens.replace("\n", ",").replace(" ", ",").split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            actor_id, sep, token = pair.partition(":")
+            actor_id, token = actor_id.strip(), token.strip()
+            if not sep or not actor_id or not token:
+                raise ConfigError(
+                    "APIP_OPERATOR_TOKENS entries must be actor_id:token "
+                    f"pairs (got {actor_id!r})")
+            if not _safe_actor_id(actor_id):
+                raise ConfigError(
+                    f"unsafe operator actor id {actor_id!r} in "
+                    "APIP_OPERATOR_TOKENS")
+            if actor_id in principals:
+                raise ConfigError(
+                    f"duplicate operator actor id {actor_id!r} in "
+                    "APIP_OPERATOR_TOKENS")
+            principals[actor_id] = token
+        if principals:
+            cfg = dataclasses.replace(cfg, operator_tokens=principals)
     db_password = _secret("APIP_DB_PASSWORD", "database password")
     if db_password:
         cfg = dataclasses.replace(cfg, db=DatabaseConfig(

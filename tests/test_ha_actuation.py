@@ -168,7 +168,7 @@ VALUES (%s, %s, 1, %s, 'rpz', 'dns_nxdomain', 'ENFORCE', %s, %s, %s, 'h',
         return action_id, candidate
 
     def rule_in_zone(self, zone: str, fqdn: str) -> bool:
-        p = Path(zone) / "apip.shadow.invalid.zone"
+        p = Path(zone) / "apip.ha.test.zone"
         if not p.is_file():
             return False
         return any(l.split(";")[0].strip().startswith(f"{fqdn} ")
@@ -194,7 +194,10 @@ def ha():
                                reconcile_interval_s=0.2,
                                verify_interval_s=3600),
             adapter=replace(
+                # audit #31: operator-owned zone name (the unedited example
+                # value is refused at ENFORCE startup)
                 AdapterConfig(rpz_mode="ENFORCE", zone_dir=zone_dir,
+                              zone_name="apip.ha.test",
                               reload_command="true",
                               verify_query_server="127.0.0.1",
                               verify_query_port=5333),
@@ -230,7 +233,7 @@ def test_follower_revoke_commits_intent_never_touches_own_adapter(ha):
     fqdn = "lead1.evil.corp.test"
     assert ha.rule_in_zone(ha.zone_a, fqdn)
     assert ha.rule_in_zone(ha.zone_b, fqdn)
-    zone_b_before = (Path(ha.zone_b) / "apip.shadow.invalid.zone").read_text()
+    zone_b_before = (Path(ha.zone_b) / "apip.ha.test.zone").read_text()
     # revoke served by B — the follower
     assert ha.b.state.is_leader is False
     out = ha.b.revoke_action(action_id, "operator", "operator_revoke")
@@ -241,7 +244,7 @@ def test_follower_revoke_commits_intent_never_touches_own_adapter(ha):
         (action_id,))
     assert row["desired_state"] == "ABSENT", row
     # B's artifact must be untouched by the follower
-    assert (Path(ha.zone_b) / "apip.shadow.invalid.zone").read_text() == \
+    assert (Path(ha.zone_b) / "apip.ha.test.zone").read_text() == \
         zone_b_before, "follower mutated its local adapter"
     # the LEADER's reconciler converges: A's artifact loses the rule and
     # the action reaches its terminal state

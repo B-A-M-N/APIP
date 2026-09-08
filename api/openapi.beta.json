@@ -249,6 +249,53 @@
         }
       }
     },
+    "/metrics": {
+      "get": {
+        "summary": "Metrics",
+        "description": "Prometheus text metrics (audit #37), AUTHENTICATED like /status \u2014\nmetric labels carry adapter/tenant detail and must not be disclosed\nto an unauthenticated prober.",
+        "operationId": "metrics_metrics_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/sources": {
       "get": {
         "summary": "List Sources",
@@ -2033,7 +2080,7 @@
           "auto_enforcement_allowed": {
             "type": "boolean",
             "title": "Auto Enforcement Allowed",
-            "default": true
+            "default": false
           },
           "upstream": {
             "anyOf": [

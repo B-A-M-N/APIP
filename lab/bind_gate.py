@@ -63,10 +63,11 @@ _steps: list[str] = []
 
 
 def _step(n: int, title: str) -> None:
-    print(f"\n[{n}/9] {title}", flush=True)
+    print(f"\n[{n}/10] {title}", flush=True)
 
 
 def _fail(msg: str) -> NoReturn:
+    _FAILED.append(msg)
     print(f"\nBIND GATE FAILED: {msg}", flush=True)
     try:
         logs = subprocess.run(["docker", "logs", "--tail", "40", BIND_NAME],
@@ -460,6 +461,12 @@ def _approve_and_dispatch(ctrl, did: str) -> tuple[str, dict]:
     return action_id, action
 
 
+def _serial_newer(a: int, b: int) -> bool:
+    """RFC 1982 serial arithmetic: a is newer than b iff (a-b) mod 2^32
+    falls in the first half of the 32-bit serial space."""
+    return ((a - b) % 2**32) < 2**31
+
+
 def _last_serial(zones_dir: Path, live: bool) -> int:
     suffix = ".zone" if live else ".shadow.zone"
     p = zones_dir / f"{ZONE_NAME}{suffix}"
@@ -544,6 +551,15 @@ def main() -> int:
     ctrl: Controller | None = None
     ctrl2: Controller | None = None
     serials: list[int] = []
+    serial_kinds: list[bool] = []   # parallel to serials: True = live artifact
+
+    def _publish(live: bool) -> None:
+        """Record the artifact's serial at a PUBLISH point — called exactly
+        once per generation change, so step 10 can demand strict per-
+        generation advancement (an equal pair here is a real defect: BIND
+        silently ignores a reload whose serial did not advance)."""
+        serials.append(_last_serial(zones_dir, live))
+        serial_kinds.append(live)
     try:
         # ---- start real BIND with BOTH artifacts attached -------------------
         _step(1, "start real BIND (named) with live+shadow RPZ attached to "
@@ -604,7 +620,7 @@ def main() -> int:
         _expect("shadow-no-change", C2_NAME, rcode=0, addresses=["10.99.0.9"])
         if C2_NAME in (zones_dir / f"{ZONE_NAME}.zone").read_text():
             _fail("SHADOW action leaked into the LIVE artifact")
-        serials.append(_last_serial(zones_dir, live=False))
+        _publish(False)
         print("      shadow artifact attached to a REAL resolver: answer "
               "unchanged (rpz-passthru is a no-op)")
 
@@ -632,7 +648,7 @@ def main() -> int:
                   f"revision={ctrl._active_policy_revision()!r} "
                   f"disposition={action['action_type']}")
         bind.named_checkzone(ZONE_NAME, zones_dir / f"{ZONE_NAME}.zone")
-        serials.append(_last_serial(zones_dir, live=True))
+        _publish(True)
         bind.reload()
         _expect("enforce-nxdomain", C2_NAME, rcode=3)
 
@@ -649,11 +665,16 @@ def main() -> int:
               f"{result['observed']['dns']['rcode']})")
 
         # ---- revoke -----------------------------------------------------------
-        _step(6, "operator revoke -> baseline restored")
+        # 41: no helper reload BEFORE the revoke verdict — APIP's own
+        # configured reload must cause the resolver change; the gate's
+        # diagnostic reload happens only after the verdict.
+        _step(6, "operator revoke -> baseline restored (APIP-caused, no helper reload first)")
         rev = ctrl.revoke_action(enforce_action_id, ACTOR, "operator_revoke")
         if rev.get("state") != "revoked":
-            _fail(f"revoke failed: {rev}")
-        bind.reload()
+            dump = ctrl.db.query(
+                "SELECT phase, ok, detail FROM adapter_attempts "
+                "WHERE action_id=%s ORDER BY at", (enforce_action_id,))
+            _fail(f"revoke failed: {rev}; attempts={json.dumps(dump, default=str)}")
         _expect("revoke-baseline", C2_NAME, rcode=0, addresses=["10.99.0.9"])
 
         # ---- TTL expiry --------------------------------------------------------
@@ -696,14 +717,100 @@ def main() -> int:
         if ctrl2.ledger.get_decision("decision--bind-shadow") is None:
             _fail("pre-restart decision lost across restart")
 
+        # ---- cross-posture stress leg --------------------------------------------
+        # Audit P0 #1 end-to-end: the SAME FQDN held by a SHADOW action and an
+        # ENFORCE action at once; revoking the SHADOW action must NOT touch
+        # the live ENFORCE control (this transition used to destroy it).
+        _step(9, "stress: SHADOW+ENFORCE coexist for one FQDN; SHADOW revoke "
+                 "preserves ENFORCE; ENFORCE expiry restores baseline")
+        shadow2_did = "decision--bind-stress-shadow"
+        _propose(ctrl2, did=shadow2_did, ind_id="indicator--bind-stress-shadow",
+                 value=C2_NAME, batch_id="batch--bind-stress-shadow")
+        # policy is ENFORCE here; the co-installed SHADOW posture is the
+        # historical promoted-then-expiring SHADOW action: flip the durable
+        # action's mode after a normal apply, then re-publish at SHADOW.
+        normal_action_id, _sa = _approve_and_dispatch(ctrl2, shadow2_did)
+        if _sa["mode"] != "ENFORCE":
+            _fail(f"stress action should be ENFORCE, got {_sa['mode']!r}")
+        stress_shadow_action = normal_action_id
+        dbnow = datetime.now(timezone.utc)
+        ctrl2.db.execute("UPDATE actions SET mode='SHADOW' WHERE action_id=%s",
+                         (stress_shadow_action,))
+        adapter = ctrl2._adapter_for({"adapter": "rpz"})
+        rs = adapter.apply({"action_id": stress_shadow_action,
+                            "decision_id": shadow2_did, "mode": "SHADOW",
+                            "action_type": "dns_nxdomain",
+                            "rule_id": f"owner:{C2_NAME}",
+                            "fragment": f"{C2_NAME} IN CNAME .",
+                            "selector": {"scope_type": "destination_global",
+                                         "exact_fqdn": C2_NAME},
+                            "ttl_seconds": 600})
+        if not rs.get("ok"):
+            _fail(f"stress SHADOW apply failed: {rs}")
+        bind.named_checkzone(f"{ZONE_NAME}.shadow",
+                             zones_dir / f"{ZONE_NAME}.shadow.zone")
+        bind.reload()
+        _expect("stress-shadow-present", C2_NAME, rcode=3)   # ENFORCE still wins
+        # revoke the SHADOW action through the LEDGER path (operator revoke):
+        # only the shadow artifact may change; live NXDOMAIN must survive.
+        rev2 = ctrl2.revoke_action(stress_shadow_action, ACTOR, "operator_revoke")
+        # the step-3 SHADOW action shares this rule_id+mode: it also owns the
+        # shadow line, so the stress revoke correctly DEFERS the physical
+        # removal while that co-owner is still active (review P0 #6). Retire
+        # the co-owner — its own revoke performs the physical removal — and
+        # only then must the shadow artifact be empty.
+        if rev2.get("state") == "revoked" and rev2.get("shared_rule"):
+            rev3 = ctrl2.revoke_action(shadow_action_id, ACTOR, "operator_revoke")
+            if rev3.get("state") != "revoked":
+                _fail(f"stress co-owner SHADOW revoke failed: {rev3}")
+        elif rev2.get("state") != "revoked":
+            _fail(f"stress SHADOW revoke failed: {rev2}")
+        if C2_NAME not in (zones_dir / f"{ZONE_NAME}.zone").read_text():
+            _fail("SHADOW revoke destroyed the live ENFORCE control "
+                  "(cross-posture revoke)")
+        _expect("stress-enforce-survives", C2_NAME, rcode=3)
+        if C2_NAME in (zones_dir / f"{ZONE_NAME}.shadow.zone").read_text():
+            _fail("stress SHADOW revoke left the shadow rule in place")
+        _publish(False)
+        print("      SHADOW revoke preserved the ENFORCE control")
+        # expire the ENFORCE action -> baseline restored
+        ctrl2.db.execute(
+            "UPDATE actions SET expires_at=%s WHERE action_id=%s",
+            (dbnow - timedelta(seconds=1), _restart_action_id))
+        from apip.controller.service import CONTROLLER_ACTOR as _CA
+        due2 = [a for a in ctrl2.ledger.actions_due_for_expiry(
+            datetime.now(timezone.utc)) if a["action_id"] == _restart_action_id]
+        if not due2:
+            _fail("stress ENFORCE action not due for expiry")
+        out2 = ctrl2._remove_action(due2[0], _CA, "ttl_expired",
+                                    terminal_state="expired", revoked_by=None)
+        if not out2.get("verified"):
+            _fail(f"stress ENFORCE expiry removal not verified: {out2}")
+        if C2_NAME in (zones_dir / f"{ZONE_NAME}.zone").read_text():
+            _fail("stress ENFORCE expiry left the live rule in place")
+        _publish(True)
+        bind.reload()
+        _expect("stress-baseline", C2_NAME, rcode=0, addresses=["10.99.0.9"])
+        print("      ENFORCE expiry restored the baseline")
+
         # ---- SOA serial monotonicity ---------------------------------------------
-        _step(9, "SOA serial advanced on every publish (reload propagates)")
-        serials.append(_last_serial(zones_dir, live=True))
-        serials.append(_last_serial(zones_dir, live=False))
-        distinct = [s for s in serials if s >= 0]
-        if len(distinct) < 2 or len(set(distinct)) < 2:
-            _fail(f"SOA serial did not advance across publishes: {serials}")
-        print(f"      serials observed: {sorted(set(distinct))}")
+        _step(10, "SOA serial advanced on EVERY publish, per artifact "
+                  "(per-generation, reload propagates)")
+        # serials were appended in publish order; each artifact's subsequence
+        # must STRICTLY advance (RFC 1982) — an identical or regressing
+        # serial means BIND would silently ignore that reload.
+        for live_flag, name in ((True, "live"), (False, "shadow")):
+            seq = [s for s, lf in zip(serials, serial_kinds) if lf == live_flag
+                   and s >= 0]
+            if len(seq) < 2:
+                _fail(f"{name} artifact has {len(seq)} observed serials; "
+                      f"need >= 2 publishes: {serials}")
+            for prev, nxt in zip(seq, seq[1:]):
+                if nxt == prev or not _serial_newer(nxt, prev):
+                    _fail(f"{name} artifact serial did not advance per "
+                          f"generation: {prev} -> {nxt} (all: {seq})")
+            print(f"      {name} serial generations: {seq}")
+        print(f"      all serials observed: {sorted(set(s for s in serials if s >= 0))}")
 
         print("\nBIND GATE PASSED: real named loaded the APIP artifacts, "
               "enforced NXDOMAIN via response-policy, restored baseline on "
@@ -718,13 +825,36 @@ def main() -> int:
         print(f"\nBIND GATE FAILED: {e!r}", flush=True)
         return 1
     finally:
+        failed = _FAILED[0] if _FAILED else None
+        if failed:
+            # 41: on failure, PRESERVE state for debugging instead of
+            # cleaning it away: keep the zone artifacts, the BIND log
+            # tail, and the container until the next run replaces them.
+            try:
+                import shutil as _sh
+                keep = Path("/tmp/apip-bind-gate-failure")
+                if keep.exists():
+                    _sh.rmtree(keep)
+                _sh.copytree(zones_dir, keep)
+                logs = subprocess.run(["docker", "logs", BIND_NAME],
+                                      capture_output=True, text=True,
+                                      timeout=30)
+                (keep / "named.log").write_text(
+                    logs.stderr + logs.stdout, encoding="utf-8")
+                print(f"\nfailure artifacts preserved in {keep} "
+                      f"(zones + named.log); container kept running",
+                      flush=True)
+            except Exception as diag_exc:
+                print(f"(failure-diagnostic capture failed: {diag_exc})",
+                      flush=True)
         for c in (ctrl, ctrl2):
             if c is not None:
                 try:
                     c.stop()
                 except Exception:
                     pass
-        bind.stop()
+        if not failed:
+            bind.stop()
         try:
             _c = _pg_connect("postgres")
             import psycopg2.extensions as _p2e
@@ -735,6 +865,9 @@ def main() -> int:
         except Exception:
             pass
         shutil.rmtree(zones_dir, ignore_errors=True)
+
+
+_FAILED: list[str] = []
 
 
 class _GateFailure(Exception):

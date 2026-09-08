@@ -57,9 +57,11 @@ import hashlib
 import ipaddress
 import os
 import socket
+import stat
 import struct
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -316,13 +318,24 @@ class RpzAdapter:
         self._zone_dir.mkdir(parents=True, exist_ok=True)
         content = "\n".join(lines) + "\n"
         suffix = ".zone" if live else ".shadow.zone"
-        tmp = self._zone_path(live).with_suffix(suffix + f".tmp-{os.getpid()}-{threading.get_ident()}-{os.urandom(4).hex()}")
+        target = self._zone_path(live)
+        tmp = target.with_suffix(suffix + f".tmp-{os.getpid()}-{threading.get_ident()}-{os.urandom(4).hex()}")
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, self._zone_path(live))
+            # os.replace swaps in a NEW inode: without this the artifact's
+            # mode becomes the writer's umask (commonly 0600) and the
+            # resolver user loses read access — the reload then fails with
+            # "permission denied" and the resolver silently keeps serving
+            # the PREVIOUS generation. Preserve the published artifact's
+            # mode (default 0644, resolver-readable).
+            try:
+                os.chmod(tmp, stat.S_IMODE(target.stat().st_mode))
+            except OSError:
+                os.chmod(tmp, 0o644)
+            os.replace(tmp, target)
         finally:
             if tmp.exists():
                 try:
@@ -590,16 +603,38 @@ class RpzAdapter:
                                     "zones": results, "reload": reload_info}
         if live:
             # ENFORCE rollback contract (audit P0 #2): prove the resolver
-            # stopped serving the APIP-induced answer. Without a configured
-            # resolver this degrades to the file+reload evidence above —
-            # surfaced honestly in the observed dict as resolver-unverified.
+            # stopped serving the APIP-induced answer, retrying boundedly —
+            # a reload (SIGHUP/rndc) is asynchronous, so an immediate probe
+            # races the resolver's own reload. Without a configured resolver
+            # this degrades to the file+reload evidence above — surfaced
+            # honestly in the observed dict as resolver-unverified.
             if self.config.verify_query_server:
-                dns = self._dns_query_nxdomain(owner)
-                observed["dns_after"] = dns
-                if dns.get("queried") and dns.get("rcode") == 3:
+                attempts: list[dict] = []
+                # Budget is the dedicated rollback budget, not a multiple of
+                # the per-query socket timeout: BIND defers a policy-zone
+                # load that "came too soon" (rate-limited against the SOA
+                # timers), so the loop must outlast a worst-case deferral.
+                deadline = time.monotonic() + max(
+                    1.0, self.config.revoke_verify_budget_s)
+                still_nxdomain = False
+                while time.monotonic() < deadline:
+                    dns = self._dns_query_nxdomain(owner)
+                    attempts.append(dns)
+                    if not dns.get("queried"):
+                        break   # resolver unreachable: not a behavior claim
+                    if dns.get("rcode") != 3:
+                        still_nxdomain = False
+                        break   # baseline class restored
+                    still_nxdomain = True
+                    time.sleep(0.5)
+                observed["dns_after"] = attempts[-1] if attempts else None
+                observed["dns_after_attempts"] = len(attempts)
+                if still_nxdomain:
+                    observed["dns_after_attempts"] = attempts
                     return {"ok": False,
                             "error": "resolver STILL answers NXDOMAIN after "
-                                     "revoke (rollback not verified)",
+                                     "revoke (rollback not verified within "
+                                     "the retry budget)",
                             "observed": observed}
         return {"ok": True, "observed": observed}
 

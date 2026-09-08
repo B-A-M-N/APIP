@@ -93,6 +93,11 @@ class AdapterConfig:
     verify_query_server: str = ""       # resolver to query for live verify
     verify_query_port: int = 53
     verify_timeout_s: float = 3.0
+    # Total budget for one rollback verification loop (audit P0 #2). Resolvers
+    # rate-limit RPZ policy-zone updates against the SOA timers ("zone version
+    # came too soon" defers the load), so this must cover a worst-case deferral
+    # — several multiples of the zone's refresh timer — not just one query.
+    revoke_verify_budget_s: float = 75.0
     # -- Suricata IPS / file exporter --------------------------------------
     suricata_mode: str = "OFF"          # OFF | OBSERVE | SHADOW | ENFORCE
     suricata_rules_dir: str = "/var/lib/apip/suricata"
@@ -180,6 +185,8 @@ def load_config(path: str | Path | None = None) -> ServiceConfig:
         verify_query_server=str(_get(raw, "adapter.verify_query_server", "")),
         verify_query_port=int(_get(raw, "adapter.verify_query_port", 53)),
         verify_timeout_s=float(_get(raw, "adapter.verify_timeout_s", 3.0)),
+        revoke_verify_budget_s=float(
+            _get(raw, "adapter.revoke_verify_budget_s", 75.0)),
         suricata_mode=str(_get(raw, "adapter.suricata_mode", "OFF")).upper(),
         suricata_rules_dir=str(_get(raw, "adapter.suricata_rules_dir", "/var/lib/apip/suricata")),
         suricata_rules_file=str(_get(raw, "adapter.suricata_rules_file", "apip.rules")),

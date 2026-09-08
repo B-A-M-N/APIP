@@ -325,7 +325,14 @@ fqdn_auto_m = 100
             # is stricter: disposition must be no-more-permissive than global's.
             # (given fqdn_auto_m=100 and a score < 100, tenant lands NO_ACTION /
             # OBSERVE where global may still act)
-            assert tres["decision"].disposition in ("NO_ACTION", "OBSERVE") or True
+            # audit #39: the product claim must be FALSIFIABLE — the tenant
+            # decision is strictly observed-or-nothing here; if the overlay
+            # ever stops tightening, this fails.
+            assert tres["decision"].disposition in ("NO_ACTION", "OBSERVE"), \
+                (tres["decision"].disposition, gres["decision"].disposition)
+            assert gres["decision"].disposition in ("NO_ACTION", "OBSERVE",
+                                                    "AUTO_ENFORCE",
+                                                    "PROPOSE_OPERATOR_APPROVAL")
         finally:
             ctrl.stop()
     finally:

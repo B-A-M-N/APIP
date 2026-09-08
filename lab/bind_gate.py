@@ -55,6 +55,7 @@ ZONE_NAME = "apip.rpz.test"          # the RPZ policy zone BIND consumes
 BASELINE_A = "baseline-test.operator.test"
 C2_NAME = "c2-test.operator.test"
 TTL_NAME = "ttl-exp.operator.test"
+REPEAT_NAME = "repeat.operator.test"   # audit #41 multi-cycle stress target
 ACTOR = "bind-gate"
 SOURCE = "local-sensor"
 SOCKET_DIR = "/var/run/postgresql"
@@ -169,8 +170,10 @@ def _expect(what: str, qname: str, *, rcode: int,
     SOA timer — so the bounded window must cover a worst-case deferral)."""
     deadline = time.monotonic() + timeout_s
     last: dict = {}
+    transcript: list[dict] = []   # audit #41: the resolver query transcript
     while time.monotonic() < deadline:
         last = dns_a(server, port, qname)
+        transcript.append(last)
         if last.get("queried") and last.get("rcode") == rcode \
                 and (addresses is None or last.get("addresses") == sorted(addresses)):
             print(f"      {what}: {qname!r} rcode={last['rcode']} "
@@ -178,7 +181,8 @@ def _expect(what: str, qname: str, *, rcode: int,
             return last
         time.sleep(0.3)
     _fail(f"{what}: {qname!r} expected rcode={rcode} addresses={addresses}, "
-          f"got {last}")
+          f"got {last}; query transcript ({len(transcript)} probes): "
+          f"{json.dumps(transcript[:20], default=str)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -205,6 +209,7 @@ $TTL 60
 baseline-test IN A 10.99.0.5
 c2-test IN A 10.99.0.9
 ttl-exp IN A 10.99.0.11
+repeat IN A 10.99.0.13
 """
 
 
@@ -624,8 +629,11 @@ def main() -> int:
             _fail(f"shadow action persisted mode {action['mode']!r}")
         bind.named_checkzone(f"{ZONE_NAME}.shadow",
                              zones_dir / f"{ZONE_NAME}.shadow.zone")
-        bind.reload()
+        # 40: the verdict below must be APIP-caused — the adapter's OWN
+        # reload_command published the shadow generation; no helper reload
+        # precedes the observation. A diagnostic reload runs after.
         _expect("shadow-no-change", C2_NAME, rcode=0, addresses=["10.99.0.9"])
+        bind.reload()
         if C2_NAME in (zones_dir / f"{ZONE_NAME}.zone").read_text():
             _fail("SHADOW action leaked into the LIVE artifact")
         _publish(False)
@@ -657,8 +665,10 @@ def main() -> int:
                   f"disposition={action['action_type']}")
         bind.named_checkzone(ZONE_NAME, zones_dir / f"{ZONE_NAME}.zone")
         _publish(True)
-        bind.reload()
+        # 40: NXDOMAIN must be APIP-caused (the adapter's own reload), not a
+        # helper reload; diagnostic reload follows the verdict.
         _expect("enforce-nxdomain", C2_NAME, rcode=3)
+        bind.reload()
 
         _step(5, "adapter verify() independently confirms NXDOMAIN over real "
                  "DNS")
@@ -691,8 +701,8 @@ def main() -> int:
                  ind_id="indicator--bind-ttl", value=TTL_NAME,
                  batch_id="batch--bind-ttl")
         ttl_action_id, _a = _approve_and_dispatch(ctrl, "decision--bind-ttl")
-        bind.reload()
         _expect("ttl-nxdomain", TTL_NAME, rcode=3)
+        bind.reload()
         ctrl.db.execute(
             "UPDATE actions SET expires_at=%s WHERE action_id=%s",
             (datetime.now(timezone.utc) - timedelta(seconds=1), ttl_action_id))
@@ -706,8 +716,8 @@ def main() -> int:
                                   terminal_state="expired", revoked_by=None)
         if not out.get("verified"):
             _fail(f"ttl expiry removal not verified: {out}")
-        bind.reload()
         _expect("ttl-baseline", TTL_NAME, rcode=0, addresses=["10.99.0.11"])
+        bind.reload()
 
         # ---- restart APIP -------------------------------------------------------
         _step(8, "restart APIP (fresh controller, same ledger) -> re-apply -> "
@@ -720,8 +730,8 @@ def main() -> int:
         _restart_action_id, action = _approve_and_dispatch(
             ctrl2, "decision--bind-restart")
         bind.named_checkzone(ZONE_NAME, zones_dir / f"{ZONE_NAME}.zone")
-        bind.reload()
         _expect("restart-nxdomain", C2_NAME, rcode=3)
+        bind.reload()
         if ctrl2.ledger.get_decision("decision--bind-shadow") is None:
             _fail("pre-restart decision lost across restart")
 
@@ -757,8 +767,8 @@ def main() -> int:
             _fail(f"stress SHADOW apply failed: {rs}")
         bind.named_checkzone(f"{ZONE_NAME}.shadow",
                              zones_dir / f"{ZONE_NAME}.shadow.zone")
-        bind.reload()
         _expect("stress-shadow-present", C2_NAME, rcode=3)   # ENFORCE still wins
+        bind.reload()
         # revoke the SHADOW action through the LEDGER path (operator revoke):
         # only the shadow artifact may change; live NXDOMAIN must survive.
         rev2 = ctrl2.revoke_action(stress_shadow_action, ACTOR, "operator_revoke")
@@ -797,12 +807,35 @@ def main() -> int:
         if C2_NAME in (zones_dir / f"{ZONE_NAME}.zone").read_text():
             _fail("stress ENFORCE expiry left the live rule in place")
         _publish(True)
-        bind.reload()
         _expect("stress-baseline", C2_NAME, rcode=0, addresses=["10.99.0.9"])
+        bind.reload()
         print("      ENFORCE expiry restored the baseline")
 
+        # ---- repeated posture stress (audit #41) ---------------------------------
+        # Serial/reload sequencing defects hide behind single cycles: the
+        # SHADOW -> ENFORCE -> revoke cycle runs AGAIN against the same
+        # artifacts, so per-generation serial advancement and reload
+        # propagation are proven across MANY publishes in one run.
+        _step(10, "repeated posture stress: ENFORCE -> revoke -> ENFORCE on a "
+                  "second FQDN (multi-cycle serial/reload rigor)")
+        for cycle in (1, 2):
+            rep_did = f"decision--bind-repeat-{cycle}"
+            _propose(ctrl2, did=rep_did, ind_id=f"indicator--bind-repeat-{cycle}",
+                     value=REPEAT_NAME, batch_id=f"batch--bind-repeat-{cycle}")
+            rep_action_id, _ra = _approve_and_dispatch(ctrl2, rep_did)
+            _expect(f"repeat-{cycle}-nxdomain", REPEAT_NAME, rcode=3)
+            _publish(True)
+            rev_r = ctrl2.revoke_action(rep_action_id, ACTOR, "operator_revoke")
+            if rev_r.get("state") != "revoked":
+                _fail(f"repeat cycle {cycle} revoke failed: {rev_r}")
+            _expect(f"repeat-{cycle}-baseline", REPEAT_NAME, rcode=0,
+                    addresses=["10.99.0.13"])
+            _publish(True)
+            print(f"      repeat cycle {cycle}: ENFORCE -> revoke -> baseline")
+        bind.reload()
+
         # ---- SOA serial monotonicity ---------------------------------------------
-        _step(10, "SOA serial advanced on EVERY publish, per artifact "
+        _step(11, "SOA serial advanced on EVERY publish, per artifact "
                   "(per-generation, reload propagates)")
         # serials were appended in publish order; each artifact's subsequence
         # must STRICTLY advance (RFC 1982) — an identical or regressing
@@ -849,8 +882,21 @@ def main() -> int:
                                       timeout=30)
                 (keep / "named.log").write_text(
                     logs.stderr + logs.stdout, encoding="utf-8")
+                # audit #41: debugging context — observed serials per
+                # artifact, container state/exit code
+                (keep / "serials.json").write_text(json.dumps({
+                    "serials": serials, "serial_kinds": serial_kinds,
+                }, indent=2), encoding="utf-8")
+                state = subprocess.run(
+                    ["docker", "ps", "-a", "--filter",
+                     f"name={BIND_NAME}",
+                     "--format", "{{.Status}}"],
+                    capture_output=True, text=True, timeout=30)
+                (keep / "container_state.txt").write_text(
+                    state.stdout, encoding="utf-8")
                 print(f"\nfailure artifacts preserved in {keep} "
-                      f"(zones + named.log); container kept running",
+                      f"(zones + named.log + serials.json + "
+                      f"container_state.txt); container kept running",
                       flush=True)
             except Exception as diag_exc:
                 print(f"(failure-diagnostic capture failed: {diag_exc})",

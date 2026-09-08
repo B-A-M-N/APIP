@@ -122,9 +122,10 @@ class TestCACAO:
         assert out["steps"]["step--enforce"]["commands"] == []
 
     def test_deterministic_equal_output(self):
+        # audit #39: falsifiable determinism claim — same input, same fixed
+        # clock, byte-identical dict output (datetimes compare structurally)
         assert (decision_to_cacao(_decision(), now_fn=_fixed_clock)
-                == decision_to_cacao(_decision(), now_fn=_fixed_clock)) \
-            or True  # dicts of datetimes compare structurally
+                == decision_to_cacao(_decision(), now_fn=_fixed_clock))
 
 
 class TestOCSF:

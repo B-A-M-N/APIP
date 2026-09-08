@@ -2003,6 +2003,14 @@
             "maxItems": 64,
             "title": "Allowed Kinds"
           },
+          "allowed_tenants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 64,
+            "title": "Allowed Tenants"
+          },
           "provenance_note": {
             "type": "string",
             "maxLength": 2048,

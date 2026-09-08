@@ -601,7 +601,15 @@ class Controller:
         SERIALIZED against every other removal path by the same CAS claim
         the lease-holding worker uses (review P0 #21): no operator call can
         mutate the adapter concurrently with a worker expiry/reconcile, and
-        two operators revoking on different controllers cannot double-remove."""
+        two operators revoking on different controllers cannot double-remove.
+
+        HA actuation contract (audit P0 #9): this API-served path NEVER
+        mutates infrastructure unless THIS controller holds the worker
+        lease. A follower only commits the durable ABSENT intent and
+        defers the physical removal to the lease-owning reconciler (step
+        0b converges desired-ABSENT rows) — in a real HA deployment
+        controller B's local adapter is not the actuator just because the
+        API request landed there."""
         action = self.ledger.get_action(action_id)
         if action is None:
             raise LookupError(f"unknown action {action_id}")
@@ -617,13 +625,20 @@ class Controller:
             return {"action_id": action_id, "state": "revoked",
                     "verified": True, "not_applied": True}
         # Commit the durable ABSENT intent FIRST (audit P0 #4/#9): the
-        # request itself only mutates desired state — the physical removal
-        # below is the same converging operation the worker performs. A
-        # crash after this commit converges to removal, never re-apply.
+        # request itself only mutates desired state. A crash after this
+        # commit converges to removal, never re-apply.
         if not self.ledger.request_removal(
                 action_id, ("applied", "verified", "drifted", "dispatching")):
             return {"action_id": action_id, "state": action["state"],
                     "already_removing": True}
+        if not self._acquire_or_renew_lease():
+            # follower: intent is durable; the LEADER's reconciler performs
+            # the physical removal (audit P0 #9)
+            self.ledger.audit(actor, "action.revoke_intent_deferred",
+                              action_id, {"reason": reason,
+                                          "by": "follower_no_lease"})
+            return {"action_id": action_id, "state": "removing",
+                    "verified": False, "deferred_to_leader": True}
         result = self._remove_action(action, actor, reason,
                                      terminal_state="revoked", revoked_by=actor)
         if result["state"] == "drifted":
@@ -794,7 +809,11 @@ class Controller:
             10, 3 * self.config.controller.reconcile_interval_s))
         for action in self.ledger.actions_stuck_dispatching(stale):
             self.ledger.unclaim_action(action["action_id"])
-        for action in self.ledger.actions_stuck_removing(stale):
+        # a 'removing' row never reconciled at all is a follower-deferred
+        # removal intent (audit P0 #9): the leader adopts it immediately.
+        # Rows wedged past the stale window are crash recovery.
+        for action in self.ledger.actions_stuck_removing(
+                stale, include_unreconciled=True):
             self.ledger.retry_removal(action["action_id"])
         # 0b. any action whose desired_state is ABSENT but which still sits
         #     in an active state (a removal interrupted before the adapter

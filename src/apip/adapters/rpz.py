@@ -61,6 +61,7 @@ import stat
 import struct
 import subprocess
 import threading
+import contextlib
 import time
 from pathlib import Path
 from typing import Any
@@ -169,6 +170,13 @@ class RpzAdapter:
         # The serial lives in the ARTIFACT, so readers of the file always
         # see the generation they published.
         self._artifact_lock = threading.Lock()
+        # Cross-process serialization (audit P0 #10): two controller
+        # processes pointed at the SAME zone directory (a misconfiguration
+        # or a sidecar writer) must not read-modify-write the artifact
+        # concurrently — the in-process lock cannot see them. An advisory
+        # flock on a lockfile beside the artifact covers the gap.
+        self._lockfile_path = self._zone_dir / (
+            f"{config.zone_name}.publish.lock")
         # ENFORCE requires an explicit authorized-domain scope — never
         # authorize-by-omission at the enforcement edge.
         if mode == "ENFORCE" and not config.authorized_domains:
@@ -298,6 +306,33 @@ class RpzAdapter:
         return {"ok": True, "owner": shape["owner"],
                 "mode": self._effective(candidate)}
 
+    @contextlib.contextmanager
+    def _publish_lock(self):
+        """Cross-process artifact lock (audit P0 #10): an advisory flock
+        held for the whole read-modify-write-publish of one generation.
+        In-process callers are already serialized by ``_artifact_lock``;
+        this covers a second PROCESS sharing the zone directory. The
+        lockfile lives beside the artifact so it follows the same
+        deployment volume."""
+        self._zone_dir.mkdir(parents=True, exist_ok=True)
+        f = None
+        try:
+            f = open(self._lockfile_path, "a+")
+            try:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except ImportError:     # non-POSIX: degrade to in-process only
+                pass
+            yield
+        finally:
+            if f is not None:
+                try:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except ImportError:
+                    pass
+                f.close()
+
     # -- artifact paths ---------------------------------------------------------
 
     def _zone_path(self, live: bool) -> Path:
@@ -412,7 +447,9 @@ class RpzAdapter:
             raise AdapterError(
                 f"effective posture {eff} below SHADOW: refusing to publish")
         live = eff == "ENFORCE"
-        with self._artifact_lock:   # audit P0 #10: serialize the generation
+        with self._artifact_lock, self._publish_lock():
+            # audit P0 #10: serialize the generation in-process AND across
+            # processes sharing this zone directory
             zone = self._read_zone(live)
             if zone:
                 lines = zone.splitlines()
@@ -570,7 +607,9 @@ class RpzAdapter:
         live = eff == "ENFORCE"
         results: list[dict] = []
         reload_needed = False
-        with self._artifact_lock:   # audit P0 #10: serialize the generation
+        with self._artifact_lock, self._publish_lock():
+            # audit P0 #10: serialize the generation in-process AND across
+            # processes sharing this zone directory
             zone = self._read_zone(live)
             artifact = "live" if live else "shadow"
             if not zone:

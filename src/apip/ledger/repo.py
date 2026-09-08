@@ -30,6 +30,7 @@ class Ledger:
                         key_hash: str, actor: str, auto_enforcement_allowed: bool = True,
                         upstream: str | None = None, enabled: bool = True,
                         allowed_kinds: tuple[str, ...] = (),
+                        allowed_tenants: tuple[str, ...] = (),
                         provenance_note: str = "",
                         key_id: str | None = None) -> None:
         # Domain-layer reservation guard (review P0 #9): the same sentinel
@@ -42,22 +43,23 @@ class Ledger:
                 f"source_id {source_id!r} is reserved and cannot be registered")
         self.db.execute("""
 INSERT INTO sources (source_id, source_class, independent, auto_enforcement_allowed,
-                     upstream, enabled, allowed_kinds, provenance_note, key_hash,
-                     key_id, created_by)
-VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     upstream, enabled, allowed_kinds, allowed_tenants,
+                     provenance_note, key_hash, key_id, created_by)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
 ON CONFLICT (source_id) DO UPDATE SET
     source_class = EXCLUDED.source_class,
     independent = EXCLUDED.independent,
     auto_enforcement_allowed = EXCLUDED.auto_enforcement_allowed,
     upstream = EXCLUDED.upstream,
     allowed_kinds = EXCLUDED.allowed_kinds,
+    allowed_tenants = EXCLUDED.allowed_tenants,
     provenance_note = EXCLUDED.provenance_note,
     key_hash = EXCLUDED.key_hash,
     key_id = EXCLUDED.key_id,
     updated_at = now()
 """, (source_id, source_class, independent, auto_enforcement_allowed,
-      upstream, enabled, list(allowed_kinds), provenance_note, key_hash,
-      key_id, actor))
+      upstream, enabled, list(allowed_kinds), list(allowed_tenants),
+      provenance_note, key_hash, key_id, actor))
         self.audit(actor, "source.register", source_id,
                    {"class": source_class, "upstream": upstream, "enabled": enabled})
 
@@ -92,7 +94,8 @@ ON CONFLICT (source_id) DO UPDATE SET
         row = self.db.query_one(
             "SELECT source_id, source_class, independent, "
             "auto_enforcement_allowed, upstream, enabled, allowed_kinds, "
-            "key_hash FROM sources WHERE key_id=%s", (key_id,))
+            "allowed_tenants, key_hash FROM sources WHERE key_id=%s",
+            (key_id,))
         if (row is not None and row.get("key_hash")
                 and verify_credential(secret, row["key_hash"], pepper)):
             return row
@@ -182,15 +185,22 @@ VALUES (%s,%s,%s,%s,%s,%s,'complete')
         self.audit("controller", "ingest.failed", batch_id, {"error": error[:400]})
 
     @staticmethod
-    def observable_id(itype: str, canonical_value: str) -> str:
+    def observable_id(itype: str, canonical_value: str,
+                      tenant_id: str | None = None) -> str:
         """The SERVER-DERIVED durable identity of an observable (review P0
-        #10): a content hash of (itype, canonical value). Two sources
+        #10): a content hash of (tenant, itype, canonical value). Two sources
         assigning different ids to the same observable derive the SAME id
         (corroboration merges); one source reusing another's id for a
         different observable derives a DIFFERENT id and can never attach
-        evidence to it. Source-native ids survive as provenance only."""
+        evidence to it. Source-native ids survive as provenance only.
+
+        Tenant is part of identity (audit P0 #8): the same FQDN observed
+        by tenants A and B maps to DISTINCT indicator rows — policy layering
+        is not isolation. ``tenant_id=None`` is the global tenant space."""
+        canonical = (canonical_value.strip().rstrip(".").lower()
+                     if itype == "fqdn" else canonical_value.strip())
         digest = hashlib.sha256(
-            f"{itype}|{canonical_value.strip().rstrip('.').lower() if itype == 'fqdn' else canonical_value.strip()}".encode()
+            f"{tenant_id or ''}|{itype}|{canonical}".encode()
         ).hexdigest()[:24]
         return "indicator--" + digest
 
@@ -199,7 +209,7 @@ VALUES (%s,%s,%s,%s,%s,%s,'complete')
         """Upsert by the server-derived observable id (review P0 #10); the
         submitted id is stored as provenance (source_object_id), never as
         identity. Returns the durable indicator id used."""
-        durable_id = self.observable_id(ind.type, ind.value)
+        durable_id = self.observable_id(ind.type, ind.value, tenant_id)
         with self.db.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -467,26 +477,37 @@ WHERE action_id=%s AND state='removing' AND desired_state='ABSENT'
 
     def actions_desired_absent_active(self) -> list[dict]:
         """Actions whose durable intent is ABSENT but which still sit in an
-        active state — e.g. a removal committed (desired ABSENT) and then
-        the process died before entering the 'removing' phase. The
-        reconciler converges these toward removal."""
+        active state — a removal committed (desired ABSENT) but the
+        infrastructure mutation never verified: a process death before the
+        adapter call, OR a follower-committed intent whose physical removal
+        the lease owner must perform (audit P0 #9 — 'removing' rows owned
+        by nobody active are re-entered and converged)."""
         return self.db.query("""
 SELECT * FROM actions
 WHERE desired_state='ABSENT'
-  AND state IN ('applied','verified','drifted')
+  AND state IN ('applied','verified','drifted','removing')
 ORDER BY created_at
 """)
 
-    def actions_stuck_removing(self, older_than: datetime) -> list[dict]:
+    def actions_stuck_removing(self, older_than: datetime,
+                               *, include_unreconciled: bool = False) -> list[dict]:
         """Actions wedged in 'removing' past a full reconcile window (their
         leader died mid-removal): the next leader retries the removal — the
-        desired state is durably ABSENT."""
-        return self.db.query("""
+        desired state is durably ABSENT.
+
+        ``include_unreconciled`` also returns rows never reconciled at all
+        (last_reconciled_at NULL): a follower-committed removal intent
+        awaiting leader actuation (audit P0 #9). These are adoptable
+        IMMEDIATELY — the removal CAS ensures exclusivity and the actuation
+        converges from durable state — unlike crash-recovery rows, which
+        wait out the stale window."""
+        query = """
 SELECT * FROM actions
-WHERE state='removing' AND desired_state='ABSENT'
-  AND last_reconciled_at IS NOT NULL AND last_reconciled_at < %s
-ORDER BY created_at
-""", (older_than,))
+WHERE state='removing' AND desired_state='ABSENT' AND ("""
+        if include_unreconciled:
+            query += "last_reconciled_at IS NULL OR "
+        query += "last_reconciled_at < %s)\nORDER BY created_at"
+        return self.db.query(query, (older_than,))
 
     def claim_for_removal(self, action_id: str, from_states: tuple[str, ...]) -> bool:
         """Atomic CAS claim for ANY removal path (operator revoke, worker

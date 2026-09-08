@@ -353,6 +353,29 @@ ALTER TABLE sources ADD COLUMN IF NOT EXISTS key_id TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_sources_key_id
     ON sources (key_id) WHERE key_id IS NOT NULL;
 """),
+    (12, "tenant identity and credential scoping (audit P0 #8)", """
+-- Tenant identity becomes first-class and credential-authorized:
+--   1. a source credential declares the tenant ids it may submit for
+--      (allowed_tenants); an empty set is a GLOBAL source — it may NOT
+--      claim a tenant. The free-form x-apip-tenant header alone grants
+--      nothing: the presented credential gates every tenant claim
+--      (cross-tenant submission is a 403 at the API).
+--   2. tenant is part of durable observable identity: the same FQDN
+--      observed by tenants A and B maps to DISTINCT indicator rows, so
+--      evidence populations, decisions and actions stay partitioned.
+--      Pre-existing rows keep their (global) identity; the legacy unique
+--      name index is replaced by (tenant_id, itype, canonical value).
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS allowed_tenants TEXT[]
+    NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_sources_allowed_tenants
+    ON sources USING gin (allowed_tenants);
+-- The legacy (itype, value) uniqueness enforced GLOBAL observable identity;
+-- tenant-partitioned identity requires the tenant in the key. The old
+-- constraint is dropped; uniqueness now comes from the deterministic
+-- server-derived primary key (observable_id hashes the tenant).
+ALTER TABLE indicators DROP CONSTRAINT IF EXISTS uq_indicators_canonical;
+DROP INDEX IF EXISTS uq_indicators_canonical;
+"""),
     (11, "desired-state reconciliation intent", """
 -- Audit P0 #4: the durable record must never forget whether the operation
 -- in progress was APPLY or REMOVE. Previously both used state='dispatching',

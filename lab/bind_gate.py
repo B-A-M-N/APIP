@@ -439,8 +439,13 @@ def _propose(ctrl, *, did: str, ind_id: str, value: str, batch_id: str) -> None:
         policy_version="bind-gate", reason_codes=("proposed",),
         explanation="bind gate proposal", selector=sel,
         content_hash="hash--" + hashlib.sha256(did.encode()).hexdigest())
+    # the proposal is bound to the ACTIVE policy revision (audit P0 #6:
+    # approval refuses a decision authorized by a different content hash)
+    active = ctrl.ledger.current_policy_row()
     ctrl.ledger.record_decision(d, indicator_id=durable, batch_id=batch_id,
-                                policy_content_sha256="sha", actor=ACTOR)
+                                policy_content_sha256=(active["content_sha256"]
+                                                       if active else "sha"),
+                                actor=ACTOR)
 
 
 def _approve_and_dispatch(ctrl, did: str) -> tuple[str, dict]:

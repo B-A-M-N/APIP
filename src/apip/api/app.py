@@ -72,6 +72,9 @@ class SourceRegistrationRequest(BaseModel):
     auto_enforcement_allowed: bool = True
     upstream: str | None = Field(default=None, max_length=4096)
     allowed_kinds: list[str] = Field(default_factory=list, max_length=64)
+    # audit P0 #8: the tenants this credential may submit for. Empty = a
+    # GLOBAL source (may never claim a tenant via x-apip-tenant).
+    allowed_tenants: list[str] = Field(default_factory=list, max_length=64)
     provenance_note: str = Field(default="", max_length=2048)
 
 
@@ -145,6 +148,10 @@ def build_app(config: ServiceConfig,
         auto_enf = payload.auto_enforcement_allowed
         upstream = payload.upstream
         allowed = tuple(payload.allowed_kinds)
+        allowed_tenants = tuple(payload.allowed_tenants)
+        for t in allowed_tenants:
+            if not _safe_source_id(t):
+                raise HTTPException(400, f"unsafe tenant id {t!r}")
         provenance = payload.provenance_note
         # Reserved identities are refused UNCONDITIONALLY (review P0 #9) —
         # no charset exemption path.
@@ -185,6 +192,7 @@ def build_app(config: ServiceConfig,
             independent=independent, key_hash=hash_credential(secret, pepper),
             actor=_op["actor"], auto_enforcement_allowed=auto_enf,
             upstream=upstream, enabled=True, allowed_kinds=allowed,
+            allowed_tenants=allowed_tenants,
             provenance_note=provenance, key_id=key_id)
         return {"source_id": source_id, "source_key": token,
                 "note": "store the key now; it is not retrievable again"}
@@ -236,10 +244,37 @@ def build_app(config: ServiceConfig,
         tenant_header = request.headers.get("x-apip-tenant", "").strip()
         if tenant_header and not _safe_source_id(tenant_header):
             raise HTTPException(400, "invalid x-apip-tenant header")
+        # audit P0 #8: tenant is authorized by the CREDENTIAL, not claimed
+        # by a header. A source's allowed_tenants (set at registration) is
+        # the gate:
+        #   - empty set  -> a GLOBAL source: it may not claim any tenant;
+        #                   the header must be absent (403 otherwise);
+        #   - non-empty  -> a tenant-scoped source: it may submit ONLY for
+        #                   tenants in its set; the header (or, when it
+        #                   submits without one, its single allowed tenant)
+        #                   must resolve inside the set (403 otherwise).
+        allowed = tuple(src.get("allowed_tenants") or ())
+        if tenant_header and tenant_header not in allowed:
+            raise HTTPException(403,
+                                f"source {src['source_id']} is not authorized "
+                                f"for tenant {tenant_header!r}")
+        tenant_id: str | None
+        if allowed:
+            if tenant_header:
+                tenant_id = tenant_header
+            elif len(allowed) == 1:
+                tenant_id = allowed[0]
+            else:
+                raise HTTPException(400,
+                                    f"source {src['source_id']} may submit "
+                                    "for multiple tenants; x-apip-tenant "
+                                    "is required")
+        else:
+            tenant_id = None
         try:
             results = controller.process_batch(
                 batch=batch, actor=src["source_id"],
-                tenant_id=tenant_header or None)
+                tenant_id=tenant_id)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(503, f"ingest processing failed: {e}") from e
         return {"batch_id": batch.batch_id, "source_id": batch.source_id,
@@ -316,6 +351,11 @@ def build_app(config: ServiceConfig,
         row = controller.ledger.get_source(source_id)
         if row is None:
             raise HTTPException(404, f"no such source {source_id}")
+        # the credential's tenant scope survives rotation (audit P0 #8);
+        # get_source's safe projection omits it, so read it separately
+        full = controller.ledger.db.query_one(
+            "SELECT allowed_tenants FROM sources WHERE source_id=%s",
+            (source_id,))
         token, key_id = generate_source_key()
         parsed = parse_source_key(token)
         assert parsed is not None and parsed[0] == key_id
@@ -330,6 +370,8 @@ def build_app(config: ServiceConfig,
             upstream=row.get("upstream"),
             enabled=bool(row["enabled"]),
             allowed_kinds=tuple(row.get("allowed_kinds") or ()),
+            allowed_tenants=tuple(full["allowed_tenants"] or ())
+            if full else (),
             provenance_note=row.get("provenance_note") or "",
             key_id=key_id)
         controller.ledger.audit(_op["actor"], "source.credential_rotated",

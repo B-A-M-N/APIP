@@ -596,9 +596,81 @@ class Controller:
         if action_ids:
             self.ledger.set_approval_actions(
                 approval_id, tuple(action_ids))
-        return {"decision_id": decision_id, "approval_id": approval_id,
-                "action_ids": action_ids,
-                "compiled": bool(action_ids)}
+        # audit #29: an approval that compiles to ZERO fragments is reported
+        # honestly as `decision valid / materialization unavailable` — the
+        # capability registry says which configured adapter could have
+        # executed it and why none did. An operator is never left inviting
+        # an approval that silently creates nothing.
+        result = {"decision_id": decision_id, "approval_id": approval_id,
+                  "action_ids": action_ids,
+                  "compiled": bool(action_ids)}
+        if not action_ids:
+            result["materialization"] = {
+                "available": False,
+                "reason": "no configured adapter compiles this decision "
+                          "(decision valid / materialization unavailable)",
+                "adapters": self.capability_matrix(),
+            }
+        return result
+
+    def capability_matrix(self) -> list[dict]:
+        """The truthful feature matrix (audit #29): every configured
+        adapter's advertised capabilities. UI/CLI surface for what this
+        deployment can actually materialize."""
+        rows: list[dict] = []
+        for adapter in self._adapters.values():
+            cap = getattr(adapter, "capabilities", None)
+            row: dict = dict(cap()) if callable(cap) else {}   # type: ignore[arg-type]
+            if not callable(cap):
+                row = {"max_posture": adapter.max_mode()}
+            row["name"] = adapter.name
+            rows.append(row)
+        return rows
+
+    def materialization_for(self, decision: Decision,
+                            indicator_value: str,
+                            indicator_type: str) -> dict:
+        """Whether THIS decision (action/type/selector) is materializable by
+        the configured deployment — without compiling or persisting
+        anything. `available=False` carries the gap: which capability the
+        configured adapters lack (audit #25/#26/#27/#28 honesty)."""
+        fragments: list[dict] = []
+        for adapter in self._adapters.values():
+            try:
+                fragments.extend(adapter.compile(
+                    decision, indicator_value, indicator_type))
+            except AdapterError:
+                pass    # a refuse-to-broaden compile is "not materializable"
+        if fragments:
+            return {"available": True, "action_ids": [], "adapters":
+                    sorted({f["adapter"] for f in fragments})}
+        action = decision.action
+        sel = getattr(decision, "selector", None)
+        scope = getattr(sel, "scope_type", None) if sel is not None else None
+        itype = indicator_type
+        gaps: list[str] = []
+        if action in ("proxy_challenge",):
+            gaps.append(f"no proxy/WAF actuator exists for {action} "
+                        "(NOT MATERIALIZABLE in beta)")
+        elif action == "rate_limit":
+            gaps.append("no enforcing rate-limit actuator exists "
+                        "(Suricata exports detection-filter INTENT only; "
+                        "NOT MATERIALIZABLE as enforcement in beta)")
+        elif action == "firewall_deny":
+            gaps.append("no firewall actuator exists (Suricata renders "
+                        "alert/IDS only; NOT MATERIALIZABLE as enforcement "
+                        "in beta)")
+        if itype == "cidr":
+            gaps.append("cidr targets have no supported adapter (audit #28: "
+                        "materializable=false, reason=no_supported_adapter)")
+        if scope and scope != "destination_global":
+            gaps.append(f"selector shape {scope} is not materializable by "
+                        "any configured adapter")
+        if not gaps:
+            gaps.append("no configured adapter accepts this action/type "
+                        "combination")
+        return {"available": False, "action_ids": [], "gaps": gaps,
+                "adapters": self.capability_matrix()}
 
     def reject_decision(self, decision_id: str, actor: str,
                         reason: str = "operator_rejected") -> dict:

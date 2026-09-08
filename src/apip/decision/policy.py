@@ -677,10 +677,19 @@ def evaluate(indicator: Indicator, policy: Policy,
             rung = "L4"
             reasons = tuple(sorted(set(reasons) | {"wildcard_requires_approval"}))
         elif indicator.type == "cidr":
+            # audit #28: CIDR is a DEAD PRODUCT BRANCH — no configured
+            # adapter can express a CIDR deny (compile refuses prefixes;
+            # capability registry marks it materializable=false,
+            # reason=no_supported_adapter). The decision records the
+            # observation honestly as OBSERVE with the gap named; it never
+            # reaches a proposal path inviting an approval that would
+            # compile to zero actions.
             action = "firewall_deny"
-            disposition = "PROPOSE_OPERATOR_APPROVAL" if policy.mode == "ENFORCE" else "SHADOW_ACTION"
+            disposition = "OBSERVE"
             rung = "NONE"
-            reasons = tuple(sorted(set(reasons) | {"prefix_requires_approval"}))
+            reasons = tuple(sorted(set(reasons) | {
+                "prefix_requires_approval",
+                "materialization_unavailable:no_supported_adapter"}))
         else:
             rung, action, ladder_reasons, selector, rand_records = select_rung(
                 indicator, policy, m, s_ctx, s_ip, behavioral_fams,

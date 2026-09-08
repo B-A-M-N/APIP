@@ -111,3 +111,22 @@ class EnforcementAdapter(Protocol):
         posture's prerequisites before the controller accepts work. Raises
         AdapterError to refuse startup; a no-op default is fine."""
         ...
+
+    def capabilities(self) -> dict:
+        """Capability advertisement (audit #29): what THIS configured
+        adapter can actually materialize.
+
+        Shape:
+          action_types:       action names this adapter compiles fragments for
+          indicator_types:    indicator types it can act on
+          selector_shapes:    selector scope_types it can faithfully represent
+          max_posture:        the configured maximum posture (== max_mode())
+          independent_verify: whether verify() observes the ACTUATOR's effect
+                              (true) or only APIP's own artifact (false)
+
+        The controller uses this to tell an operator the truth BEFORE an
+        approval: a decision that compiles to zero fragments is reported as
+        `decision valid / materialization unavailable` rather than silently
+        creating nothing. Also the truthful feature matrix for UI/CLI.
+        """
+        ...

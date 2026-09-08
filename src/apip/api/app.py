@@ -26,7 +26,7 @@ from apip.auth import (
     parse_source_key,
 )
 from apip.config.service import ServiceConfig
-from apip.controller.service import Controller
+from apip.controller.service import Controller, decision_from_row
 from apip.ingest import IngestBatch, IngestChannel, IngestError, parse_indicator_payload
 from apip.ledger.db import DatabaseUnavailable
 
@@ -452,7 +452,20 @@ def build_app(config: ServiceConfig,
         if d is None:
             raise HTTPException(404, f"no such decision {decision_id}")
         ev = controller.ledger.get_decision_evidence(decision_id)
-        return {"decision": d, "evidence": ev}
+        out = {"decision": d, "evidence": ev}
+        # audit #29: a pending proposal carries its materialization status —
+        # `decision valid / materialization unavailable` is visible BEFORE
+        # an operator approves something that would compile to zero actions.
+        if d.get("disposition") == "PROPOSE_OPERATOR_APPROVAL":
+            ind = controller.ledger.get_indicator(d["indicator_id"])
+            if ind is not None:
+                try:
+                    decision = decision_from_row(d)
+                    out["materialization"] = controller.materialization_for(
+                        decision, ind["value"], ind["itype"])
+                except Exception:      # noqa: BLE001 — the surface must not
+                    pass               # fail on an unshaped legacy row
+        return out
 
     @app.post("/decisions/{decision_id}/approve")
     def approve_decision(decision_id: str,

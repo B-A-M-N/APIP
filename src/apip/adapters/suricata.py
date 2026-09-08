@@ -482,6 +482,24 @@ class SuricataAdapter:
                 break
         return {"sid": sid_line, "present": present, "mode": self._mode}
 
+    def capabilities(self) -> dict:
+        """Capability advertisement (audit #29). Beta truthfulness: this
+        adapter is an IDS/EXPORT surface — even a firewall_deny decision
+        renders as `alert`, so NO action type is independently enforced;
+        rate_limit exports detection-filter INTENT (monitoring only). IP
+        pair-scoped selectors cannot be faithfully represented and are
+        refused at compile rather than broadened."""
+        return {
+            "action_types": ["firewall_deny", "rate_limit"],
+            "indicator_types": ["ipv4", "ipv6", "fqdn"],
+            "selector_shapes": ["destination_global"],
+            "max_posture": self._mode,
+            # file-state evidence only (audit honesty: never engine load
+            # state, never packet-level effect)
+            "independent_verify": False,
+            "enforcement": "none (IDS export / intent only — beta)",
+        }
+
     def health(self) -> dict:
         base = {
             "name": self.name,

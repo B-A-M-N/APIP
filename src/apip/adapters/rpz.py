@@ -791,6 +791,23 @@ class RpzAdapter:
                 "live_present": live_present,
                 "shadow_present": shadow_present, "mode": self._mode}
 
+    def capabilities(self) -> dict:
+        """Capability advertisement (audit #29). The RPZ adapter's honest
+        surface: exact-FQDN DNS NXDOMAIN only — everything else (CIDR,
+        wildcards, rate limiting, proxy challenge, firewall denial) is NOT
+        materializable here. Independent verification is real only in
+        ENFORCE with a configured resolver; below that it is file-state
+        evidence, not actuator behavior."""
+        return {
+            "action_types": ["dns_nxdomain"],
+            "indicator_types": ["fqdn"],
+            "selector_shapes": ["destination_global"],
+            "max_posture": self._mode,
+            "independent_verify": (
+                self._mode == "ENFORCE"
+                and bool(self.config.verify_query_server)),
+        }
+
     def health(self) -> dict:
         base = {
             "name": self.name,
